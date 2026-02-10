@@ -16,6 +16,17 @@ scheduling:
     - "15m"
     - "1h"
 
+governance:
+  # 정기 회의(하루 2회 권장). 실시간 트리거(수익/손절/비용/레짐/운영)는 즉시 Safe Judge로 처리하고,
+  # 회의는 "종목/비중/허용조건(Trade Plan)"과 "룰 패치 제안"을 갱신하는 거버넌스 용도.
+  daily_meeting_times_kst:
+    - "09:00"
+    - "21:00"
+  # 슬롯 시간 기준으로 +/- 몇 분까지를 “해당 회의 시간대”로 볼지(중복 생성 방지)
+  meeting_window_min: 5
+  # 회의 결과로 기본 채택할 목표 비중(실행은 Safe Judge 게이트 통과 시에만)
+  default_target_position_pct: 10.0
+
 execution:
   order_style: "limit_post_only_first"
   default_ord_type: "limit"

@@ -515,7 +515,15 @@ class NotificationService:
             },
         )
 
-    def notify_meeting_summary(self, *, event_id: uuid.UUID, meeting_id: str, summary: str) -> None:
+    def notify_meeting_summary(
+        self,
+        *,
+        event_id: uuid.UUID,
+        meeting_id: str,
+        summary: str,
+        assistant_minutes: str | None = None,
+        assistant_meta: Mapping[str, Any] | None = None,
+    ) -> None:
         try:
             chat_id = telegram_client.chat_id_meeting()
         except Exception as exc:  # pragma: no cover
@@ -543,6 +551,8 @@ class NotificationService:
                 **_ts_payload(),
                 "meeting_id": meeting_id,
                 "summary": summary,
+                "assistant_minutes": assistant_minutes,
+                "assistant_meta": dict(assistant_meta or {}),
             },
         )
 

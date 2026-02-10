@@ -37,6 +37,27 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _parse_dt(value: str) -> datetime | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _trade_plan_is_active(plan: dict[str, Any]) -> bool:
+    now = _utcnow()
+    vf = _parse_dt(str(plan.get("valid_from_kst") or plan.get("valid_from") or ""))
+    vt = _parse_dt(str(plan.get("valid_to_kst") or plan.get("valid_to") or ""))
+    if vf and now < vf:
+        return False
+    if vt and now >= vt:
+        return False
+    return True
+
+
 def _timeframe_to_minutes(tf: str) -> int:
     tf = tf.strip().lower()
     if tf.endswith("m"):
@@ -117,12 +138,19 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         )
     )
 
-    symbol = rules.universe.symbols[0]
+    default_symbol = rules.universe.symbols[0]
     timeframe_entry = str(raw_rules.get("signal", {}).get("timeframe_entry", "15m"))
     tf_min = _timeframe_to_minutes(timeframe_entry)
 
     for _i in range(cycles):
         decision_id = uuid.uuid4()
+        symbol = default_symbol
+        plan = repo.fetch_latest_trade_plan()
+        if plan and _trade_plan_is_active(plan):
+            plan_symbol = str(plan.get("symbol") or "").strip()
+            if plan_symbol and plan_symbol in set(rules.universe.symbols):
+                symbol = plan_symbol
+
         snapshot = fetch_market_snapshot(symbol)
         quote_ts = _utcnow()
         repo.insert_market_quote(
@@ -302,6 +330,15 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     "symbol": symbol,
                     "decision_id": str(decision_id),
                     "decision": asdict(safe),
+                    "trade_plan": {
+                        "event_id": plan.get("event_id"),
+                        "slot_key": plan.get("slot_key"),
+                        "symbol": plan.get("symbol"),
+                        "target_position_pct": plan.get("target_position_pct"),
+                        "valid_to_kst": plan.get("valid_to_kst"),
+                    }
+                    if plan
+                    else None,
                     "agent_inputs": {
                         "market": asdict(market),
                         "regime": asdict(regime),
@@ -332,6 +369,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "ops_veto": ops_op.veto,
                 "reconciliation_status": ops_op.reconciliation_status,
                 "pause_state": ops.get("pause_state"),
+                "trade_plan_slot_key": plan.get("slot_key") if plan else None,
+                "trade_plan_target_pct": plan.get("target_position_pct") if plan else None,
             },
         )
 

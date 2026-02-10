@@ -10,6 +10,7 @@ import { DecisionsPage } from './pages/DecisionsPage'
 import { ConferencePage } from './pages/ConferencePage'
 import { JudgePage } from './pages/JudgePage'
 import { AgentOpinionsPage } from './pages/AgentOpinionsPage'
+import { TradePlanPage } from './pages/TradePlanPage'
 import { RoomsPage } from './pages/RoomsPage'
 import { MeetingsPage } from './pages/MeetingsPage'
 import { MeetingDetailPage } from './pages/MeetingDetailPage'
@@ -39,6 +40,7 @@ export default function App() {
           <NavItem to="/" label="대시보드" hint="오늘" />
           <NavItem to="/decisions" label="의사결정" hint="SAFE/AI" />
           <NavItem to="/agents" label="에이전트" hint="의견" />
+          <NavItem to="/trade-plan" label="플랜" hint="종목/비중" />
           <NavItem to="/timeline" label="타임라인" hint="이벤트" />
           <NavItem to="/execution" label="실행품질" hint="슬리피지" />
         </nav>
@@ -74,6 +76,7 @@ export default function App() {
           <Route path="/conference/:decisionId" element={<ConferencePage />} />
           <Route path="/decision/:decisionId" element={<JudgePage />} />
           <Route path="/agents" element={<AgentOpinionsPage />} />
+          <Route path="/trade-plan" element={<TradePlanPage />} />
           <Route path="/timeline" element={<TimelinePage />} />
           <Route path="/execution" element={<ExecutionQualityPage />} />
           <Route path="/ops" element={<OpsPage />} />

@@ -15,9 +15,11 @@ sys.path.insert(0, str(ROOT))
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
 from ai_invest.config.rules_loader import load_rules  # noqa: E402
+from ai_invest.agents.research_agent import research_agent_daily_brief  # noqa: E402
 from ai_invest.market_data.features import build_feature_snapshot_from_candles  # noqa: E402
 from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_market_snapshot  # noqa: E402
 from ai_invest.notifications.service import NotificationService  # noqa: E402
+from ai_invest.research.rss import fetch_crypto_headlines  # noqa: E402
 from ai_invest.storage.postgres import DbAgentDailyReport, DbEvent, PostgresRepo  # noqa: E402
 
 
@@ -72,10 +74,16 @@ def build_brief(
         risk_watchlist.append("정합성 FAIL")
         next_actions.append("reconciliation_checks diff 확인 및 원인 제거")
 
-    summary = (
-        f"{symbol} 현재가 {snap.last_price:,.0f} / 스프레드 {snap.spread_bps:.2f}bps / "
-        f"RSI14 {feat.rsi_14:.1f} / ATR% {feat.atr_pct:.2f} / VolZ {feat.vol_zscore:.2f}"
+    headlines = fetch_crypto_headlines(symbol=symbol, limit=12)
+    brief = research_agent_daily_brief(
+        symbol=symbol,
+        snapshot={"last_price": snap.last_price, "best_bid": snap.best_bid, "best_ask": snap.best_ask, "mid_price": snap.mid_price, "spread_bps": snap.spread_bps},
+        features={"atr_pct": feat.atr_pct, "rsi_14": feat.rsi_14, "vol_zscore": feat.vol_zscore},
+        ops={"pause": pause, "latest_reconciliation": recon},
+        headlines=headlines,
     )
+
+    summary = brief.summary
 
     findings = {
         "symbol": symbol,
@@ -89,12 +97,14 @@ def build_brief(
         "features": {"atr_pct": feat.atr_pct, "rsi_14": feat.rsi_14, "vol_zscore": feat.vol_zscore},
         "ops": {"pause": pause, "latest_reconciliation": recon},
         "latest_safe_decision": latest_safe,
+        "news_headlines": headlines,
+        "key_findings": brief.key_findings,
+        "llm_meta": brief.llm_meta,
     }
 
-    if not risk_watchlist:
-        risk_watchlist.append("특이 리스크 없음(기계적 체크 기준)")
-    if not next_actions:
-        next_actions.append("동일 룰로 모니터링 지속")
+    # Prefer agent output (LLM or deterministic fallback).
+    risk_watchlist = list(brief.risk_watchlist or risk_watchlist)
+    next_actions = list(brief.next_actions or next_actions)
 
     return summary, findings, risk_watchlist, next_actions
 
@@ -103,7 +113,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Generate and store Research Daily Brief.")
     p.add_argument("--symbol", type=str, default="")
     p.add_argument("--timeframe", type=str, default="15m")
-    p.add_argument("--title", type=str, default="일일 리서치 브리프")
+    p.add_argument("--title", type=str, default="일일 리서치 브리프(뉴스+시장)")
     args = p.parse_args()
 
     load_dotenv()
@@ -180,4 +190,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

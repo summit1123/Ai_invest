@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+from ai_invest.agents.secretary_agent import generate_meeting_minutes  # noqa: E402
 from ai_invest.notifications.service import NotificationService  # noqa: E402
 from ai_invest.storage.postgres import (  # noqa: E402
     DbEvent,
@@ -92,6 +93,80 @@ def main() -> int:
         {"owner": "strategy_coordinator", "action": "주간 우선순위 1건 업데이트 및 성공 기준 명확화", "due_date": str(ended_at.date())},
     ]
 
+    draft_messages: list[dict[str, Any]] = []
+    if latest_report:
+        draft_messages.append(
+            {
+                "sender_agent": "research_agent",
+                "message_type": "EVIDENCE",
+                "content": _safe_str(latest_report.get("summary")),
+                "payload": {"report_id": latest_report.get("report_id"), "risks": latest_report.get("risks")},
+                "confidence": 0.75,
+            }
+        )
+    if agent_inputs:
+        market = agent_inputs.get("market") or {}
+        regime = agent_inputs.get("regime") or {}
+        risk = agent_inputs.get("risk") or {}
+        ops = agent_inputs.get("ops") or {}
+        draft_messages.extend(
+            [
+                {
+                    "sender_agent": "market_agent",
+                    "message_type": "CLAIM",
+                    "content": f"시장신호={market.get('signal')} conf={market.get('confidence')} target%={market.get('target_position_pct')}",
+                    "payload": {"reason_codes": market.get("reason_codes"), "reason": market.get("reason")},
+                    "confidence": float(market.get("confidence") or 0.6),
+                },
+                {
+                    "sender_agent": "regime_agent",
+                    "message_type": "CLAIM",
+                    "content": f"레짐={regime.get('regime')} trade_allowed={regime.get('trade_allowed')}",
+                    "payload": {"reason_codes": regime.get("reason_codes"), "reason": regime.get("reason")},
+                    "confidence": 0.7,
+                },
+                {
+                    "sender_agent": "risk_agent",
+                    "message_type": "CLAIM",
+                    "content": f"veto={risk.get('veto')} max_pos%={risk.get('max_position_pct')} max_loss%={risk.get('max_loss_per_trade_pct')}",
+                    "payload": {"reason_codes": risk.get("reason_codes"), "reason": risk.get("reason")},
+                    "confidence": 0.7,
+                },
+                {
+                    "sender_agent": "ops_agent",
+                    "message_type": "CLAIM",
+                    "content": f"state={ops.get('system_state')} veto={ops.get('veto')} recon={ops.get('reconciliation_status')}",
+                    "payload": {"reason_codes": ops.get("reason_codes"), "alerts": ops.get("alerts")},
+                    "confidence": 0.7,
+                },
+            ]
+        )
+    draft_messages.append(
+        {
+            "sender_agent": "strategy_coordinator",
+            "message_type": "PROPOSAL",
+            "content": "오늘은 paper loop 기준으로 운영/비용/레짐 게이트가 정상인지 확인하고, 다음 주 개선 우선순위를 1건만 고정합니다.",
+            "payload": {"action_items": action_items},
+            "confidence": 0.65,
+        }
+    )
+
+    session_map: dict[str, Any] = {
+        "meeting_id": str(meeting_id),
+        "meeting_type": str(args.meeting_type).upper(),
+        "status": "CLOSED",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "facilitator": str(args.facilitator),
+        "participants": participants,
+        "agenda": agenda,
+        "summary": summary,
+        "decisions": {"paper": True},
+        "action_items": {"items": action_items},
+    }
+    assistant = generate_meeting_minutes(session=session_map, messages=draft_messages)
+    assistant_minutes = assistant.text
+
     repo.insert_meeting_session(
         DbMeetingSession(
             meeting_id=meeting_id,
@@ -102,7 +177,7 @@ def main() -> int:
             facilitator=str(args.facilitator),
             participants=participants,
             agenda=agenda,
-            summary=summary,
+            summary=assistant_minutes,
             decisions={"paper": True},
             action_items={"items": action_items},
             run_id=None,
@@ -122,65 +197,12 @@ def main() -> int:
         )
     )
 
-    messages: list[tuple[str, str, str, dict[str, Any] | None, float | None]] = []
-    if latest_report:
-        messages.append(
-            (
-                "research_agent",
-                "EVIDENCE",
-                _safe_str(latest_report.get("summary")),
-                {"report_id": latest_report.get("report_id"), "risks": latest_report.get("risks")},
-                0.75,
-            )
-        )
-    if agent_inputs:
-        market = agent_inputs.get("market") or {}
-        regime = agent_inputs.get("regime") or {}
-        risk = agent_inputs.get("risk") or {}
-        ops = agent_inputs.get("ops") or {}
-        messages.extend(
-            [
-                (
-                    "market_agent",
-                    "CLAIM",
-                    f"시장신호={market.get('signal')} conf={market.get('confidence')} target%={market.get('target_position_pct')}",
-                    {"reason_codes": market.get("reason_codes"), "reason": market.get("reason")},
-                    float(market.get("confidence") or 0.6),
-                ),
-                (
-                    "regime_agent",
-                    "CLAIM",
-                    f"레짐={regime.get('regime')} trade_allowed={regime.get('trade_allowed')}",
-                    {"reason_codes": regime.get("reason_codes"), "reason": regime.get("reason")},
-                    0.7,
-                ),
-                (
-                    "risk_agent",
-                    "CLAIM",
-                    f"veto={risk.get('veto')} max_pos%={risk.get('max_position_pct')} max_loss%={risk.get('max_loss_per_trade_pct')}",
-                    {"reason_codes": risk.get("reason_codes"), "reason": risk.get("reason")},
-                    0.7,
-                ),
-                (
-                    "ops_agent",
-                    "CLAIM",
-                    f"state={ops.get('system_state')} veto={ops.get('veto')} recon={ops.get('reconciliation_status')}",
-                    {"reason_codes": ops.get("reason_codes"), "alerts": ops.get("alerts")},
-                    0.7,
-                ),
-            ]
-        )
-    messages.append(
-        (
-            "strategy_coordinator",
-            "PROPOSAL",
-            "오늘은 paper loop 기준으로 운영/비용/레짐 게이트가 정상인지 확인하고, 다음 주 개선 우선순위를 1건만 고정합니다.",
-            {"action_items": action_items},
-            0.65,
-        )
-    )
-
-    for sender, msg_type, content, payload, conf in messages:
+    for dm in draft_messages:
+        sender = str(dm.get("sender_agent") or "")
+        msg_type = str(dm.get("message_type") or "")
+        content = str(dm.get("content") or "")
+        payload = dm.get("payload")
+        conf = dm.get("confidence")
         msg_id = uuid.uuid4()
         ts = _utcnow()
         repo.insert_meeting_message(
@@ -223,11 +245,35 @@ def main() -> int:
             entity_id=str(meeting_id),
             run_id=None,
             rule_version_id=None,
-            payload={"meeting_id": str(meeting_id), "summary": summary, "symbol": symbol},
+            payload={
+                "meeting_id": str(meeting_id),
+                "summary_short": summary,
+                "assistant_minutes": assistant_minutes,
+                "assistant_meta": {
+                    "used_llm": assistant.used_llm,
+                    "model": assistant.model,
+                    "endpoint": assistant.endpoint,
+                    "usage": assistant.usage,
+                    "error": assistant.error,
+                },
+                "symbol": symbol,
+            },
         )
     )
     try:
-        notifier.notify_meeting_summary(event_id=summary_event_id, meeting_id=str(meeting_id), summary=summary)
+        notifier.notify_meeting_summary(
+            event_id=summary_event_id,
+            meeting_id=str(meeting_id),
+            summary=summary,
+            assistant_minutes=assistant_minutes,
+            assistant_meta={
+                "used_llm": assistant.used_llm,
+                "model": assistant.model,
+                "endpoint": assistant.endpoint,
+                "usage": assistant.usage,
+                "error": assistant.error,
+            },
+        )
     except Exception:
         pass
 
@@ -255,4 +301,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

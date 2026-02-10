@@ -1232,6 +1232,42 @@ class PostgresRepo:
         event_id, ts, payload = row
         return {"event_id": str(event_id), "ts": ts, "payload": payload}
 
+    def fetch_latest_event(self, *, event_type: str) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select event_id, ts, event_type, entity_type, entity_id, run_id, rule_version_id, payload
+                from events
+                where event_type=%s
+                order by ts desc
+                limit 1
+                """,
+                (event_type,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        event_id, ts, event_type2, entity_type, entity_id, run_id, rule_version_id, payload = row
+        return {
+            "event_id": str(event_id),
+            "ts": ts,
+            "event_type": event_type2,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "run_id": str(run_id) if run_id else None,
+            "rule_version_id": str(rule_version_id) if rule_version_id else None,
+            "payload": payload,
+        }
+
+    def fetch_latest_trade_plan(self) -> dict[str, Any] | None:
+        ev = self.fetch_latest_event(event_type="TRADE_PLAN_SET")
+        if not ev:
+            return None
+        payload = ev.get("payload")
+        if not isinstance(payload, Mapping):
+            return None
+        return {"event_id": ev.get("event_id"), "ts": ev.get("ts"), **dict(payload)}
+
     def fetch_ai_shadow_decision_for(self, *, safe_decision_id: str) -> dict[str, Any] | None:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -1315,6 +1351,22 @@ class PostgresRepo:
         }
         paused = ts_resume is None
         return {"paused": paused, "latest": latest}
+
+    def meeting_slot_exists(self, *, slot_key: str) -> bool:
+        slot_key = str(slot_key).strip()
+        if not slot_key:
+            return False
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select 1
+                from meeting_sessions
+                where agenda->>'slot_key'=%s
+                limit 1
+                """,
+                (slot_key,),
+            )
+            return cur.fetchone() is not None
 
     def fetch_meeting_sessions(self, *, limit: int = 50) -> list[dict[str, Any]]:
         with self.connect() as conn, conn.cursor() as cur:

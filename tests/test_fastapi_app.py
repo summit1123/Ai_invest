@@ -49,16 +49,19 @@ class FastApiAppTests(unittest.TestCase):
             resp2 = client.get("/api/v1/ui/collaboration/rooms?limit=5")
             resp3 = client.get("/api/v1/ui/meetings?limit=5")
             resp4 = client.get("/api/v1/ui/strategy-reviews?limit=5")
+            resp5 = client.get("/api/v1/ui/trade-plan/latest")
         self.assertEqual(resp1.status_code, 200)
         self.assertEqual(resp1b.status_code, 200)
         self.assertEqual(resp2.status_code, 200)
         self.assertEqual(resp3.status_code, 200)
         self.assertEqual(resp4.status_code, 200)
+        self.assertEqual(resp5.status_code, 200)
         self.assertTrue(resp1.json()["ok"])
         self.assertTrue(resp1b.json()["ok"])
         self.assertTrue(resp2.json()["ok"])
         self.assertTrue(resp3.json()["ok"])
         self.assertTrue(resp4.json()["ok"])
+        self.assertTrue(resp5.json()["ok"])
 
 
 if __name__ == "__main__":

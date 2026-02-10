@@ -102,10 +102,18 @@ def tpl_weekly_review(data: Mapping[str, Any]) -> str:
 
 
 def tpl_research_daily_brief(data: Mapping[str, Any]) -> str:
+    risks = data.get("risk_watchlist")
+    risk_lines: list[str] = []
+    if isinstance(risks, list):
+        for r in risks[:8]:
+            s = str(r or "").strip()
+            if s:
+                risk_lines.append(f"- {s}")
+    risks_txt = "\n".join(risk_lines) if risk_lines else "- (없음)"
     return (
         f"[리서치][일간] {data.get('brief_date')}\n"
         f"- 요약: {data.get('summary')}\n"
-        f"- 리스크: {data.get('risk_watchlist')}\n"
+        f"- 리스크:\n{risks_txt}\n"
     )
 
 
@@ -118,20 +126,44 @@ def tpl_agent_daily_report(data: Mapping[str, Any]) -> str:
 
 
 def tpl_meeting_summary(data: Mapping[str, Any]) -> str:
+    assistant_minutes = data.get("assistant_minutes")
+    if not isinstance(assistant_minutes, str) or not assistant_minutes.strip():
+        assistant_minutes = None
+    assistant_meta = data.get("assistant_meta") if isinstance(data.get("assistant_meta"), Mapping) else {}
+    used_llm = bool(assistant_meta.get("used_llm") or False)
+    model = assistant_meta.get("model")
+
+    body = assistant_minutes or str(data.get("summary") or "").strip()
+    if not body:
+        body = "(요약 없음)"
     return (
-        "[회의] 요약\n"
+        "[회의] 회의록\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- meeting_id: {data.get('meeting_id')}\n"
-        f"- 요약: {data.get('summary')}\n"
+        + (f"- 생성: LLM({model})\n" if used_llm and model else ("- 생성: deterministic\n" if not used_llm else ""))
+        + "\n"
+        + f"{body}\n"
     )
 
 
 def tpl_meeting_action_items(data: Mapping[str, Any]) -> str:
+    items = data.get("items")
+    lines: list[str] = []
+    if isinstance(items, list):
+        for it in items[:10]:
+            if not isinstance(it, Mapping):
+                continue
+            owner = str(it.get("owner") or "")
+            action = str(it.get("action") or "")
+            due = str(it.get("due_date") or "")
+            if owner or action:
+                lines.append(f"- {owner}: {action} (기한 {due})")
+    items_txt = "\n".join(lines) if lines else "- (없음)"
     return (
         "[회의][액션아이템]\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- meeting_id: {data.get('meeting_id')}\n"
-        f"- items: {data.get('items')}\n"
+        f"{items_txt}\n"
     )
 
 

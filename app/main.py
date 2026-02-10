@@ -162,6 +162,13 @@ def strategy_reviews(limit: int = 20) -> dict[str, Any]:
     return ok({"items": repo.fetch_strategy_reviews(limit=limit)})
 
 
+@app.get("/api/v1/ui/trade-plan/latest", tags=["거버넌스"], summary="최신 Trade Plan(종목/비중)")
+def latest_trade_plan() -> dict[str, Any]:
+    repo = PostgresRepo()
+    ev = repo.fetch_latest_event(event_type="TRADE_PLAN_SET")
+    return ok({"event": ev})
+
+
 @app.get("/api/v1/ui/review/weekly", tags=["리뷰"], summary="주간 리뷰 데이터(PnL/실현거래)")
 def weekly_review() -> dict[str, Any]:
     repo = PostgresRepo()

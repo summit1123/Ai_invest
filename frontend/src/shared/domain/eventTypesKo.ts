@@ -4,6 +4,7 @@ export const EVENT_TYPE_KO: Record<string, string> = {
   AGENT_OPINION: '에이전트 의견',
   SAFE_DECISION: 'Safe 결정',
   AI_DECISION: 'AI Shadow 결정',
+  TRADE_PLAN_SET: '트레이드 플랜 설정',
   MEETING_STARTED: '회의 시작',
   MEETING_MESSAGE: '회의 메시지',
   MEETING_SUMMARY: '회의 요약',
