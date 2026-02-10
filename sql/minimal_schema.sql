@@ -1,6 +1,8 @@
 -- 최소 MVP 스키마: events / decisions / orders / fills / notification_deliveries
-
-CREATE EXTENSION IF NOT EXISTS vector;
+--
+-- NOTE:
+-- - pgvector는 v1.1 casebook/embedding 용도로만 필요하며 "선택"이다(database.md 참고).
+-- - vector 기능이 필요하면 `sql/optional_pgvector.sql`을 별도로 적용한다.
 
 CREATE TABLE IF NOT EXISTS events (
   event_id         UUID PRIMARY KEY,

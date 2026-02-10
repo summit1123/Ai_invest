@@ -12,7 +12,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import psycopg
+try:
+    import psycopg
+except ModuleNotFoundError as exc:  # pragma: no cover
+    raise SystemExit(
+        "[실패] Python 의존성이 설치되어 있지 않습니다(psycopg 누락).\n"
+        "아래 중 하나로 실행하세요:\n"
+        "  1) uv sync && .venv/bin/python scripts/smoke_tests.py\n"
+        "  2) uv run python scripts/smoke_tests.py\n"
+    ) from exc
 import requests
 
 
@@ -43,6 +51,10 @@ def to_psycopg_dsn(dsn: str) -> str:
     return dsn
 
 
+def parse_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
@@ -61,6 +73,7 @@ def test_db(env: dict[str, str]) -> TestResult:
     dsn = env.get("POSTGRES_DSN", "")
     if not dsn:
         return TestResult("DB", False, "POSTGRES_DSN 누락")
+    require_pgvector = parse_bool(env.get("REQUIRE_PGVECTOR", ""))
 
     dsn = to_psycopg_dsn(dsn)
     try:
@@ -70,8 +83,10 @@ def test_db(env: dict[str, str]) -> TestResult:
                 db, user = cur.fetchone()
                 cur.execute("select extname from pg_extension where extname='vector'")
                 vector_exists = bool(cur.fetchone())
+        if not vector_exists and require_pgvector:
+            return TestResult("DB", False, f"연결 성공({db}/{user}), vector 확장 없음(REQUIRE_PGVECTOR=true)")
         if not vector_exists:
-            return TestResult("DB", False, f"연결 성공({db}/{user}), vector 확장 없음")
+            return TestResult("DB", True, f"연결 성공({db}/{user}), vector 확장 없음(선택)")
         return TestResult("DB", True, f"연결 성공({db}/{user}), vector 확장 확인")
     except Exception as exc:
         return TestResult("DB", False, f"연결 실패: {exc}")
