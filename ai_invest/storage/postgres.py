@@ -4,7 +4,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Mapping, Sequence
 
 import psycopg
@@ -599,6 +599,79 @@ class PostgresRepo:
             stop_price=stop_price,
             take_profit=take_profit,
             meta=meta,
+        )
+
+    def fetch_cash_balance(self, *, currency: str) -> float:
+        """ledger_entries 기반 단순 현금 잔고(통화별).
+
+        - amount는 현금 유입/유출(+/-)
+        - fee_amount가 존재하면 amount에서 차감하여 net cashflow로 계산한다.
+        """
+
+        ccy = str(currency or "").strip().upper()
+        if not ccy:
+            return 0.0
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select coalesce(sum(amount - coalesce(fee_amount, 0.0)), 0.0)
+                from ledger_entries
+                where currency=%s
+                """,
+                (ccy,),
+            )
+            row = cur.fetchone()
+        try:
+            return float(row[0]) if row else 0.0
+        except Exception:
+            return 0.0
+
+    def paper_seed_exists(self, *, currency: str) -> bool:
+        ccy = str(currency or "").strip().upper()
+        if not ccy:
+            return False
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select 1
+                from ledger_entries
+                where currency=%s
+                  and entry_type='DEPOSIT'
+                  and (meta->>'paper_seed')='true'
+                limit 1
+                """,
+                (ccy,),
+            )
+            return cur.fetchone() is not None
+
+    def ensure_paper_seed_cash(self, *, currency: str, amount: float) -> None:
+        """Paper 계정 seed 현금(DEPOSIT)을 1회만 주입한다.
+
+        - live 모드에서는 사용하지 않는 것을 전제로 한다.
+        - meta.paper_seed=true 를 키로 중복 주입을 방지한다.
+        """
+
+        ccy = str(currency or "").strip().upper()
+        amt = float(amount or 0.0)
+        if not ccy or amt <= 0:
+            return
+        if self.paper_seed_exists(currency=ccy):
+            return
+        self.insert_ledger_entry(
+            DbLedgerEntry(
+                entry_id=uuid.uuid4(),
+                ts=datetime.now(timezone.utc),
+                entry_type="DEPOSIT",
+                symbol=None,
+                currency=ccy,
+                amount=amt,
+                price=None,
+                fee_amount=None,
+                fee_currency=None,
+                order_id=None,
+                fill_id=None,
+                meta={"paper": True, "paper_seed": True, "note": "initial paper cash"},
+            )
         )
 
     def upsert_position(self, pos: DbPosition) -> None:

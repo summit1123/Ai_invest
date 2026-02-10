@@ -16,6 +16,8 @@ REASON_CODE_KO: dict[str, str] = {
     "RG_SLIPPAGE_EST_TOO_HIGH": "슬리피지 예상 초과",
     "RG_EDGE_TOO_LOW": "엣지 부족",
     "RG_EXPOSURE_LIMIT": "익스포저 상한",
+    "RG_TRADE_PLAN_FLAT": "트레이드 플랜: 노출 0% 유지",
+    "RG_TRADE_PLAN_TARGET_REACHED": "트레이드 플랜: 목표 비중 도달",
     "RG_MIN_ORDER_NOT_MET": "최소 주문금액 미충족",
     "RG_COOLDOWN_ACTIVE": "쿨다운 활성",
     "RG_SIGNAL_CONFLICT": "신호 충돌",
@@ -54,4 +56,3 @@ def format_reason_codes_ko(codes: Iterable[str]) -> str:
         return "없음"
     # Show Korean title first, keep code in parentheses for traceability.
     return ", ".join(f"{reason_title_ko(c)}({c})" for c in items)
-

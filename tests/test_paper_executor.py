@@ -36,6 +36,42 @@ class _FakeRepo:
     def insert_ledger_entry(self, entry: DbLedgerEntry) -> None:
         self.ledger.append(entry)
 
+    def paper_seed_exists(self, *, currency: str) -> bool:  # noqa: ARG002
+        for e in self.ledger:
+            if e.entry_type == "DEPOSIT" and str(e.currency).upper() == str(currency).upper() and (e.meta or {}).get("paper_seed"):
+                return True
+        return False
+
+    def ensure_paper_seed_cash(self, *, currency: str, amount: float) -> None:
+        if self.paper_seed_exists(currency=currency):
+            return
+        self.insert_ledger_entry(
+            DbLedgerEntry(
+                entry_id=uuid.uuid4(),
+                ts=datetime.now(timezone.utc),
+                entry_type="DEPOSIT",
+                symbol=None,
+                currency=str(currency).upper(),
+                amount=float(amount),
+                price=None,
+                fee_amount=None,
+                fee_currency=None,
+                order_id=None,
+                fill_id=None,
+                meta={"paper": True, "paper_seed": True},
+            )
+        )
+
+    def fetch_cash_balance(self, *, currency: str) -> float:
+        ccy = str(currency).upper()
+        total = 0.0
+        for e in self.ledger:
+            if str(e.currency).upper() != ccy:
+                continue
+            fee = float(e.fee_amount or 0.0)
+            total += float(e.amount) - fee
+        return float(total)
+
     def fetch_position(self, symbol: str) -> DbPosition | None:
         return self.positions.get(symbol)
 
@@ -109,8 +145,11 @@ class PaperExecutorTests(unittest.TestCase):
         self.assertEqual(res_buy.side, "BUY")
         self.assertEqual(res_buy.entry_decision_id, entry_decision_id)
 
-        self.assertEqual(len(repo.ledger), 1)
-        entry = repo.ledger[0]
+        # Paper seed(초기 현금) + BUY cashflow 1건
+        self.assertGreaterEqual(len(repo.ledger), 2)
+        trade_entries = [e for e in repo.ledger if e.entry_type == "TRADE_FILL"]
+        self.assertEqual(len(trade_entries), 1)
+        entry = trade_entries[0]
         self.assertEqual(entry.entry_type, "TRADE_FILL")
         self.assertEqual(entry.currency, "KRW")
         self.assertLess(entry.amount, 0.0)
@@ -152,10 +191,11 @@ class PaperExecutorTests(unittest.TestCase):
         self.assertEqual(res_sell.closed_trade.entry_decision_id, entry_decision_id)
         self.assertEqual(res_sell.closed_trade.exit_decision_id, exit_decision_id)
 
-        # Ledger gets a second row (sell cashflow).
-        self.assertEqual(len(repo.ledger), 2)
-        exit_entry = repo.ledger[1]
-        self.assertGreater(exit_entry.amount, 0.0)
+        # Ledger gets one more TRADE_FILL row (sell cashflow).
+        trade_entries2 = [e for e in repo.ledger if e.entry_type == "TRADE_FILL"]
+        self.assertEqual(len(trade_entries2), 2)
+        exit_entry = trade_entries2[1]
+        self.assertGreater(float(exit_entry.amount), 0.0)
 
         self.assertEqual(len(repo.realized_trades), 1)
         self.assertEqual(str(repo.realized_trades[0]["trade_id"]), str(res_buy.trade_id))

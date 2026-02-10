@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from ai_invest.config.llm_router import LLMRoute
 from ai_invest.llm.openai_http import OpenAIConfigError, OpenAIRequestError, OpenAITextResult, openai_generate_text
 from ai_invest.research.rss import summarize_headlines_text
 
@@ -121,6 +122,7 @@ def research_agent_daily_brief(
     features: Mapping[str, Any],
     ops: Mapping[str, Any],
     headlines: Sequence[Mapping[str, Any]] | None = None,
+    llm_route: LLMRoute | None = None,
 ) -> ResearchBrief:
     """Research Agent: qualitative context + news (LLM optional).
 
@@ -131,8 +133,11 @@ def research_agent_daily_brief(
     headlines = list(headlines or [])
     fallback = _deterministic_brief(symbol=symbol, snapshot=snapshot, features=features, ops=ops, headlines=headlines)
 
-    llm_enabled = _parse_bool(os.environ.get("RESEARCH_LLM_ENABLED", ""), default=True)
-    use_llm = llm_enabled and bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    if llm_route is not None:
+        use_llm = bool(llm_route.enabled) and bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    else:
+        llm_enabled = _parse_bool(os.environ.get("RESEARCH_LLM_ENABLED", ""), default=True)
+        use_llm = llm_enabled and bool(os.environ.get("OPENAI_API_KEY", "").strip())
     if not use_llm:
         return fallback
 
@@ -174,7 +179,11 @@ def research_agent_daily_brief(
         res: OpenAITextResult = openai_generate_text(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            temperature=0.2,
+            model=(llm_route.model if llm_route else None),
+            api_style=(llm_route.api_style if llm_route else None),
+            reasoning_effort=(llm_route.reasoning_effort if llm_route else None),
+            temperature=(float(llm_route.temperature) if (llm_route and llm_route.temperature is not None) else 0.2),
+            timeout_sec=(int(llm_route.timeout_sec) if (llm_route and llm_route.timeout_sec) else 40),
         )
         raw = res.text.strip()
         data = json.loads(raw)

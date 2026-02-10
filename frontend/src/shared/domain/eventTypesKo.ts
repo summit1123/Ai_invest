@@ -9,6 +9,7 @@ export const EVENT_TYPE_KO: Record<string, string> = {
   MEETING_MESSAGE: '회의 메시지',
   MEETING_SUMMARY: '회의 요약',
   MEETING_ACTION_ASSIGNED: '회의 액션 할당',
+  WEEKLY_PRIORITY_SET: '주간 우선순위 설정',
   ORDER_SUBMITTED: '주문 제출',
   ORDER_ACK: '주문 ACK',
   ORDER_REJECTED: '주문 거부',

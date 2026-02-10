@@ -17,11 +17,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+from ai_invest.config.llm_router import llm_route_for_agent  # noqa: E402
 from ai_invest.config.rules_loader import load_rules  # noqa: E402
 from ai_invest.agents.secretary_agent import generate_meeting_minutes  # noqa: E402
+from ai_invest.agents.strategy_coordinator_agent import propose_trade_plan  # noqa: E402
 from ai_invest.market_data.features import build_feature_snapshot_from_candles  # noqa: E402
 from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_market_snapshot  # noqa: E402
 from ai_invest.notifications.service import NotificationService  # noqa: E402
+from ai_invest.research.rss import fetch_crypto_headlines, summarize_headlines_text  # noqa: E402
 from ai_invest.storage.postgres import DbEvent, DbMeetingMessage, DbMeetingSession, PostgresRepo  # noqa: E402
 
 
@@ -179,15 +182,38 @@ def run_once(
             best = row
 
     best = best or evaluated[0]
-    # Basic plan: if score is negative, stay flat (0%); else allocate up to configured default.
+
+    # Coordinator input: ops snapshot + headline context (lightweight RSS).
+    pause = repo.fetch_pause_state()
+    recon = repo.fetch_latest_reconciliation()
+    headlines = fetch_crypto_headlines(symbol=str(best.get("symbol") or symbols[0]), limit=10)
+    research_brief = {
+        "headlines": headlines,
+        "headlines_text": summarize_headlines_text(headlines, max_items=6),
+    }
+
     default_target = float((rules_raw.get("governance") or {}).get("default_target_position_pct", 10.0))
-    target_pct = 0.0 if float(best["score"]) < 0 else min(float(default_target), float(rules.risk.max_position_pct_per_symbol))
+    plan = propose_trade_plan(
+        candidates=evaluated,
+        allowed_symbols=symbols,
+        default_target_position_pct=default_target,
+        max_position_pct_per_symbol=float(rules.risk.max_position_pct_per_symbol),
+        cost_guard=dict(rules_raw.get("cost_guard") or {}),
+        ops_state={"pause": pause, "latest_reconciliation": recon},
+        research_brief=research_brief,
+        llm_route=llm_route_for_agent(rules_raw=rules_raw, agent_name="strategy_coordinator"),
+    )
+    target_pct = float(plan.target_position_pct)
+    best = next((row for row in evaluated if str(row.get("symbol") or "") == plan.symbol), best)
 
     meeting_id = uuid.uuid4()
     started_at = _utcnow()
     ended_at = started_at + timedelta(seconds=2)
 
-    summary_short = f"[{slot_key}] Trade Plan: {best['symbol']} target={target_pct:.1f}% (score={best['score']:.3f})"
+    summary_short = (
+        f"[{slot_key}] Trade Plan: {plan.symbol} target={target_pct:.1f}% "
+        f"(score={float(best.get('score') or 0.0):.3f})"
+    )
     action_items = [
         {"owner": "research_agent", "action": "다음 슬롯까지 리스크(스프레드/ATR) 모니터링", "due_date": str(now_kst.date())},
         {"owner": "ops_agent", "action": "정합성 WARN/FAIL 여부 점검 및 알림 누락 확인", "due_date": str(now_kst.date())},
@@ -198,8 +224,11 @@ def run_once(
         {
             "sender_agent": "research_agent",
             "message_type": "EVIDENCE",
-            "content": f"후보 평가 {len(evaluated)}개. 상위: {best['symbol']} score={best['score']:.3f}",
-            "payload": {"evaluated": evaluated[:5]},
+            "content": (
+                f"후보 평가 {len(evaluated)}개. 상위: {best['symbol']} score={best['score']:.3f}\n"
+                + (f"뉴스(요약): {research_brief.get('headlines_text')}" if research_brief.get("headlines_text") else "뉴스: (없음)")
+            ),
+            "payload": {"evaluated": evaluated[:5], "headlines": headlines[:8]},
             "confidence": 0.75,
         },
         {
@@ -226,8 +255,16 @@ def run_once(
         {
             "sender_agent": "strategy_coordinator",
             "message_type": "PROPOSAL",
-            "content": f"Trade Plan 확정: {best['symbol']} target_position_pct={target_pct:.1f}% (다음 슬롯까지 유지)",
-            "payload": {"trade_plan": {"symbol": best["symbol"], "target_position_pct": target_pct}},
+            "content": (
+                f"Trade Plan 제안: {plan.symbol} target_position_pct={target_pct:.1f}% (다음 슬롯까지 유지)\n"
+                f"notes: {plan.notes}"
+            ),
+            "payload": {
+                "trade_plan": {"symbol": plan.symbol, "target_position_pct": target_pct, "constraints": dict(plan.constraints or {})},
+                "llm_meta": plan.llm_meta,
+                "error": plan.error,
+                "used_llm": bool(plan.used_llm),
+            },
             "confidence": 0.7,
         },
     ]
@@ -242,10 +279,21 @@ def run_once(
         "participants": ["research_agent", "market_agent", "risk_agent", "ops_agent", "strategy_coordinator"],
         "agenda": {"slot_key": slot_key, "symbols": symbols, "timeframe_entry": timeframe_entry},
         "summary": summary_short,
-        "decisions": {"trade_plan": {"symbol": best["symbol"], "target_position_pct": target_pct}},
+        "decisions": {
+            "trade_plan": {
+                "symbol": plan.symbol,
+                "target_position_pct": target_pct,
+                "constraints": dict(plan.constraints or {}),
+                "notes": plan.notes,
+            }
+        },
         "action_items": {"items": action_items},
     }
-    assistant = generate_meeting_minutes(session=session_map, messages=draft_messages)
+    assistant = generate_meeting_minutes(
+        session=session_map,
+        messages=draft_messages,
+        llm_route=llm_route_for_agent(rules_raw=rules_raw, agent_name="secretary_agent"),
+    )
     assistant_minutes = assistant.text
 
     repo.insert_meeting_session(
@@ -378,19 +426,21 @@ def run_once(
 
     # Trade plan event (used by UI and runtime selection later).
     next_slot = _next_slot_kst(now_kst, times, hit_slot) if hit_slot in times else (now_kst + timedelta(hours=8))
+    constraints = {
+        "max_spread_bps_entry": max_spread,
+        "rsi_min": rsi_min,
+        "volume_zscore_min": vol_min,
+        **(dict(plan.constraints or {})),
+    }
     plan_payload = {
         "slot_key": slot_key,
         "meeting_id": str(meeting_id),
-        "symbol": best["symbol"],
+        "symbol": plan.symbol,
         "target_position_pct": float(target_pct),
         "valid_from_kst": (_slot_dt_for_today_kst(now_kst, hit_slot) if hit_slot in times else now_kst).isoformat(),
         "valid_to_kst": next_slot.isoformat(),
-        "constraints": {
-            "max_spread_bps_entry": max_spread,
-            "rsi_min": rsi_min,
-            "volume_zscore_min": vol_min,
-        },
-        "notes": "DAILY_STRATEGY 회의에서 후보 스코어 기반으로 선정(데모 v1).",
+        "constraints": constraints,
+        "notes": plan.notes,
     }
     repo.insert_event(
         DbEvent(

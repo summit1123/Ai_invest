@@ -10,6 +10,8 @@ export const REASON_CODE_KO: Record<string, { title: string; hint?: string }> = 
   RG_SLIPPAGE_EST_TOO_HIGH: { title: '슬리피지 예상 초과' },
   RG_EDGE_TOO_LOW: { title: '엣지 부족' },
   RG_EXPOSURE_LIMIT: { title: '익스포저 상한' },
+  RG_TRADE_PLAN_FLAT: { title: '트레이드 플랜(0%)', hint: 'Trade Plan이 노출 0%로 지정' },
+  RG_TRADE_PLAN_TARGET_REACHED: { title: '목표 비중 도달', hint: 'Trade Plan 목표 비중에 도달' },
   RG_MIN_ORDER_NOT_MET: { title: '최소 주문금액 미충족' },
   RG_COOLDOWN_ACTIVE: { title: '쿨다운 활성' },
   RG_SIGNAL_CONFLICT: { title: '신호 충돌' },
@@ -39,4 +41,3 @@ export const REASON_CODE_KO: Record<string, { title: string; hint?: string }> = 
 export function reasonTitleKo(code: string): string {
   return REASON_CODE_KO[code]?.title ?? code
 }
-

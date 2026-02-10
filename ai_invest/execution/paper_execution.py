@@ -96,6 +96,7 @@ class PaperExecutor:
         action: str,
         snapshot: MarketSnapshot,
         rules: RulesConfig,
+        target_position_pct: float | None = None,
     ) -> PaperExecutionResult | None:
         action = action.upper()
         if action not in {"BUY", "SELL"}:
@@ -104,6 +105,15 @@ class PaperExecutor:
         symbol = snapshot.symbol
         ts_decision = _utcnow()
         decision_mid = snapshot.mid_price
+
+        # Paper seed cash (1회) to make sizing realistic.
+        quote_ccy = _quote_currency(snapshot.symbol)
+        paper_cfg = rules.raw.get("paper", {}) if isinstance(rules.raw, dict) else {}
+        seed_cash = float(paper_cfg.get("initial_cash_krw") or 0.0)
+        if seed_cash > 0:
+            self._repo.ensure_paper_seed_cash(currency=quote_ccy, amount=seed_cash)
+
+        cash_balance = self._repo.fetch_cash_balance(currency=quote_ccy)
 
         # Determine quantity.
         pos = self._repo.fetch_position(symbol)
@@ -116,7 +126,41 @@ class PaperExecutor:
         if action == "BUY":
             min_order_krw = int(rules.execution.min_order_krw)
             price = snapshot.best_bid  # post-only maker bias
-            qty = float(min_order_krw) / float(price)
+            if cash_balance <= 0:
+                return None
+
+            # If we have a target allocation (from Trade Plan), size toward that level.
+            tgt_pct = None
+            try:
+                tgt_pct = float(target_position_pct) if target_position_pct is not None else None
+            except Exception:
+                tgt_pct = None
+
+            if tgt_pct is None:
+                if cash_balance < float(min_order_krw):
+                    return None
+                qty = float(min_order_krw) / float(price)
+            else:
+                if tgt_pct <= 0:
+                    return None
+                pos_value = current_qty * float(snapshot.mid_price)
+                equity = float(cash_balance) + float(pos_value)
+                if equity <= 0:
+                    return None
+
+                desired_value = equity * (float(tgt_pct) / 100.0)
+                desired_qty_total = desired_value / float(price) if float(price) > 0 else 0.0
+                buy_qty = max(0.0, float(desired_qty_total) - float(current_qty))
+
+                # Fee-aware affordability.
+                fee_bps = _fee_rate_bps(rules, side="BUY")
+                fee_rate = float(fee_bps) / 10000.0
+                max_affordable_qty = float(cash_balance) / (float(price) * (1.0 + fee_rate)) if float(price) > 0 else 0.0
+                buy_qty = min(buy_qty, max_affordable_qty)
+
+                if buy_qty * float(price) < float(min_order_krw):
+                    return None
+                qty = float(buy_qty)
             side = "BUY"
         else:
             if current_qty <= 0:
@@ -249,7 +293,6 @@ class PaperExecutor:
         self._repo.update_order_status(order_id, status=OrderState.FILLED.value, meta_patch={"filled_ts": fill_ts.isoformat()})
 
         # Finance ledger primitive (quote-currency cashflow + fee).
-        quote_ccy = _quote_currency(symbol)
         notional = float(fill_price) * float(qty)
         cashflow = -notional if side.upper() == "BUY" else notional
         self._repo.insert_ledger_entry(
@@ -272,6 +315,7 @@ class PaperExecutor:
                     "decision_id": str(decision_id),
                     "trade_id": str(trade_id),
                     "entry_decision_id": str(entry_decision_id) if entry_decision_id else None,
+                    "target_position_pct": float(target_position_pct) if target_position_pct is not None else None,
                 },
             )
         )

@@ -41,6 +41,22 @@ def _as_str(payload: Mapping[str, Any], path: str) -> str:
     return value
 
 
+def _opt_float(payload: Mapping[str, Any], path: str) -> float | None:
+    try:
+        value = _dot_get(payload, path)
+    except Exception:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        s = str(value).strip()
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class SafeJudgeDecision:
     action: str  # BUY / SELL / HOLD / PAUSE
@@ -75,6 +91,11 @@ def safe_judge_decide(
     pause_state = _as_bool(payload, "ops.pause_state")
     daily_loss_pct = _as_float(payload, "context.account.daily_loss_pct")
 
+    # Optional context fields (paper/live sizing, trade plan).
+    trade_plan_target_pct = _opt_float(payload, "context.trade_plan.target_position_pct")
+    current_position_pct = _opt_float(payload, "context.position.current_position_pct")
+    cash_krw = _opt_float(payload, "context.account.cash_krw")
+
     gates: dict[str, Any] = {
         "symbol": symbol,
         "pause_state": pause_state,
@@ -84,6 +105,9 @@ def safe_judge_decide(
         "max_daily_loss_pct": rules.risk.max_daily_loss_pct,
         "spread_bps": spread_bps,
         "max_spread_bps_entry": rules.cost_guard.max_spread_bps_entry,
+        "trade_plan_target_pct": trade_plan_target_pct,
+        "current_position_pct": current_position_pct,
+        "cash_krw": cash_krw,
     }
 
     # External agent opinions (optional but supported).
@@ -141,6 +165,20 @@ def safe_judge_decide(
         else:
             action = "HOLD"
         reasons.append(ReasonCode.RG_PASS)
+
+        # Trade Plan gating (position sizing guard): if plan says "flat" or already at target, do not buy.
+        if action == "BUY" and trade_plan_target_pct is not None:
+            if float(trade_plan_target_pct) <= 0:
+                action = "HOLD"
+                reasons = [ReasonCode.RG_TRADE_PLAN_FLAT]
+            elif current_position_pct is not None and float(current_position_pct) >= float(trade_plan_target_pct) - 0.25:
+                action = "HOLD"
+                reasons = [ReasonCode.RG_TRADE_PLAN_TARGET_REACHED]
+
+        # Paper/live cash guard: if we cannot satisfy min order notional, hold.
+        if action == "BUY" and cash_krw is not None and float(cash_krw) < float(rules.execution.min_order_krw):
+            action = "HOLD"
+            reasons = [ReasonCode.RG_MIN_ORDER_NOT_MET]
 
     selected_reason_codes = [c.value for c in validate_reason_codes(reasons, max_items=3)]
 

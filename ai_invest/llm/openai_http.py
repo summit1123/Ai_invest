@@ -136,6 +136,8 @@ def openai_generate_text(
     user_prompt: str,
     model: str | None = None,
     temperature: float = 0.2,
+    api_style: str | None = None,
+    reasoning_effort: str | None = None,
     max_output_tokens: int | None = None,
     timeout_sec: int = 40,
 ) -> OpenAITextResult:
@@ -149,7 +151,9 @@ def openai_generate_text(
     - This must never be used for trade execution decisions in v1 (summaries only).
     """
 
-    style = _get_env("OPENAI_API_STYLE", default="auto").lower() or "auto"
+    style = (api_style or _get_env("OPENAI_API_STYLE", default="auto")).lower().strip() or "auto"
+    if style not in {"auto", "responses", "chat"}:
+        style = "auto"
     base = _base_url()
     headers = _headers()
 
@@ -157,11 +161,20 @@ def openai_generate_text(
     if not chosen_model:
         raise OpenAIConfigError("OPENAI_LLM_MODEL is missing")
 
-    # Reasoning models (e.g., gpt-5) may burn many tokens on hidden reasoning by default.
-    # Keep the default conservative so summaries/briefs don't frequently end as "incomplete".
-    reasoning_effort = _get_env("OPENAI_REASONING_EFFORT", default="").lower().strip()
-    if not reasoning_effort and chosen_model.startswith("gpt-5"):
-        reasoning_effort = "low"
+    def _default_reasoning_effort_for(model_name: str) -> str | None:
+        m = str(model_name or "").strip().lower()
+        if m.startswith("gpt-5.2-pro"):
+            return "medium"
+        if m.startswith("gpt-5"):
+            return "low"
+        return None
+
+    # Reasoning models (e.g., gpt-5) may spend large hidden reasoning tokens by default.
+    # Keep the default conservative for summaries/briefs; allow caller override per-agent.
+    reasoning_effort = (reasoning_effort or _get_env("OPENAI_REASONING_EFFORT", default="")).lower().strip()
+    if not reasoning_effort:
+        de = _default_reasoning_effort_for(chosen_model)
+        reasoning_effort = str(de or "").strip()
 
     last_err: OpenAIRequestError | None = None
 
@@ -176,7 +189,7 @@ def openai_generate_text(
         }
         if max_output_tokens is not None and int(max_output_tokens) > 0:
             payload["max_output_tokens"] = int(max_output_tokens)
-        if reasoning_effort in {"low", "medium", "high"}:
+        if reasoning_effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
             payload["reasoning"] = {"effort": reasoning_effort}
         # Some reasoning models reject temperature; we'll retry without if needed.
         if temperature is not None:

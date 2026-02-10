@@ -31,6 +31,8 @@
 | `RG_SLIPPAGE_EST_TOO_HIGH` | `HOLD` | 예상 슬리피지 초과 |
 | `RG_EDGE_TOO_LOW` | `HOLD` | 비용 반영 후 기대엣지 부족 |
 | `RG_EXPOSURE_LIMIT` | `HOLD` | 익스포저 상한 초과 |
+| `RG_TRADE_PLAN_FLAT` | `HOLD` | Trade Plan이 노출 0%로 지정(진입 금지) |
+| `RG_TRADE_PLAN_TARGET_REACHED` | `HOLD` | Trade Plan 목표 비중에 이미 도달 |
 | `RG_MIN_ORDER_NOT_MET` | `HOLD` | 최소 주문금액 미충족 |
 | `RG_COOLDOWN_ACTIVE` | `HOLD` | 연속 손실 쿨다운 구간 |
 | `RG_SIGNAL_CONFLICT` | `HOLD` | 핵심 Agent 신호 충돌 |

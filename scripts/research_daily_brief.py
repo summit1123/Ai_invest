@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+from ai_invest.config.llm_router import llm_route_for_agent  # noqa: E402
 from ai_invest.config.rules_loader import load_rules  # noqa: E402
 from ai_invest.agents.research_agent import research_agent_daily_brief  # noqa: E402
 from ai_invest.market_data.features import build_feature_snapshot_from_candles  # noqa: E402
@@ -75,12 +76,14 @@ def build_brief(
         next_actions.append("reconciliation_checks diff 확인 및 원인 제거")
 
     headlines = fetch_crypto_headlines(symbol=symbol, limit=12)
+    llm_route = llm_route_for_agent(rules_raw=rules_raw, agent_name="research_agent")
     brief = research_agent_daily_brief(
         symbol=symbol,
         snapshot={"last_price": snap.last_price, "best_bid": snap.best_bid, "best_ask": snap.best_ask, "mid_price": snap.mid_price, "spread_bps": snap.spread_bps},
         features={"atr_pct": feat.atr_pct, "rsi_14": feat.rsi_14, "vol_zscore": feat.vol_zscore},
         ops={"pause": pause, "latest_reconciliation": recon},
         headlines=headlines,
+        llm_route=llm_route,
     )
 
     summary = brief.summary

@@ -37,6 +37,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _quote_currency(symbol: str) -> str:
+    if "-" not in symbol:
+        return "KRW"
+    return symbol.split("-", 1)[0].strip().upper() or "KRW"
+
+
 def _parse_dt(value: str) -> datetime | None:
     value = str(value or "").strip()
     if not value:
@@ -139,6 +145,11 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
     )
 
     default_symbol = rules.universe.symbols[0]
+    # Seed paper cash once so position sizing can use target_position_pct realistically.
+    paper_cfg = raw_rules.get("paper", {}) if isinstance(raw_rules, dict) else {}
+    seed_cash = float((paper_cfg or {}).get("initial_cash_krw") or 0.0)
+    if seed_cash > 0:
+        repo.ensure_paper_seed_cash(currency=_quote_currency(default_symbol), amount=seed_cash)
     timeframe_entry = str(raw_rules.get("signal", {}).get("timeframe_entry", "15m"))
     tf_min = _timeframe_to_minutes(timeframe_entry)
 
@@ -152,6 +163,18 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 symbol = plan_symbol
 
         snapshot = fetch_market_snapshot(symbol)
+        quote_ccy = _quote_currency(symbol)
+        cash = repo.fetch_cash_balance(currency=quote_ccy)
+        pos = repo.fetch_position(symbol)
+        current_qty = float(pos.qty) if pos else 0.0
+        pos_value = float(current_qty) * float(snapshot.mid_price)
+        equity = float(cash) + float(pos_value)
+        current_pct = (pos_value / equity * 100.0) if equity > 0 else 0.0
+        plan_target_pct = None
+        try:
+            plan_target_pct = float(plan.get("target_position_pct")) if plan and _trade_plan_is_active(plan) else None
+        except Exception:
+            plan_target_pct = None
         quote_ts = _utcnow()
         repo.insert_market_quote(
             ts=quote_ts,
@@ -213,7 +236,25 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             snapshot=snapshot,
             features=asdict(feat),
             ops=ops,
-            context=default_context(daily_loss_pct=0.0),
+            context={
+                "account": {
+                    "daily_loss_pct": 0.0,
+                    "cash_krw": float(cash),
+                    "equity_krw": float(equity),
+                    "position_value_krw": float(pos_value),
+                },
+                "risk_limits": {
+                    "max_daily_loss_pct": float(rules.risk.max_daily_loss_pct),
+                    "max_slippage_bps": float(rules.cost_guard.max_predicted_slippage_bps),
+                    "max_spread_bps_entry": float(rules.cost_guard.max_spread_bps_entry),
+                },
+                "position": {"current_qty": float(current_qty), "current_position_pct": float(current_pct)},
+                "trade_plan": {
+                    "slot_key": plan.get("slot_key") if plan else None,
+                    "target_position_pct": plan_target_pct,
+                    "valid_to_kst": plan.get("valid_to_kst") if plan else None,
+                },
+            },
         )
 
         # Agents (opinion-only)
@@ -382,6 +423,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             action=safe.action,
             snapshot=snapshot,
             rules=rules,
+            target_position_pct=plan_target_pct,
         )
         if exec_res is not None:
             notifier.notify_fill(
