@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 
 from ai_invest.config.dotenv import load_dotenv
 from ai_invest.config.rules_loader import load_rules
@@ -37,7 +37,9 @@ def healthz() -> dict[str, Any]:
 
 
 @app.get("/api/v1/ui/latest-decisions", tags=["의사결정"], summary="최근 의사결정 목록")
-def latest_decisions(limit: int = 20) -> dict[str, Any]:
+def latest_decisions(
+    limit: int = Query(20, ge=1, le=500, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_latest_decisions(limit=limit)})
 
@@ -60,49 +62,65 @@ def today_overview() -> dict[str, Any]:
 
 
 @app.get("/api/v1/ui/timeline", tags=["이벤트"], summary="이벤트 타임라인")
-def timeline(limit: int = 200) -> dict[str, Any]:
+def timeline(
+    limit: int = Query(200, ge=1, le=2000, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_recent_events(limit=limit)})
 
 
 @app.get("/api/v1/ui/execution-quality", tags=["실행/비용"], summary="실행 품질(TCA-lite) 조회")
-def execution_quality(limit: int = 200) -> dict[str, Any]:
+def execution_quality(
+    limit: int = Query(200, ge=1, le=2000, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_execution_metrics(limit=limit)})
 
 
 @app.get("/api/v1/ui/reconciliation-status", tags=["운영"], summary="정합성 체크 목록")
-def reconciliation_status(limit: int = 200) -> dict[str, Any]:
+def reconciliation_status(
+    limit: int = Query(200, ge=1, le=2000, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_reconciliation_checks(limit=limit)})
 
 
 @app.get("/api/v1/ui/pause-log", tags=["운영"], summary="PAUSE 로그")
-def pause_log(limit: int = 200) -> dict[str, Any]:
+def pause_log(
+    limit: int = Query(200, ge=1, le=2000, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_pause_logs(limit=limit)})
 
 
 @app.get("/api/v1/ui/notifications-delivery", tags=["알림"], summary="알림 전송 이력")
-def notifications_delivery(limit: int = 200) -> dict[str, Any]:
+def notifications_delivery(
+    limit: int = Query(200, ge=1, le=2000, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_notification_deliveries(limit=limit)})
 
 
 @app.get("/api/v1/ui/ledger", tags=["정산"], summary="원장(ledger) 조회")
-def ledger(limit: int = 200) -> dict[str, Any]:
+def ledger(
+    limit: int = Query(200, ge=1, le=2000, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_ledger_entries(limit=limit)})
 
 
 @app.get("/api/v1/ui/outcomes", tags=["학습/복기"], summary="Outcome(복기) 목록")
-def outcomes(limit: int = 200) -> dict[str, Any]:
+def outcomes(
+    limit: int = Query(200, ge=1, le=2000, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_decision_outcomes(limit=limit)})
 
 
 @app.get("/api/v1/ui/tax-exports", tags=["정산"], summary="Tax Export 실행 목록")
-def tax_exports(limit: int = 50) -> dict[str, Any]:
+def tax_exports(
+    limit: int = Query(50, ge=1, le=500, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_tax_export_runs(limit=limit)})
 
@@ -125,31 +143,44 @@ def judge(decision_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/v1/ui/collaboration/rooms", tags=["협업"], summary="협업 채널(방) 목록")
-def collaboration_rooms(limit: int = 200) -> dict[str, Any]:
+def collaboration_rooms(
+    limit: int = Query(200, ge=1, le=1000, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_communication_rooms(limit=limit)})
 
 
 @app.get("/api/v1/ui/research/daily", tags=["리서치"], summary="일일 리서치/에이전트 보고 목록")
-def research_daily(limit: int = 50) -> dict[str, Any]:
+def research_daily(
+    limit: int = Query(50, ge=1, le=500, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_agent_daily_reports(limit=limit)})
 
 
 @app.get("/api/v1/ui/agent-opinions", tags=["에이전트"], summary="에이전트 의견 목록")
-def agent_opinions(limit: int = 200, symbol: str | None = None, agent_name: str | None = None) -> dict[str, Any]:
+def agent_opinions(
+    limit: int = Query(200, ge=1, le=2000, description="조회할 최대 개수"),
+    symbol: str | None = Query(None, description="필터: 심볼 (예: KRW-BTC)"),
+    agent_name: str | None = Query(None, description="필터: agent_name (예: market_agent)"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_agent_opinions(limit=limit, symbol=symbol, agent_name=agent_name)})
 
 
 @app.get("/api/v1/ui/meetings", tags=["회의"], summary="회의 세션 목록")
-def meetings(limit: int = 50) -> dict[str, Any]:
+def meetings(
+    limit: int = Query(50, ge=1, le=500, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_meeting_sessions(limit=limit)})
 
 
 @app.get("/api/v1/ui/meetings/{meeting_id}", tags=["회의"], summary="회의 상세(메시지 포함)")
-def meeting_detail(meeting_id: str, limit: int = 500) -> dict[str, Any]:
+def meeting_detail(
+    meeting_id: str,
+    limit: int = Query(500, ge=1, le=5000, description="회의 메시지 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     session = repo.fetch_meeting_session(meeting_id=meeting_id)
     messages = repo.fetch_meeting_messages(meeting_id=meeting_id, limit=limit)
@@ -157,7 +188,9 @@ def meeting_detail(meeting_id: str, limit: int = 500) -> dict[str, Any]:
 
 
 @app.get("/api/v1/ui/strategy-reviews", tags=["거버넌스"], summary="전략 리뷰(주간 우선순위) 목록")
-def strategy_reviews(limit: int = 20) -> dict[str, Any]:
+def strategy_reviews(
+    limit: int = Query(20, ge=1, le=200, description="조회할 최대 개수"),
+) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_strategy_reviews(limit=limit)})
 

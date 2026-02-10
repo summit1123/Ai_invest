@@ -6,6 +6,7 @@
 LLM은 다음 용도로만 사용한다(실행 의존 금지):
 - 리서치(뉴스/이슈) 요약 및 리스크 watchlist 작성
 - 회의록(Secretary) 생성: “누가/무엇을/왜” 결정했는지 한국어로 자산화
+- Strategy Coordinator(CEO) 제안: 정시 회의에서 Trade Plan(종목/비중/제약) 및 주간 우선순위 제안
 - 룰 패치 제안(RULE_PATCH) 생성(실제 적용은 Validator/승인 절차)
 
 원칙:
@@ -69,6 +70,7 @@ LLM은 다음 용도로만 사용한다(실행 의존 금지):
 알림:
 - `tpl_meeting_summary`, `tpl_meeting_action_items`
 - `tpl_meeting_summary`는 Secretary Agent(LLM optional)가 “사람이 읽는 회의록”을 생성한다.
+- Trade Plan의 종목/비중 선택은 Strategy Coordinator(LLM optional)가 담당한다(실패 시 deterministic fallback).
 
 ### 2.1 Trade Plan(회의 산출물) → 실시간 루프 입력
 회의의 결론은 “말”이 아니라 **데이터(Trade Plan)**로 저장되어야 한다.
@@ -137,3 +139,6 @@ Trade Plan 최소 필드:
 - 핵심 API curl OK
 - `notification_deliveries`에 `SENT/FAILED/SKIPPED`가 남음
 
+## 7) LLM 모델 라우팅(Agent별)
+Agent별 모델/엔드포인트/effort는 `rules.yaml`의 `llm:` 섹션으로 제어한다.
+- 예: Research/Secretary/Strategy Coordinator는 `gpt-5.2-pro`, 실시간 루프는 LLM 비의존
