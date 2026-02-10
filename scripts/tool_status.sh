@@ -16,10 +16,14 @@ else
   echo "- gh: 없음"
 fi
 
-if command -v docker >/dev/null 2>&1; then
-  echo "- docker: $(docker --version)"
-elif [[ -x "$HOME/.local/bin/docker" ]]; then
-  echo "- docker: $($HOME/.local/bin/docker --version) (local)"
+if command -v psql >/dev/null 2>&1; then
+  echo "- psql: $(psql --version)"
 else
-  echo "- docker: 없음"
+  echo "- psql: 없음"
+fi
+
+if command -v pg_isready >/dev/null 2>&1; then
+  echo "- pg_isready: 사용 가능"
+else
+  echo "- pg_isready: 없음"
 fi
