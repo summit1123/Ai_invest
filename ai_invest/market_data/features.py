@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Sequence
+
+
+@dataclass(frozen=True)
+class FeatureSnapshot:
+    atr_pct: float
+    rsi_14: float
+    vol_zscore: float
+    missing_rate_1m: float
+
+
+def _mean(values: Sequence[float]) -> float:
+    return sum(values) / float(len(values)) if values else 0.0
+
+
+def _std(values: Sequence[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    m = _mean(values)
+    var = sum((x - m) ** 2 for x in values) / float(len(values) - 1)
+    return math.sqrt(var)
+
+
+def compute_rsi(closes: Sequence[float], *, period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+
+    gains: list[float] = []
+    losses: list[float] = []
+    for i in range(1, period + 1):
+        delta = closes[-i] - closes[-i - 1]
+        if delta >= 0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-delta)
+
+    avg_gain = _mean(gains)
+    avg_loss = _mean(losses)
+    if avg_loss <= 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return float(max(0.0, min(100.0, rsi)))
+
+
+def compute_atr_pct(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    *,
+    period: int = 14,
+) -> float:
+    n = min(len(highs), len(lows), len(closes))
+    if n < period + 1:
+        return 0.0
+
+    trs: list[float] = []
+    for i in range(n - period, n):
+        high = highs[i]
+        low = lows[i]
+        prev_close = closes[i - 1]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+
+    atr = _mean(trs)
+    last_close = closes[-1]
+    if last_close <= 0:
+        return 0.0
+    return float(atr / last_close * 100.0)
+
+
+def compute_volume_zscore(volumes: Sequence[float], *, window: int = 20) -> float:
+    if len(volumes) < window:
+        return 0.0
+    sample = list(volumes[-window:])
+    m = _mean(sample)
+    s = _std(sample)
+    if s <= 0:
+        return 0.0
+    return float((sample[-1] - m) / s)
+
+
+def build_feature_snapshot_from_candles(
+    *,
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    volumes: Sequence[float],
+    missing_rate_1m: float = 0.0,
+) -> FeatureSnapshot:
+    return FeatureSnapshot(
+        atr_pct=compute_atr_pct(highs, lows, closes, period=14),
+        rsi_14=compute_rsi(closes, period=14),
+        vol_zscore=compute_volume_zscore(volumes, window=20),
+        missing_rate_1m=float(missing_rate_1m),
+    )
+

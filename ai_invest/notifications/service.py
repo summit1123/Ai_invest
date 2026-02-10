@@ -1,0 +1,579 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Mapping
+
+from zoneinfo import ZoneInfo
+
+from ai_invest.notifications import telegram_client
+from ai_invest.notifications.templates import render
+from ai_invest.storage.postgres import PostgresRepo
+
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _ts_payload() -> dict[str, str]:
+    now = _utcnow()
+    return {"ts_utc": now.isoformat(), "ts_kst": now.astimezone(KST).isoformat()}
+
+
+def _stable_hash(obj: Any) -> str:
+    try:
+        raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    except Exception:
+        raw = str(obj).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:12]
+
+
+@dataclass(frozen=True)
+class NotificationContext:
+    send_telegram: bool
+    notify_safe_hold: bool
+    dedupe_within_sec: int
+
+
+def load_notification_context() -> NotificationContext:
+    dedupe = os.environ.get("NOTIFICATION_DEDUPE_WITHIN_SEC", "").strip()
+    try:
+        dedupe_sec = int(dedupe) if dedupe else 60
+    except Exception:
+        dedupe_sec = 60
+    return NotificationContext(
+        send_telegram=parse_bool(os.environ.get("SEND_TELEGRAM", "")),
+        notify_safe_hold=parse_bool(os.environ.get("NOTIFY_SAFE_DECISION_HOLD", "")),
+        dedupe_within_sec=max(0, dedupe_sec),
+    )
+
+
+class NotificationService:
+    def __init__(self, repo: PostgresRepo, ctx: NotificationContext | None = None) -> None:
+        self._repo = repo
+        self._ctx = ctx or load_notification_context()
+
+    def _deliver_telegram(
+        self,
+        *,
+        event_id: uuid.UUID,
+        template_id: str,
+        severity: str,
+        chat_id: str,
+        payload: Mapping[str, Any],
+        dedupe_key: str | None = None,
+    ) -> None:
+        delivery_id = uuid.uuid4()
+        text = render(template_id, payload)
+
+        if not chat_id:
+            self._repo.insert_notification_delivery(
+                delivery_id=delivery_id,
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id=template_id,
+                severity=severity,
+                status="FAILED",
+                attempt_count=0,
+                last_error="chat_id missing",
+                dedupe_key=dedupe_key,
+                payload={"event": payload},
+                sent_at=None,
+            )
+            return
+
+        if dedupe_key and self._ctx.dedupe_within_sec > 0:
+            if self._repo.was_notification_sent_recently(dedupe_key=dedupe_key, within_sec=self._ctx.dedupe_within_sec):
+                self._repo.insert_notification_delivery(
+                    delivery_id=delivery_id,
+                    event_id=event_id,
+                    channel="TELEGRAM",
+                    template_id=template_id,
+                    severity=severity,
+                    status="SKIPPED",
+                    attempt_count=0,
+                    last_error=f"dedupe skip within {self._ctx.dedupe_within_sec}s",
+                    dedupe_key=dedupe_key,
+                    payload={"telegram": {"chat_id": chat_id}, "event": payload},
+                    sent_at=None,
+                )
+                return
+
+        if not self._ctx.send_telegram:
+            self._repo.insert_notification_delivery(
+                delivery_id=delivery_id,
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id=template_id,
+                severity=severity,
+                status="PENDING",
+                attempt_count=0,
+                last_error="SEND_TELEGRAM disabled",
+                dedupe_key=dedupe_key,
+                payload={"telegram": {"chat_id": chat_id}, "event": payload},
+                sent_at=None,
+            )
+            return
+
+        result = telegram_client.send_message(chat_id=chat_id, text=text)
+        status = "SENT" if result.ok else "FAILED"
+        self._repo.insert_notification_delivery(
+            delivery_id=delivery_id,
+            event_id=event_id,
+            channel="TELEGRAM",
+            template_id=template_id,
+            severity=severity,
+            status=status,
+            attempt_count=1,
+            last_error=result.error,
+            dedupe_key=dedupe_key,
+            payload={"telegram": {"chat_id": chat_id, "message_id": result.message_id}, "event": payload},
+            sent_at=_utcnow() if result.ok else None,
+        )
+
+    def notify_safe_decision(
+        self,
+        *,
+        event_id: uuid.UUID,
+        symbol: str,
+        action: str,
+        reasons: list[str],
+        run_id: uuid.UUID,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        action = action.upper()
+        if action == "HOLD" and not self._ctx.notify_safe_hold:
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_safe_decision",
+                severity="NORMAL",
+                status="SKIPPED",
+                attempt_count=0,
+                last_error="HOLD suppressed (NOTIFY_SAFE_DECISION_HOLD=false)",
+                dedupe_key=f"DECISION:SAFE:{symbol}:{action}",
+                payload={"symbol": symbol, "action": action, "reasons": reasons, "run_id": str(run_id)},
+                sent_at=None,
+            )
+            return
+        try:
+            chat_id = telegram_client.chat_id_trading()
+        except Exception as exc:  # pragma: no cover
+            chat_id = ""
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_safe_decision",
+                severity="NORMAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"symbol": symbol, "action": action}},
+                sent_at=None,
+            )
+            return
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_safe_decision",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=f"DECISION:SAFE:{symbol}:{action}",
+            payload={
+                **_ts_payload(),
+                "symbol": symbol,
+                "action": action,
+                "reasons": reasons,
+                "context": dict(context or {}),
+                "run_id": str(run_id),
+            },
+        )
+
+    def notify_fill(
+        self,
+        *,
+        event_id: uuid.UUID,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float,
+        fee: float,
+        fee_currency: str,
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_trading()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_fill_notice",
+                severity="NORMAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"symbol": symbol, "side": side}},
+                sent_at=None,
+            )
+            return
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_fill_notice",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=f"FILL:{symbol}:{side}:{event_id}",
+            payload={
+                **_ts_payload(),
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "fee": fee,
+                "fee_currency": fee_currency,
+            },
+        )
+
+    def notify_recon_fail(
+        self,
+        *,
+        event_id: uuid.UUID,
+        symbol: str,
+        diff_summary: str | None,
+        run_id: uuid.UUID,
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_ops()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_recon_fail",
+                severity="CRITICAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"symbol": symbol}},
+                sent_at=None,
+            )
+            return
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_recon_fail",
+            severity="CRITICAL",
+            chat_id=chat_id,
+            dedupe_key=f"OPS:RECON_FAIL:{symbol}",
+            payload={
+                **_ts_payload(),
+                "symbol": symbol,
+                "diff_summary": diff_summary,
+                "run_id": str(run_id),
+            },
+        )
+
+    def notify_pause(
+        self,
+        *,
+        event_id: uuid.UUID,
+        symbol: str,
+        reason_type: str,
+        run_id: uuid.UUID,
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_ops()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_pause_critical",
+                severity="CRITICAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"symbol": symbol, "reason_type": reason_type}},
+                sent_at=None,
+            )
+            return
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_pause_critical",
+            severity="CRITICAL",
+            chat_id=chat_id,
+            dedupe_key=f"OPS:PAUSE:{reason_type}:{symbol}",
+            payload={
+                **_ts_payload(),
+                "symbol": symbol,
+                "reason_type": reason_type,
+                "run_id": str(run_id),
+            },
+        )
+
+    def notify_tax_export_done(self, *, event_id: uuid.UUID, export_id: str, year: int, month: int) -> None:
+        try:
+            chat_id = telegram_client.chat_id_review()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_tax_export_done",
+                severity="NORMAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"export_id": export_id}},
+                sent_at=None,
+            )
+            return
+        period_label = f"{year:04d}-{month:02d}"
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_tax_export_done",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=f"FINANCE:TAX_EXPORT_DONE:{period_label}:{export_id}",
+            payload={
+                **_ts_payload(),
+                "period_label": period_label,
+                "export_id": export_id,
+            },
+        )
+
+    def notify_tax_export_fail(
+        self, *, event_id: uuid.UUID, export_id: str, year: int, month: int, errors: list[str]
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_review()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_tax_export_fail",
+                severity="HIGH",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"export_id": export_id, "errors": errors}},
+                sent_at=None,
+            )
+            return
+        period_label = f"{year:04d}-{month:02d}"
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_tax_export_fail",
+            severity="HIGH",
+            chat_id=chat_id,
+            dedupe_key=f"FINANCE:TAX_EXPORT_FAIL:{period_label}:{export_id}",
+            payload={
+                **_ts_payload(),
+                "period_label": period_label,
+                "export_id": export_id,
+                "errors": errors[:5],
+            },
+        )
+
+    def notify_research_daily_brief(
+        self,
+        *,
+        event_id: uuid.UUID,
+        brief_date: str,
+        summary: str,
+        risk_watchlist: list[str],
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_research()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_research_daily_brief",
+                severity="NORMAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"brief_date": brief_date}},
+                sent_at=None,
+            )
+            return
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_research_daily_brief",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=f"RESEARCH:DAILY_BRIEF:{brief_date}",
+            payload={
+                **_ts_payload(),
+                "brief_date": brief_date,
+                "summary": summary,
+                "risk_watchlist": risk_watchlist[:5],
+            },
+        )
+
+    def notify_daily_review(
+        self,
+        *,
+        event_id: uuid.UUID,
+        day: str,
+        realized_pnl: float,
+        fees_paid: float,
+        trades_count: int,
+        max_drawdown: float | None,
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_review()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_daily_review",
+                severity="NORMAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"day": day}},
+                sent_at=None,
+            )
+            return
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_daily_review",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=f"REVIEW:DAILY:{day}",
+            payload={
+                **_ts_payload(),
+                "day": day,
+                "realized_pnl": realized_pnl,
+                "fees_paid": fees_paid,
+                "trades_count": trades_count,
+                "max_drawdown": max_drawdown,
+            },
+        )
+
+    def notify_weekly_priority(
+        self,
+        *,
+        event_id: uuid.UUID,
+        week_label: str,
+        priority_title: str,
+        hypothesis: str,
+        owner: str,
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_review()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_weekly_priority",
+                severity="NORMAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"week_label": week_label}},
+                sent_at=None,
+            )
+            return
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_weekly_priority",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=f"GOV:WEEKLY_PRIORITY:{week_label}:{priority_title}",
+            payload={
+                **_ts_payload(),
+                "week_label": week_label,
+                "priority_title": priority_title,
+                "hypothesis": hypothesis,
+                "owner": owner,
+            },
+        )
+
+    def notify_meeting_summary(self, *, event_id: uuid.UUID, meeting_id: str, summary: str) -> None:
+        try:
+            chat_id = telegram_client.chat_id_meeting()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_meeting_summary",
+                severity="NORMAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"meeting_id": meeting_id}},
+                sent_at=None,
+            )
+            return
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_meeting_summary",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=f"MEETING:SUMMARY:{meeting_id}",
+            payload={
+                **_ts_payload(),
+                "meeting_id": meeting_id,
+                "summary": summary,
+            },
+        )
+
+    def notify_meeting_action_items(self, *, event_id: uuid.UUID, meeting_id: str, items: list[Mapping[str, Any]]) -> None:
+        try:
+            chat_id = telegram_client.chat_id_meeting()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_meeting_action_items",
+                severity="HIGH",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"meeting_id": meeting_id}},
+                sent_at=None,
+            )
+            return
+        action_hash = _stable_hash(items)
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_meeting_action_items",
+            severity="HIGH",
+            chat_id=chat_id,
+            dedupe_key=f"MEETING:ACTION:{meeting_id}:{action_hash}",
+            payload={
+                **_ts_payload(),
+                "meeting_id": meeting_id,
+                "items": items[:10],
+            },
+        )

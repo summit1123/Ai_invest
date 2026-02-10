@@ -26,3 +26,10 @@ Thumbs.db
 # Local runtime data
 *.log
 data/
+exports/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
