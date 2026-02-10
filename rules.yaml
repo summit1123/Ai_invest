@@ -1,0 +1,101 @@
+version: "v1.0"
+as_of_date: "2026-02-09"
+
+universe:
+  market: "upbit"
+  symbols:
+    - "KRW-BTC"
+  trade_side: "long_only"
+  mode: "paper"
+  max_open_positions: 1
+
+scheduling:
+  decision_interval_sec: 15
+  candle_timeframes:
+    - "1m"
+    - "15m"
+    - "1h"
+
+execution:
+  order_style: "limit_post_only_first"
+  default_ord_type: "limit"
+  default_time_in_force: "post_only"
+  post_only_timeout_sec: 30
+  reprice_interval_sec: 8
+  max_reprice_count: 3
+  fallback_to_market: false
+  min_order_krw: 10000
+  max_submit_retries: 2
+  cancel_on_timeout_sec: 90
+
+fees:
+  source: "upbit_orders_chance"
+  refresh_interval_sec: 300
+  fallback_bid_fee_bps: 5.0
+  fallback_ask_fee_bps: 5.0
+
+risk:
+  max_risk_per_trade_pct: 0.35
+  max_daily_loss_pct: 1.50
+  max_weekly_loss_pct: 4.00
+  max_position_pct_per_symbol: 20.0
+  max_total_exposure_pct: 30.0
+  consecutive_loss_cooldown_count: 3
+  cooldown_minutes_after_trigger: 180
+  min_hold_seconds: 300
+
+cost_guard:
+  max_spread_bps_entry: 8.0
+  max_predicted_slippage_bps: 10.0
+  max_total_cost_bps: 18.0
+  min_expected_edge_bps: 28.0
+  entry_cost_buffer_bps: 5.0
+
+stop_policy:
+  mode: "atr_with_hard_stop"
+  atr_window: 14
+  atr_stop_mult: 2.2
+  atr_trail_mult: 2.8
+  hard_stop_pct: 1.2
+  take_profit_partial_pct: 1.8
+  time_stop_minutes: 360
+  break_even_after_rr: 1.0
+  include_tax_in_realtime_stop: false
+  include_fee_in_realtime_stop: true
+
+regime:
+  trade_allowed:
+    - "TREND"
+  blocked:
+    - "HIGH_VOL"
+    - "DATA_UNSTABLE"
+  trend_adx_min: 25
+  volatility_block_atr_pct: 2.5
+
+signal:
+  trend_follow_enabled: true
+  timeframe_entry: "15m"
+  timeframe_context: "1h"
+  donchian_window: 20
+  volume_zscore_min: 1.2
+  rsi_min: 50
+
+ops_guard:
+  pause_on_ws_reconnects_5m: 5
+  pause_on_rest_429_5m: 8
+  pause_on_recon_fail: true
+  max_data_lag_sec: 3
+  max_clock_skew_ms: 1500
+  max_fill_latency_sec: 45
+
+resume_policy:
+  recon_ok_streak_required: 3
+  check_interval_sec: 20
+  min_stable_duration_sec: 300
+  auto_resume_blocked_reasons:
+    - "RECON_FAIL"
+    - "DAILY_LOSS"
+    - "MANUAL"
+
+settlement:
+  timezone: "Asia/Seoul"

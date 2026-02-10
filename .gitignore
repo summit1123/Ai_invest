@@ -1,0 +1,28 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/.ropeproject
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local runtime data
+*.log
+data/

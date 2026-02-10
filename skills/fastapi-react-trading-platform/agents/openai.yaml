@@ -1,0 +1,4 @@
+interface:
+  display_name: "FastAPI React Trading Platform"
+  short_description: "Build and evolve FastAPI+React AI trading platform"
+  default_prompt: "Implement backend and frontend changes using project contracts"
