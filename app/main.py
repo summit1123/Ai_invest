@@ -67,12 +67,14 @@ def today_overview() -> dict[str, Any]:
     latest_ai = repo.fetch_latest_decision(judge_type="AI")
     pause = repo.fetch_pause_state()
     latest_recon = repo.fetch_latest_reconciliation()
+    portfolio = repo.fetch_portfolio_overview(quote_currency="KRW")
     return ok(
         {
             "latest_safe_decision": latest_safe,
             "latest_ai_decision": latest_ai,
             "pause": pause,
             "latest_reconciliation": latest_recon,
+            "portfolio": portfolio,
         }
     )
 

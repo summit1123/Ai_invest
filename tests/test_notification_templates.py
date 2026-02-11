@@ -81,6 +81,24 @@ class NotificationTemplateTests(unittest.TestCase):
         self.assertIn("주요 링크", text)
         self.assertIn("https://example.com/a", text)
 
+    def test_finance_monthly_review_template(self) -> None:
+        text = render(
+            "tpl_finance_monthly_review",
+            {
+                "ts_kst": "2026-02-28T23:10:00+09:00",
+                "period_label": "2026-02",
+                "tax_export_status": "COMPLETED",
+                "manifest_ref": "exp-123",
+                "llm_used": True,
+                "llm_model": "gpt-5.2-pro",
+                "summary": "원장/실현손익 차이 경미, 정합성 통과",
+                "discrepancy_alerts": ["실현손익-원장 근사 차이 500 KRW"],
+            },
+        )
+        self.assertIn("Finance/Tax 리뷰", text)
+        self.assertIn("gpt-5.2-pro", text)
+        self.assertIn("2026-02", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -626,6 +626,72 @@ class PostgresRepo:
         except Exception:
             return 0.0
 
+    def fetch_portfolio_overview(self, *, quote_currency: str = "KRW") -> dict[str, Any]:
+        """현재 포트폴리오 요약(현금/포지션 평가/총자산)을 반환한다."""
+
+        ccy = str(quote_currency or "").strip().upper() or "KRW"
+        cash = float(self.fetch_cash_balance(currency=ccy))
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                  p.symbol,
+                  p.qty,
+                  p.avg_entry_price,
+                  p.ts_updated,
+                  q.mid_price,
+                  q.ts as quote_ts
+                from positions p
+                left join lateral (
+                  select mq.mid_price, mq.ts
+                  from market_quotes mq
+                  where mq.symbol=p.symbol
+                    and mq.mid_price is not null
+                  order by mq.ts desc
+                  limit 1
+                ) q on true
+                where coalesce(p.qty, 0.0) <> 0.0
+                order by p.symbol asc
+                """
+            )
+            rows = cur.fetchall()
+
+        positions: list[dict[str, Any]] = []
+        position_value = 0.0
+        for symbol, qty, avg_entry_price, ts_updated, mid_price, quote_ts in rows:
+            qty_f = float(qty or 0.0)
+            avg_f = float(avg_entry_price) if avg_entry_price is not None else None
+            mid_f = float(mid_price) if mid_price is not None else None
+            mark = mid_f if mid_f is not None else (avg_f if avg_f is not None else 0.0)
+            value = float(qty_f) * float(mark)
+            position_value += value
+            unrealized = ((float(mark) - float(avg_f)) * float(qty_f)) if avg_f is not None else None
+            positions.append(
+                {
+                    "symbol": str(symbol),
+                    "qty": qty_f,
+                    "avg_entry_price": avg_f,
+                    "mark_price": float(mark),
+                    "mid_price": mid_f,
+                    "value_krw": float(value),
+                    "unrealized_pnl_krw": unrealized,
+                    "ts_updated": ts_updated,
+                    "quote_ts": quote_ts,
+                }
+            )
+
+        equity = float(cash) + float(position_value)
+        exposure_pct = (float(position_value) / float(equity) * 100.0) if float(equity) > 0 else 0.0
+        return {
+            "quote_currency": ccy,
+            "cash_krw": float(cash),
+            "position_value_krw": float(position_value),
+            "equity_krw": float(equity),
+            "exposure_pct": float(exposure_pct),
+            "positions_count": len(positions),
+            "positions": positions,
+        }
+
     def paper_seed_exists(self, *, currency: str) -> bool:
         ccy = str(currency or "").strip().upper()
         if not ccy:
