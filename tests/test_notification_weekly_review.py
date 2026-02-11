@@ -26,6 +26,7 @@ class NotificationWeeklyReviewTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
                 dedupe_within_sec=60,

@@ -42,6 +42,7 @@ def _stable_hash(obj: Any) -> str:
 @dataclass(frozen=True)
 class NotificationContext:
     send_telegram: bool
+    notify_safe_enabled: bool
     notify_safe_hold: bool
     notify_safe_change_only: bool
     dedupe_within_sec: int
@@ -55,6 +56,7 @@ def load_notification_context() -> NotificationContext:
         dedupe_sec = 60
     return NotificationContext(
         send_telegram=parse_bool(os.environ.get("SEND_TELEGRAM", "")),
+        notify_safe_enabled=parse_bool(os.environ.get("NOTIFY_SAFE_DECISION_ENABLED", "0")),
         notify_safe_hold=parse_bool(os.environ.get("NOTIFY_SAFE_DECISION_HOLD", "")),
         notify_safe_change_only=parse_bool(os.environ.get("NOTIFY_SAFE_DECISION_CHANGE_ONLY", "1")),
         dedupe_within_sec=max(0, dedupe_sec),
@@ -183,6 +185,22 @@ class NotificationService:
         run_id: uuid.UUID,
         context: Mapping[str, Any] | None = None,
     ) -> None:
+        if not self._ctx.notify_safe_enabled:
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_safe_decision",
+                severity="NORMAL",
+                status="SKIPPED",
+                attempt_count=0,
+                last_error="safe decision notification disabled (NOTIFY_SAFE_DECISION_ENABLED=false)",
+                dedupe_key=f"DECISION:SAFE:DISABLED:{symbol}",
+                payload={"symbol": symbol, "action": action, "reasons": reasons, "context": dict(context or {})},
+                sent_at=None,
+            )
+            return
+
         action = action.upper()
         safe_ctx = dict(context or {})
         if self._ctx.notify_safe_change_only:

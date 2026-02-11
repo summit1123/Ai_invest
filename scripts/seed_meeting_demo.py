@@ -50,6 +50,7 @@ def main() -> int:
             repo,
             ctx=NotificationContext(
                 send_telegram=False,
+                notify_safe_enabled=False,
                 notify_safe_hold=False,
                 notify_safe_change_only=True,
                 dedupe_within_sec=0,

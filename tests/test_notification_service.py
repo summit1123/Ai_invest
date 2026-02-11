@@ -20,12 +20,41 @@ class _FakeRepo:
 
 
 class NotificationServiceTests(unittest.TestCase):
+    def test_notify_safe_decision_disabled_skips(self) -> None:
+        repo = _FakeRepo()
+        svc = NotificationService(
+            repo,  # type: ignore[arg-type]
+            ctx=NotificationContext(
+                send_telegram=True,
+                notify_safe_enabled=False,
+                notify_safe_hold=True,
+                notify_safe_change_only=True,
+                dedupe_within_sec=60,
+            ),
+        )
+
+        svc.notify_safe_decision(
+            event_id=uuid.uuid4(),
+            symbol="KRW-BTC",
+            action="SELL",
+            reasons=["RG_PASS"],
+            run_id=uuid.uuid4(),
+            context={"market_signal": "SELL"},
+        )
+
+        self.assertEqual(len(repo.rows), 1)
+        row = repo.rows[0]
+        self.assertEqual(row.get("template_id"), "tpl_safe_decision")
+        self.assertEqual(row.get("status"), "SKIPPED")
+        self.assertIn("disabled", str(row.get("last_error") or ""))
+
     def test_notify_trade_plan_set_records_pending_when_send_disabled(self) -> None:
         repo = _FakeRepo()
         svc = NotificationService(
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
                 dedupe_within_sec=60,
@@ -63,6 +92,7 @@ class NotificationServiceTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
                 dedupe_within_sec=60,
@@ -116,6 +146,7 @@ class NotificationServiceTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
                 dedupe_within_sec=60,
