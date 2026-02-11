@@ -95,8 +95,9 @@ def _slot_dt_for_today_kst(now_kst: datetime, hhmm: str) -> datetime:
 
 
 def default_meeting_times_kst() -> list[str]:
-    # 정기 회의: 하루 2회 권장
-    return ["09:00", "21:00"]
+    # 정기 회의: 하루 3회(8시간 간격) 권장
+    # 24:00은 다음날 00:00과 동일하므로 00:00/08:00/16:00으로 표현한다.
+    return ["00:00", "08:00", "16:00"]
 
 
 def get_meeting_times_kst(rules_raw: Mapping[str, Any]) -> list[str]:
