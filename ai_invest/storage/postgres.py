@@ -1420,6 +1420,77 @@ class PostgresRepo:
             return None
         return {"event_id": ev.get("event_id"), "ts": ev.get("ts"), **dict(payload)}
 
+    def fetch_latest_governance_policy(self) -> dict[str, Any] | None:
+        ev = self.fetch_latest_event(event_type="GOVERNANCE_POLICY_SET")
+        if not ev:
+            return None
+        payload = ev.get("payload")
+        if not isinstance(payload, Mapping):
+            return None
+        return {"event_id": ev.get("event_id"), "ts": ev.get("ts"), **dict(payload)}
+
+    def fetch_ready_agent_tasks(self, *, agent_name: str, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select e.event_id, e.ts, e.entity_id, e.payload
+                from events e
+                where e.event_type='AGENT_TASK_ASSIGNED'
+                  and coalesce(e.payload->>'target_agent','')=%s
+                  and coalesce(e.payload->>'status','READY')='READY'
+                  and not exists (
+                    select 1
+                    from events c
+                    where c.event_type='AGENT_TASK_COMPLETED'
+                      and coalesce(c.payload->>'task_id','')=e.entity_id
+                  )
+                order by e.ts asc
+                limit %s
+                """,
+                (str(agent_name), int(limit)),
+            )
+            rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for event_id, ts, entity_id, payload in rows:
+            out.append(
+                {
+                    "event_id": str(event_id),
+                    "ts": ts,
+                    "task_id": str(entity_id),
+                    "payload": payload if isinstance(payload, Mapping) else {},
+                }
+            )
+        return out
+
+    def mark_agent_task_completed(
+        self,
+        *,
+        task_id: str,
+        agent_name: str,
+        result: Mapping[str, Any] | None = None,
+        run_id: uuid.UUID | None = None,
+        rule_version_id: uuid.UUID | None = None,
+    ) -> uuid.UUID:
+        ev_id = uuid.uuid4()
+        self.insert_event(
+            DbEvent(
+                event_id=ev_id,
+                ts=datetime.now(timezone.utc),
+                event_type="AGENT_TASK_COMPLETED",
+                entity_type="agent_tasks",
+                entity_id=str(task_id),
+                run_id=run_id,
+                rule_version_id=rule_version_id,
+                payload={
+                    "task_id": str(task_id),
+                    "target_agent": str(agent_name),
+                    "status": "DONE",
+                    "result": dict(result or {}),
+                },
+            )
+        )
+        return ev_id
+
     def fetch_ai_shadow_decision_for(self, *, safe_decision_id: str) -> dict[str, Any] | None:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(

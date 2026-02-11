@@ -230,6 +230,110 @@ class GovernanceOutputs:
     llm_meta: dict[str, AgentRunMeta]
 
 
+def _next_policy_version(repo: PostgresRepo) -> int:
+    latest = repo.fetch_latest_governance_policy()
+    if not latest:
+        return 1
+    return max(0, int(_as_float(latest.get("policy_version"), default=0.0))) + 1
+
+
+def _build_policy_payload(
+    *,
+    policy_version: int,
+    slot_key: str,
+    outputs: GovernanceOutputs,
+    fact_pack: Mapping[str, Any],
+) -> dict[str, Any]:
+    universe_sel = fact_pack.get("universe_selection") if isinstance(fact_pack.get("universe_selection"), Mapping) else {}
+    prework = fact_pack.get("prework_reports") if isinstance(fact_pack.get("prework_reports"), Mapping) else {}
+    quant = prework.get("quant_strategist") if isinstance(prework.get("quant_strategist"), Mapping) else {}
+    quant_findings = quant.get("findings") if isinstance(quant.get("findings"), Mapping) else {}
+    backtest = quant_findings.get("backtest") if isinstance(quant_findings.get("backtest"), Mapping) else {}
+    return {
+        "policy_version": int(policy_version),
+        "slot_key": str(slot_key),
+        "updated_at_kst": _now_kst().isoformat(),
+        "quant": {
+            "universe_selection": dict(universe_sel or {}),
+            "backtest_engine": str((backtest or {}).get("engine") or "unknown"),
+            "backtest_params": dict((backtest or {}).get("params") or {}),
+        },
+        "risk": {
+            "max_position_pct": float(outputs.risk.max_position_pct),
+            "max_loss_per_trade_pct": float(outputs.risk.max_loss_per_trade_pct),
+            "max_daily_loss_pct": float(outputs.risk.max_daily_loss_pct),
+        },
+        "ops": {
+            "required_ops_gates": list(outputs.ops.required_ops_gates),
+            "trade_window_allowed": bool(outputs.ops.trade_window_allowed),
+        },
+        "plan": {
+            "symbol": outputs.final_plan.symbol,
+            "target_position_pct": float(outputs.final_plan.target_position_pct),
+            "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
+            "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
+        },
+    }
+
+
+def _build_agent_tasks(*, slot_key: str, outputs: GovernanceOutputs) -> list[dict[str, Any]]:
+    due_ts = (_now_kst() + timedelta(hours=8)).isoformat()
+    symbol = str(outputs.final_plan.symbol)
+    return [
+        {
+            "task_id": str(uuid.uuid4()),
+            "target_agent": "research_agent",
+            "task_type": "NEWS_DIGEST",
+            "priority": "HIGH",
+            "status": "READY",
+            "due_ts_kst": due_ts,
+            "description": f"{symbol} 포함 주요 이슈/리스크 브리프 갱신",
+            "slot_key": slot_key,
+            "payload": {"symbol": symbol, "focus": "catalyst+risk"},
+        },
+        {
+            "task_id": str(uuid.uuid4()),
+            "target_agent": "quant_strategist",
+            "task_type": "UNIVERSE_SCAN_BACKTEST",
+            "priority": "HIGH",
+            "status": "READY",
+            "due_ts_kst": due_ts,
+            "description": "업비트 동적 유니버스 스캔 + 후보 백테스트 재실행",
+            "slot_key": slot_key,
+            "payload": {
+                "symbol_hint": symbol,
+                "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
+                "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
+            },
+        },
+        {
+            "task_id": str(uuid.uuid4()),
+            "target_agent": "risk_manager",
+            "task_type": "LIMIT_AUDIT",
+            "priority": "HIGH",
+            "status": "READY",
+            "due_ts_kst": due_ts,
+            "description": "노출/손실 한도 및 실패 시나리오 점검",
+            "slot_key": slot_key,
+            "payload": {
+                "max_position_pct": float(outputs.risk.max_position_pct),
+                "max_daily_loss_pct": float(outputs.risk.max_daily_loss_pct),
+            },
+        },
+        {
+            "task_id": str(uuid.uuid4()),
+            "target_agent": "ops_manager",
+            "task_type": "EXCHANGE_HEALTH_RECON",
+            "priority": "HIGH",
+            "status": "READY",
+            "due_ts_kst": due_ts,
+            "description": "정합성/지연/알림 실패 모니터링 및 리포트",
+            "slot_key": slot_key,
+            "payload": {"required_ops_gates": list(outputs.ops.required_ops_gates)},
+        },
+    ]
+
+
 def enforce_final_trade_plan(
     *,
     plan: FinalTradePlan,
@@ -1350,6 +1454,64 @@ def run_governance_meeting_now(
         except Exception:
             pass
 
+        # Governance memory loop: versioned policy snapshot + per-agent task assignment.
+        policy_version = _next_policy_version(repo)
+        policy_payload = _build_policy_payload(
+            policy_version=policy_version,
+            slot_key=slot_key,
+            outputs=outputs,
+            fact_pack=fact_pack,
+        )
+        policy_event_id = uuid.uuid4()
+        repo.insert_event(
+            DbEvent(
+                event_id=policy_event_id,
+                ts=ended_at,
+                event_type="GOVERNANCE_POLICY_SET",
+                entity_type="policies",
+                entity_id=f"v{policy_version}",
+                run_id=None,
+                rule_version_id=None,
+                payload=policy_payload,
+            )
+        )
+        assigned_tasks = _build_agent_tasks(slot_key=slot_key, outputs=outputs)
+        for task in assigned_tasks:
+            repo.insert_event(
+                DbEvent(
+                    event_id=uuid.uuid4(),
+                    ts=ended_at,
+                    event_type="AGENT_TASK_ASSIGNED",
+                    entity_type="agent_tasks",
+                    entity_id=str(task.get("task_id")),
+                    run_id=None,
+                    rule_version_id=None,
+                    payload=dict(task),
+                )
+            )
+        try:
+            repo.update_meeting_session(
+                meeting_id=meeting_id,
+                decisions={
+                    "trade_plan": outputs.final_plan.model_dump(),
+                    "policy_version": int(policy_version),
+                    "assigned_tasks": assigned_tasks,
+                },
+                action_items={
+                    "items": list(action_items)
+                    + [
+                        {
+                            "owner": str(t.get("target_agent")),
+                            "action": str(t.get("description")),
+                            "due_date": str(t.get("due_ts_kst")),
+                        }
+                        for t in assigned_tasks
+                    ],
+                },
+            )
+        except Exception:
+            pass
+
         if emit is not None:
             emit(
                 "summary",
@@ -1360,6 +1522,8 @@ def run_governance_meeting_now(
                     "summary_short": summary_short,
                     "assistant_minutes": outputs.secretary_minutes,
                     "trade_plan": plan_payload,
+                    "policy_version": int(policy_version),
+                    "assigned_tasks": assigned_tasks,
                 },
             )
             emit("done", {"ok": True})
