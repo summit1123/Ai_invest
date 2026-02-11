@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 from ai_invest.config.llm_router import LLMRoute
 from ai_invest.llm.openai_http import OpenAIConfigError, OpenAIRequestError, OpenAITextResult, openai_generate_text
+from ai_invest.agents.prompt_contract import secretary_minutes_system_prompt
 
 
 def _parse_bool(value: str, *, default: bool = False) -> bool:
@@ -172,16 +173,7 @@ def generate_meeting_minutes(
         "fallback_minutes": _clip(fallback, 1200),
     }
 
-    system_prompt = (
-        "너는 'AI 자동성장 투자' 멀티에이전트 팀의 비서(Secretary Agent)다.\n"
-        "목표: 회의 로그(발언/근거/결정)를 사람이 바로 이해할 수 있는 '회의록'으로 한국어 요약한다.\n"
-        "주의:\n"
-        "- 사실은 입력에 있는 것만 사용하고, 모르면 '미확인'이라고 적어라.\n"
-        "- 이유를 code(RG_PASS 같은)로만 쓰지 말고 한국어로 풀어 써라.\n"
-        "- 투자 조언처럼 과장하지 말고, 시스템/운영 관점으로 담담하게 써라.\n"
-        "- 텔레그램 텍스트로 전송되므로 마크다운 링크/표는 쓰지 말고, 일반 텍스트로 작성.\n"
-        "- 3,000자 이내.\n"
-    )
+    system_prompt = secretary_minutes_system_prompt()
 
     user_prompt = (
         "아래 JSON은 1회 회의 세션과 메시지 트랜스크립트다.\n"

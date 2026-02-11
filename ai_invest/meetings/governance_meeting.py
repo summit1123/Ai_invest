@@ -10,6 +10,15 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from pydantic import BaseModel, Field
 from zoneinfo import ZoneInfo
 
+from ai_invest.agents.prompt_contract import (
+    governance_coordinator_instructions,
+    governance_critique_instructions,
+    governance_ops_instructions,
+    governance_quant_instructions,
+    governance_research_instructions,
+    governance_risk_instructions,
+    governance_secretary_instructions,
+)
 from ai_invest.config.llm_router import LLMRoute, llm_route_for_agent
 from ai_invest.config.rules_loader import RulesConfig, load_rules
 from ai_invest.market_data.features import build_feature_snapshot_from_candles
@@ -687,13 +696,7 @@ def run_governance_protocol(
     try:
         r1_research, m_research = _run_agent_typed(
             name="research_agent",
-            instructions=(
-                "너는 자동투자 멀티에이전트 팀의 Research Agent(거버넌스 회의용)다.\n"
-                "역할: 뉴스/이슈를 정리해 근거 카드와 리스크 워치리스트를 만든다.\n"
-                "금지: 매수/매도 방향성 직접 제안 금지(전략은 Quant가 담당).\n"
-                "원칙: 모르면 '미확인'으로 기록.\n"
-                "출력은 스키마에 맞는 JSON만."
-            ),
+            instructions=governance_research_instructions(),
             output_type=ResearchGovOutput,
             input_payload=fact_pack,
             route=research_route,
@@ -707,16 +710,7 @@ def run_governance_protocol(
     try:
         r1_quant, m_quant = _run_agent_typed(
             name="quant_strategist",
-            instructions=(
-                "너는 자동투자 멀티에이전트 팀의 Quant Strategist다.\n"
-                "역할: Fact Pack 기반으로 '전략 초안'을 제시한다.\n"
-                "규칙:\n"
-                "- allowed_symbols 밖의 심볼은 선택 금지.\n"
-                "- target_position_pct는 0~max_position_pct_per_symbol 범위.\n"
-                "- 실행은 Safe Judge가 하며, 너는 계획/트리거/제약을 명확히 써라.\n"
-                "- 스프레드/정합성/PAUSE가 나쁘면 buy=false 또는 target_position_pct를 낮춰라.\n"
-                "출력은 스키마 JSON만."
-            ),
+            instructions=governance_quant_instructions(),
             output_type=QuantPlanDraft,
             input_payload=fact_pack,
             route=quant_route,
@@ -731,15 +725,7 @@ def run_governance_protocol(
     try:
         r1_risk, m_risk = _run_agent_typed(
             name="risk_manager",
-            instructions=(
-                "너는 자동투자 멀티에이전트 팀의 Risk Manager다.\n"
-                "역할: 허용 상한/손실 제한/금지 조건을 제시한다.\n"
-                "원칙:\n"
-                "- recon FAIL, pause 등 하드 리스크가 있으면 veto를 고려.\n"
-                "- max_position_pct/max_loss_per_trade_pct/max_daily_loss_pct를 명시.\n"
-                "- required_constraints에는 반드시 spread/slippage 같은 실행 제약을 포함.\n"
-                "출력은 스키마 JSON만."
-            ),
+            instructions=governance_risk_instructions(),
             output_type=RiskDraft,
             input_payload=fact_pack,
             route=risk_route,
@@ -754,15 +740,7 @@ def run_governance_protocol(
     try:
         r1_ops, m_ops = _run_agent_typed(
             name="ops_manager",
-            instructions=(
-                "너는 자동투자 멀티에이전트 팀의 Ops Manager다.\n"
-                "역할: 운영/정합성/레이트리밋/데이터 신뢰도 관점에서 '거래 가능 창'을 평가한다.\n"
-                "원칙:\n"
-                "- reconciliation_status=FAIL이면 veto=true.\n"
-                "- required_ops_gates로 실행 하드게이트를 나열.\n"
-                "- data_quality_flags로 데이터 이슈를 기록.\n"
-                "출력은 스키마 JSON만."
-            ),
+            instructions=governance_ops_instructions(),
             output_type=OpsDraft,
             input_payload=fact_pack,
             route=ops_route,
@@ -792,14 +770,7 @@ def run_governance_protocol(
         try:
             c, mc = _run_agent_typed(
                 name=f"{agent_key}_critique",
-                instructions=(
-                    "너는 거버넌스 회의의 '반박/크리틱' 라운드 참가자다.\n"
-                    "입력에는 Round1 결과가 포함되어 있다.\n"
-                    "해야 할 일:\n"
-                    "- 다른 에이전트 제안에서 치명적 모순/누락/위험 1~5개를 critical_issues에 적어라.\n"
-                    "- 바로 적용 가능한 수정 제안 1~5개를 suggested_changes에 적어라.\n"
-                    "출력은 스키마 JSON만."
-                ),
+                instructions=governance_critique_instructions(),
                 output_type=CritiqueOutput,
                 input_payload=critique_input,
                 route=route,
@@ -819,18 +790,7 @@ def run_governance_protocol(
     try:
         final_plan, m_final = _run_agent_typed(
             name="governance_coordinator",
-            instructions=(
-                "너는 자동투자 멀티에이전트 팀의 Governance Coordinator다.\n"
-                "역할: Round1 + Critique를 종합해 최종 Trade Plan을 확정한다.\n"
-                "하드 규칙:\n"
-                "- ops_manager.veto=true 또는 risk_manager.veto=true이면 buy=false 및 target_position_pct=0을 우선 고려.\n"
-                "- allowed_symbols 밖의 심볼은 금지.\n"
-                "- target_position_pct는 0~max_position_pct_per_symbol 범위.\n"
-                "소프트 규칙:\n"
-                "- 비용/스프레드가 나쁘면 보수적으로.\n"
-                "- conflict_resolution에 어떤 충돌을 어떻게 해결했는지 기록.\n"
-                "출력은 스키마 JSON만."
-            ),
+            instructions=governance_coordinator_instructions(),
             output_type=FinalTradePlan,
             input_payload=final_input,
             route=coord_route,
@@ -862,20 +822,7 @@ def run_governance_protocol(
     try:
         minutes, m_minutes = _run_agent_text(
             name="secretary_agent",
-            instructions=(
-                "너는 자동투자 멀티에이전트 팀의 비서(Secretary Agent)다.\n"
-                "목표: 사람이 바로 이해할 수 있게 회의 내용을 한국어로 회의록 형태로 요약한다.\n"
-                "규칙:\n"
-                "- 사실은 입력 JSON 안에서만 사용. 모르면 '미확인'.\n"
-                "- reason_code만 나열하지 말고 한국어로 풀어 써라.\n"
-                "- 3,000자 이내 텔레그램 텍스트로 읽히게.\n"
-                "형식:\n"
-                "1) 결론(Trade Plan)\n"
-                "2) 근거(에이전트별)\n"
-                "3) 제약/게이트\n"
-                "4) 리스크/관찰 포인트\n"
-                "5) 액션 아이템\n"
-            ),
+            instructions=governance_secretary_instructions(),
             input_payload=secretary_input,
             route=sec_route,
         )

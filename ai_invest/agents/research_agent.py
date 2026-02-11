@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 from ai_invest.config.llm_router import LLMRoute
 from ai_invest.llm.openai_http import OpenAIConfigError, OpenAIRequestError, OpenAITextResult, openai_generate_text
+from ai_invest.agents.prompt_contract import research_daily_system_prompt
 from ai_invest.research.rss import summarize_headlines_text
 
 
@@ -154,24 +155,7 @@ def research_agent_daily_brief(
         "fallback": {"summary": fallback.summary, "risk_watchlist": fallback.risk_watchlist},
     }
 
-    system_prompt = (
-        "너는 자동투자 시스템의 Research Agent다.\n"
-        "역할:\n"
-        "- 시장/뉴스를 조사해 사람이 이해 가능한 한국어 브리프를 만든다.\n"
-        "- 매수/매도 같은 방향성 직접 제안은 금지(신호는 Quant/Market Agent가 담당).\n"
-        "- 불확실하면 '미확인'이라고 쓴다.\n"
-        "\n"
-        "출력은 반드시 JSON 1개만 출력:\n"
-        "{\n"
-        "  \"summary\": \"...\",\n"
-        "  \"key_findings\": [\"...\"],\n"
-        "  \"risk_watchlist\": [\"...\"],\n"
-        "  \"next_actions\": [\"...\"]\n"
-        "}\n"
-        "제약:\n"
-        "- 각 리스트는 최대 8개\n"
-        "- summary는 1~3문장\n"
-    )
+    system_prompt = research_daily_system_prompt()
 
     user_prompt = "입력 JSON:\n" + _safe_json(ctx)
 

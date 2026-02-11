@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 from ai_invest.config.llm_router import LLMRoute
 from ai_invest.llm.openai_http import OpenAIConfigError, OpenAIRequestError, OpenAITextResult, openai_generate_text
+from ai_invest.agents.prompt_contract import strategy_trade_plan_system_prompt, strategy_weekly_priority_system_prompt
 
 
 def _parse_bool(value: str, *, default: bool = False) -> bool:
@@ -164,24 +165,7 @@ def propose_trade_plan(
         "fallback": {"symbol": best_symbol, "target_position_pct": float(fallback_target)},
     }
 
-    system_prompt = (
-        "너는 자동투자 멀티에이전트 팀의 Strategy Coordinator(CEO)다.\n"
-        "목표: 후보 심볼을 평가해서 'Trade Plan' 1개를 제안한다.\n"
-        "규칙:\n"
-        "- 실시간 매수/매도 실행 판단은 Safe Judge가 담당한다. 너는 계획(종목/목표비중/제약)만 제안한다.\n"
-        "- allowed_symbols 밖의 심볼은 절대 선택하지 말 것.\n"
-        "- target_position_pct는 0~max_position_pct_per_symbol 범위.\n"
-        "- 유동성(스프레드), 변동성(ATR), 운영 리스크(recon/pause)가 나쁘면 보수적으로(0% 또는 낮게) 제안.\n"
-        "- 근거를 간단히 notes에 한국어로 작성.\n"
-        "\n"
-        "출력은 반드시 JSON 1개만:\n"
-        "{\n"
-        "  \"symbol\": \"KRW-BTC\",\n"
-        "  \"target_position_pct\": 10.0,\n"
-        "  \"constraints\": {\"max_spread_bps_entry\": 8.0},\n"
-        "  \"notes\": \"왜 이 종목/비중인지 2~4문장\"\n"
-        "}\n"
-    )
+    system_prompt = strategy_trade_plan_system_prompt()
 
     user_prompt = "입력 JSON:\n" + _safe_json(ctx)
 
@@ -289,22 +273,7 @@ def propose_weekly_priority(
         },
     }
 
-    system_prompt = (
-        "너는 자동투자 멀티에이전트 팀의 Strategy Coordinator(CEO)다.\n"
-        "역할: 주간 회의에서 개선 우선순위 1건을 선정하고 실험 가설/성공지표를 제안한다.\n"
-        "규칙:\n"
-        "- 거래 실행 권한 없음. 코드 직접 변경 권한 없음(제안만).\n"
-        "- 출력은 반드시 JSON 1개만.\n"
-        "\n"
-        "출력 JSON 형식:\n"
-        "{\n"
-        "  \"weekly_priority\": \"...\",\n"
-        "  \"hypothesis\": \"...\",\n"
-        "  \"owner\": \"...\",\n"
-        "  \"deadline\": \"YYYY-MM-DD\" | \"\",\n"
-        "  \"success_criteria\": {\"metric\": \"...\", \"target\": \"...\", \"window_days\": 7}\n"
-        "}\n"
-    )
+    system_prompt = strategy_weekly_priority_system_prompt()
 
     user_prompt = "입력 JSON:\n" + _safe_json(ctx)
 
@@ -361,4 +330,3 @@ def propose_weekly_priority(
             llm_meta=None,
             error=str(exc)[:200],
         )
-
