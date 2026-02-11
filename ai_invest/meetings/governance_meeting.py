@@ -327,15 +327,17 @@ def _run_agent_typed(
     output_type: type[BaseModel],
     input_payload: Mapping[str, Any],
     route: LLMRoute,
+    strict_json_schema: bool = True,
 ) -> tuple[BaseModel, AgentRunMeta]:
-    from agents import Agent, Runner
+    from agents import Agent, AgentOutputSchema, Runner
 
+    schema = AgentOutputSchema(output_type, strict_json_schema=bool(strict_json_schema))
     agent = Agent(
         name=name,
         instructions=instructions,
         model=str(route.model),
         model_settings=_to_model_settings(route),
-        output_type=output_type,
+        output_type=schema,
     )
 
     text_in = "입력(Fact Pack) JSON:\n" + _safe_json(dict(input_payload))
@@ -741,6 +743,7 @@ def run_governance_protocol(
             output_type=RiskDraft,
             input_payload=fact_pack,
             route=risk_route,
+            strict_json_schema=False,
         )
         llm_meta["risk_manager"] = m_risk
     except Exception as exc:
@@ -831,6 +834,7 @@ def run_governance_protocol(
             output_type=FinalTradePlan,
             input_payload=final_input,
             route=coord_route,
+            strict_json_schema=False,
         )
         final_plan = final_plan.model_copy(update={"symbol": _ensure_symbol(final_plan.symbol)})
         llm_meta["governance_coordinator"] = m_final
