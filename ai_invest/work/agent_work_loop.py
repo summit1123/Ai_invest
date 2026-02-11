@@ -247,15 +247,19 @@ def _quick_backtest_candidate(
     rsi_min: float,
     vol_min: float,
     fee_total_bps: float,
+    base_slippage_bps: float = 1.0,
+    spread_penalty_mult: float = 0.30,
+    low_liquidity_penalty_bps: float = 1.2,
+    fill_ratio: float = 1.0,
     hold_bars: int = 24,
     lookback_bars: int = 500,
 ) -> dict[str, Any]:
     """Lightweight rule replay for quant prework.
 
-    This is intentionally simple/fast:
+    This is intentionally simple/fast (v1.5):
     - entry: RSI>=rsi_min and vol_z>=vol_min
     - exit : RSI < max(45, rsi_min-8) or hold_bars timeout
-    - fees: round-trip fixed bps
+    - costs: fee + slippage + spread-like candle-range penalty + liquidity penalty
     """
 
     try:
@@ -273,9 +277,11 @@ def _quick_backtest_candidate(
             "backtest_score": -99.0,
         }
 
+    highs = [float(c.get("high_price") or 0.0) for c in candles]
+    lows = [float(c.get("low_price") or 0.0) for c in candles]
     closes = [float(c.get("trade_price") or 0.0) for c in candles]
     volumes = [float(c.get("candle_acc_trade_volume") or 0.0) for c in candles]
-    n = min(len(closes), len(volumes))
+    n = min(len(highs), len(lows), len(closes), len(volumes))
     if n < 60:
         return {
             "symbol": symbol,
@@ -299,6 +305,7 @@ def _quick_backtest_candidate(
     wins = 0
     sum_ret_pct = 0.0
     fee_rate = max(0.0, float(fee_total_bps)) / 10000.0
+    fill_ratio_n = max(0.2, min(1.0, float(fill_ratio)))
 
     for i in range(30, n):
         px = float(closes[i])
@@ -320,7 +327,13 @@ def _quick_backtest_candidate(
             continue
 
         gross = (px - entry_px) / entry_px if entry_px > 0 else 0.0
-        net = gross - fee_rate
+        # Candle range as spread proxy (in bps)
+        range_pct = ((float(highs[i]) - float(lows[i])) / px * 100.0) if px > 0 else 0.0
+        spread_like_bps = max(0.0, float(range_pct) * 100.0)  # 1% range -> 100 bps proxy
+        liq_pen = max(0.0, -float(volz)) * float(low_liquidity_penalty_bps)
+        slippage_total_bps = (float(base_slippage_bps) * 2.0) + (float(spread_penalty_mult) * spread_like_bps) + liq_pen
+        total_cost_rate = fee_rate + (slippage_total_bps / 10000.0)
+        net = (gross * fill_ratio_n) - total_cost_rate
         eq *= max(0.0, 1.0 + net)
         peak = max(peak, eq)
         if peak > 0:
@@ -338,7 +351,9 @@ def _quick_backtest_candidate(
     if in_pos and entry_px > 0:
         last_px = float(closes[n - 1])
         gross = (last_px - entry_px) / entry_px if entry_px > 0 else 0.0
-        net = gross - fee_rate
+        range_pct = ((float(highs[n - 1]) - float(lows[n - 1])) / last_px * 100.0) if last_px > 0 else 0.0
+        spread_like_bps = max(0.0, float(range_pct) * 100.0)
+        net = (gross * fill_ratio_n) - (fee_rate + ((float(base_slippage_bps) * 2.0 + float(spread_penalty_mult) * spread_like_bps) / 10000.0))
         eq *= max(0.0, 1.0 + net)
         peak = max(peak, eq)
         if peak > 0:
@@ -364,6 +379,13 @@ def _quick_backtest_candidate(
         "max_drawdown_pct": float(max_dd * 100.0),
         "avg_trade_return_pct": float(avg_trade),
         "backtest_score": float(backtest_score),
+        "assumptions": {
+            "fee_total_bps": float(fee_total_bps),
+            "base_slippage_bps": float(base_slippage_bps),
+            "spread_penalty_mult": float(spread_penalty_mult),
+            "low_liquidity_penalty_bps": float(low_liquidity_penalty_bps),
+            "fill_ratio": float(fill_ratio_n),
+        },
     }
 
 
@@ -417,6 +439,7 @@ def run_agent_work_cycle(
     report_ids: dict[str, str] = {}
 
     if "research_agent" in selected:
+        research_tasks = repo.fetch_ready_agent_tasks(agent_name="research_agent", limit=10)
         try:
             headlines = fetch_crypto_headlines(symbol=symbol, limit=12)
         except Exception:
@@ -456,13 +479,27 @@ def run_agent_work_cycle(
                 "llm_meta": brief.llm_meta,
                 "symbol": symbol,
                 "headlines": compact_headlines,
+                "assigned_tasks": [dict(t.get("payload") or {}) for t in research_tasks[:5]],
             },
             risks={"watchlist": list(brief.risk_watchlist)},
-            action_items={"next_actions": list(brief.next_actions)},
+            action_items={
+                "next_actions": list(brief.next_actions),
+                "task_refs": [str(t.get("task_id")) for t in research_tasks[:10]],
+            },
         )
         report_ids["research_agent"] = str(research_id)
+        for t in research_tasks:
+            try:
+                repo.mark_agent_task_completed(
+                    task_id=str(t.get("task_id")),
+                    agent_name="research_agent",
+                    result={"cycle_key": cycle_key, "report_id": str(research_id)},
+                )
+            except Exception:
+                pass
 
     if "quant_strategist" in selected:
+        quant_tasks = repo.fetch_ready_agent_tasks(agent_name="quant_strategist", limit=10)
         top = candidates[0] if candidates else {"symbol": symbol, "score": 0.0, "snapshot": snapshot, "features": features}
         signal_cfg = (rules_raw.get("signal") or {}) if isinstance(rules_raw, Mapping) else {}
         rsi_min = _as_float(signal_cfg.get("rsi_min"), default=50.0)
@@ -471,6 +508,13 @@ def run_agent_work_cycle(
         fee_total_bps = _as_float(fees_cfg.get("fallback_bid_fee_bps"), default=5.0) + _as_float(
             fees_cfg.get("fallback_ask_fee_bps"), default=5.0
         )
+        bt_cfg = (rules_raw.get("quant_backtest") or {}) if isinstance(rules_raw, Mapping) else {}
+        base_slippage_bps = _as_float(bt_cfg.get("base_slippage_bps"), default=1.0)
+        spread_penalty_mult = _as_float(bt_cfg.get("spread_penalty_mult"), default=0.30)
+        low_liquidity_penalty_bps = _as_float(bt_cfg.get("low_liquidity_penalty_bps"), default=1.2)
+        fill_ratio = _as_float(bt_cfg.get("fill_ratio"), default=0.92)
+        hold_bars = int(_as_float(bt_cfg.get("hold_bars"), default=24))
+        lookback_bars = int(_as_float(bt_cfg.get("lookback_bars"), default=500))
         backtests: list[dict[str, Any]] = []
         for row in candidates[: min(8, len(candidates))]:
             sym = str(row.get("symbol") or "").strip().upper()
@@ -482,8 +526,12 @@ def run_agent_work_cycle(
                 rsi_min=rsi_min,
                 vol_min=vol_min,
                 fee_total_bps=fee_total_bps,
-                hold_bars=24,
-                lookback_bars=500,
+                base_slippage_bps=base_slippage_bps,
+                spread_penalty_mult=spread_penalty_mult,
+                low_liquidity_penalty_bps=low_liquidity_penalty_bps,
+                fill_ratio=fill_ratio,
+                hold_bars=hold_bars,
+                lookback_bars=lookback_bars,
             )
             backtests.append(bt)
         if backtests:
@@ -542,12 +590,24 @@ def run_agent_work_cycle(
                 },
                 "candidates": candidates[:8],
                 "backtest": {
-                    "engine": "quick_rsi_vol_replay_v1",
-                    "params": {"tf_min": tf_min, "rsi_min": rsi_min, "vol_min": vol_min, "fee_total_bps": fee_total_bps},
+                    "engine": "quick_rsi_vol_replay_v1_5",
+                    "params": {
+                        "tf_min": tf_min,
+                        "rsi_min": rsi_min,
+                        "vol_min": vol_min,
+                        "fee_total_bps": fee_total_bps,
+                        "base_slippage_bps": base_slippage_bps,
+                        "spread_penalty_mult": spread_penalty_mult,
+                        "low_liquidity_penalty_bps": low_liquidity_penalty_bps,
+                        "fill_ratio": fill_ratio,
+                        "hold_bars": hold_bars,
+                        "lookback_bars": lookback_bars,
+                    },
                     "ranked": sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)[:8],
                 },
                 "suggested_plan": {"symbol": top.get("symbol"), "target_position_pct": target},
                 "capital_profile": capital_profile.as_dict(),
+                "assigned_tasks": [dict(t.get("payload") or {}) for t in quant_tasks[:5]],
             },
             risks={"watchlist": quant_risks},
             action_items={
@@ -555,12 +615,23 @@ def run_agent_work_cycle(
                     "회의에서 상위 후보의 비용/리스크 충돌 여부 검증",
                     "target_position_pct와 cooldown/rebalance_band 합의",
                     "자본 티어(capital_policy) 상한과 플랜 비중 일치 여부 확인",
-                ]
+                ],
+                "task_refs": [str(t.get("task_id")) for t in quant_tasks[:10]],
             },
         )
         report_ids["quant_strategist"] = str(quant_id)
+        for t in quant_tasks:
+            try:
+                repo.mark_agent_task_completed(
+                    task_id=str(t.get("task_id")),
+                    agent_name="quant_strategist",
+                    result={"cycle_key": cycle_key, "report_id": str(quant_id)},
+                )
+            except Exception:
+                pass
 
     if "risk_manager" in selected:
+        risk_tasks = repo.fetch_ready_agent_tasks(agent_name="risk_manager", limit=10)
         latest_pnl = (repo.fetch_pnl_daily(limit=1) or [None])[0]
         risk_watch: list[str] = []
         if pause.get("paused"):
@@ -582,13 +653,32 @@ def run_agent_work_cycle(
             team_scope="RISK",
             title="사전업무 리포트(Risk)",
             summary=risk_summary,
-            findings={"limits": {"max_daily_loss_pct": rules.risk.max_daily_loss_pct, "max_position_pct_per_symbol": rules.risk.max_position_pct_per_symbol}},
+            findings={
+                "limits": {
+                    "max_daily_loss_pct": rules.risk.max_daily_loss_pct,
+                    "max_position_pct_per_symbol": rules.risk.max_position_pct_per_symbol,
+                },
+                "assigned_tasks": [dict(t.get("payload") or {}) for t in risk_tasks[:5]],
+            },
             risks={"watchlist": risk_watch},
-            action_items={"next_actions": ["회의에서 하드게이트(veto 조건) 재확인"]},
+            action_items={
+                "next_actions": ["회의에서 하드게이트(veto 조건) 재확인"],
+                "task_refs": [str(t.get("task_id")) for t in risk_tasks[:10]],
+            },
         )
         report_ids["risk_manager"] = str(risk_id)
+        for t in risk_tasks:
+            try:
+                repo.mark_agent_task_completed(
+                    task_id=str(t.get("task_id")),
+                    agent_name="risk_manager",
+                    result={"cycle_key": cycle_key, "report_id": str(risk_id)},
+                )
+            except Exception:
+                pass
 
     if "ops_manager" in selected:
+        ops_tasks = repo.fetch_ready_agent_tasks(agent_name="ops_manager", limit=10)
         deliveries = repo.fetch_notification_deliveries(limit=30)
         failed_n = len([d for d in deliveries if str(d.get("status") or "").upper() == "FAILED"])
         ops_summary = (
@@ -609,10 +699,27 @@ def run_agent_work_cycle(
             team_scope="OPS",
             title="사전업무 리포트(Ops)",
             summary=ops_summary,
-            findings={"reconciliation": recon, "pause": pause, "notification_failures_recent": failed_n},
+            findings={
+                "reconciliation": recon,
+                "pause": pause,
+                "notification_failures_recent": failed_n,
+                "assigned_tasks": [dict(t.get("payload") or {}) for t in ops_tasks[:5]],
+            },
             risks={"watchlist": ops_risks},
-            action_items={"next_actions": ["회의 전 recon/pause 상태 재검증", "알림 실패 원인 점검"]},
+            action_items={
+                "next_actions": ["회의 전 recon/pause 상태 재검증", "알림 실패 원인 점검"],
+                "task_refs": [str(t.get("task_id")) for t in ops_tasks[:10]],
+            },
         )
         report_ids["ops_manager"] = str(ops_id)
+        for t in ops_tasks:
+            try:
+                repo.mark_agent_task_completed(
+                    task_id=str(t.get("task_id")),
+                    agent_name="ops_manager",
+                    result={"cycle_key": cycle_key, "report_id": str(ops_id)},
+                )
+            except Exception:
+                pass
 
     return WorkCycleResult(cycle_key=cycle_key, report_ids=report_ids)

@@ -40,6 +40,15 @@ workers:
   risk_interval_sec: 300
   ops_interval_sec: 60
 
+# Quant 사전검증(경량 리플레이) 가정값
+quant_backtest:
+  lookback_bars: 500
+  hold_bars: 24
+  base_slippage_bps: 1.0
+  spread_penalty_mult: 0.30
+  low_liquidity_penalty_bps: 1.2
+  fill_ratio: 0.92
+
 governance:
   # 정기 회의(하루 3회, 8시간 간격 권장). 실시간 트리거(수익/손절/비용/레짐/운영)는 즉시 Safe Judge로 처리하고,
   # 회의는 "종목/비중/허용조건(Trade Plan)"과 "룰 패치 제안"을 갱신하는 거버넌스 용도.
