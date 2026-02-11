@@ -26,6 +26,7 @@ from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_mark
 from ai_invest.notifications.service import NotificationService
 from ai_invest.research.rss import fetch_crypto_headlines, summarize_headlines_text
 from ai_invest.storage.postgres import DbEvent, DbMeetingMessage, DbMeetingSession, PostgresRepo
+from ai_invest.work.agent_work_loop import collect_latest_work_reports, run_agent_work_cycle
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -1047,6 +1048,47 @@ def run_governance_meeting_now(
         )
 
     try:
+        # Prework orchestration: each meeting should consume fresh agent work reports.
+        prework_agents = ["research_agent", "quant_strategist", "risk_manager", "ops_manager"]
+        prework_max_age_min = int(((rules_raw.get("governance") or {}).get("prework_max_age_min") or 360) if isinstance(rules_raw, Mapping) else 360)
+        prework = collect_latest_work_reports(repo=repo, agent_names=prework_agents, max_age_minutes=prework_max_age_min)
+        prework_cycle_info: dict[str, Any] | None = None
+
+        if list(prework.get("missing") or []) or list(prework.get("stale") or []):
+            try:
+                cycle = run_agent_work_cycle(repo=repo, rules_raw=rules_raw, meeting_context=slot_key)
+                prework_cycle_info = {"cycle_key": cycle.cycle_key, "report_ids": cycle.report_ids}
+                prework = collect_latest_work_reports(repo=repo, agent_names=prework_agents, max_age_minutes=prework_max_age_min)
+            except Exception as exc:
+                prework_cycle_info = {"error": str(exc)[:200]}
+
+        fresh_agents = sorted(
+            set(prework_agents)
+            - set(str(x) for x in list(prework.get("missing") or []))
+            - set(str(x) for x in list(prework.get("stale") or []))
+        )
+        prework_content = _clip(
+            "\n".join(
+                [
+                    f"사전업무 상태: fresh={len(fresh_agents)}, stale={len(list(prework.get('stale') or []))}, missing={len(list(prework.get('missing') or []))}",
+                    f"- fresh: {', '.join(fresh_agents) or '(없음)'}",
+                    f"- stale: {', '.join(list(prework.get('stale') or [])) or '(없음)'}",
+                    f"- missing: {', '.join(list(prework.get('missing') or [])) or '(없음)'}",
+                ]
+            ),
+            1200,
+        )
+        _store_message(
+            repo=repo,
+            meeting_id=meeting_id,
+            sender_agent="orchestrator",
+            message_type="PREWORK_STATUS",
+            content=prework_content,
+            payload={"prework": prework, "refresh_cycle": prework_cycle_info},
+            confidence=0.95,
+            emit=emit,
+        )
+
         evaluated = evaluate_candidates(rules_raw=rules_raw, rules=rules, symbols=symbols)
 
         pause = repo.fetch_pause_state()
@@ -1094,6 +1136,14 @@ def run_governance_meeting_now(
             research_brief=research_brief,
             account_state=account_state,
         )
+        fact_pack["prework_reports"] = dict((prework or {}).get("reports") or {})
+        fact_pack["prework_status"] = {
+            "fresh_agents": fresh_agents,
+            "stale_agents": list(prework.get("stale") or []),
+            "missing_agents": list(prework.get("missing") or []),
+            "max_age_minutes": prework_max_age_min,
+            "refresh_cycle": prework_cycle_info,
+        }
         fact_pack["valid_from_kst"] = vf_kst.isoformat()
         fact_pack["valid_to_kst"] = vt_kst.isoformat()
 

@@ -26,6 +26,8 @@ governance:
   daily_meeting_times_kst:
     - "09:00"
     - "21:00"
+  # 회의 시작 전, 에이전트 사전업무 리포트 허용 최대 나이(분)
+  prework_max_age_min: 360
   # 슬롯 시간 기준으로 +/- 몇 분까지를 “해당 회의 시간대”로 볼지(중복 생성 방지)
   meeting_window_min: 5
   # 회의 결과로 기본 채택할 목표 비중(실행은 Safe Judge 게이트 통과 시에만)
