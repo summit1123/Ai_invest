@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import json
+import queue
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterable, Mapping
 
+import yaml
 from fastapi import FastAPI, Query
+from starlette.responses import StreamingResponse
 
 from ai_invest.config.dotenv import load_dotenv
 from ai_invest.config.rules_loader import load_rules
+from ai_invest.meetings.governance_meeting import run_governance_meeting_now
+from ai_invest.notifications.service import NotificationService
 from ai_invest.storage.postgres import PostgresRepo
 
 
@@ -200,6 +208,48 @@ def latest_trade_plan() -> dict[str, Any]:
     repo = PostgresRepo()
     ev = repo.fetch_latest_event(event_type="TRADE_PLAN_SET")
     return ok({"event": ev})
+
+
+@app.get("/api/v1/ui/meetings/governance/live", tags=["회의"], summary="거버넌스 회의 라이브 실행(SSE, 멀티 LLM)")
+def meetings_governance_live(
+    slot_key: str | None = Query(None, description="(선택) 강제 slot_key. 비우면 LIVE 슬롯으로 생성"),
+) -> StreamingResponse:
+    """Start a governance meeting and stream messages as Server-Sent Events (SSE)."""
+
+    repo = PostgresRepo()
+    notifier = NotificationService(repo)
+    rules_raw = yaml.safe_load(Path("rules.yaml").read_text(encoding="utf-8"))
+
+    q: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
+
+    def emit(event: str, data: Mapping[str, Any]) -> None:
+        q.put((str(event), dict(data)))
+
+    def worker() -> None:
+        try:
+            run_governance_meeting_now(
+                repo=repo,
+                notifier=notifier,
+                rules_raw=rules_raw,
+                force_slot_key=slot_key,
+                emit=emit,
+            )
+        except Exception as exc:
+            emit("error", {"error": str(exc)[:300]})
+            emit("done", {"ok": False})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def gen() -> Iterable[bytes]:
+        while True:
+            event, data = q.get()
+            payload = json.dumps(data, ensure_ascii=False, default=str)
+            msg = f"event: {event}\ndata: {payload}\n\n"
+            yield msg.encode("utf-8")
+            if event == "done":
+                break
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/api/v1/ui/review/weekly", tags=["리뷰"], summary="주간 리뷰 데이터(PnL/실현거래)")
