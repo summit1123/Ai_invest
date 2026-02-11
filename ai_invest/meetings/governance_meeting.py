@@ -67,6 +67,14 @@ def _as_float(value: Any, *, default: float) -> float:
         return float(default)
 
 
+def should_block_prework(*, require_prework_reports: bool, prework: Mapping[str, Any]) -> bool:
+    if not bool(require_prework_reports):
+        return False
+    missing = list(prework.get("missing") or []) if isinstance(prework, Mapping) else []
+    stale = list(prework.get("stale") or []) if isinstance(prework, Mapping) else []
+    return bool(missing or stale)
+
+
 def _timeframe_to_minutes(tf: str) -> int:
     tf = str(tf or "").strip().lower()
     if tf.endswith("m"):
@@ -1051,6 +1059,7 @@ def run_governance_meeting_now(
         # Prework orchestration: each meeting should consume fresh agent work reports.
         prework_agents = ["research_agent", "quant_strategist", "risk_manager", "ops_manager"]
         prework_max_age_min = int(((rules_raw.get("governance") or {}).get("prework_max_age_min") or 360) if isinstance(rules_raw, Mapping) else 360)
+        require_prework_reports = bool(((rules_raw.get("governance") or {}).get("require_prework_reports")) if isinstance(rules_raw, Mapping) else False)
         prework = collect_latest_work_reports(repo=repo, agent_names=prework_agents, max_age_minutes=prework_max_age_min)
         prework_cycle_info: dict[str, Any] | None = None
 
@@ -1088,6 +1097,10 @@ def run_governance_meeting_now(
             confidence=0.95,
             emit=emit,
         )
+        if should_block_prework(require_prework_reports=require_prework_reports, prework=prework):
+            raise RuntimeError(
+                f"prework_missing_or_stale: missing={list(prework.get('missing') or [])}, stale={list(prework.get('stale') or [])}"
+            )
 
         evaluated = evaluate_candidates(rules_raw=rules_raw, rules=rules, symbols=symbols)
 
@@ -1138,6 +1151,7 @@ def run_governance_meeting_now(
         )
         fact_pack["prework_reports"] = dict((prework or {}).get("reports") or {})
         fact_pack["prework_status"] = {
+            "require_prework_reports": bool(require_prework_reports),
             "fresh_agents": fresh_agents,
             "stale_agents": list(prework.get("stale") or []),
             "missing_agents": list(prework.get("missing") or []),
