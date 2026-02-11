@@ -49,6 +49,10 @@
 | `TELEGRAM_CHAT_ID_RESEARCH` | Y | `-100...` | research-daily 채널 |
 | `TELEGRAM_CHAT_ID_MEETING` | Y | `-100...` | agent-meeting 채널 |
 | `TELEGRAM_CHAT_ID_ENGINEERING` | Y | `-100...` | engineering-change 채널 |
+| `SEND_TELEGRAM` | N | `true` | 실제 Telegram 전송 on/off (off면 delivery는 `PENDING` 저장) |
+| `NOTIFY_SAFE_DECISION_HOLD` | N | `false` | Safe 결정이 `HOLD`일 때 알림 전송 여부 |
+| `NOTIFY_SAFE_DECISION_CHANGE_ONLY` | N | `true` | Safe 결정 알림을 상태 변화가 있을 때만 전송 |
+| `NOTIFICATION_DEDUPE_WITHIN_SEC` | N | `60` | dedupe key 기준 중복 전송 억제 시간(초) |
 
 ## 6) Slack 알림 (추가)
 

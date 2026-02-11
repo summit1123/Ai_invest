@@ -24,7 +24,12 @@ class NotificationWeeklyReviewTests(unittest.TestCase):
         repo = _FakeRepo()
         svc = NotificationService(
             repo,  # type: ignore[arg-type]
-            ctx=NotificationContext(send_telegram=False, notify_safe_hold=True, dedupe_within_sec=60),
+            ctx=NotificationContext(
+                send_telegram=False,
+                notify_safe_hold=True,
+                notify_safe_change_only=True,
+                dedupe_within_sec=60,
+            ),
         )
 
         with patch("ai_invest.notifications.service.telegram_client.chat_id_review", return_value="-100123"):

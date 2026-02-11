@@ -46,7 +46,15 @@ def main() -> int:
     if args.dry_run:
         from ai_invest.notifications.service import NotificationContext  # noqa: E402
 
-        notifier = NotificationService(repo, ctx=NotificationContext(send_telegram=False, notify_safe_hold=False, dedupe_within_sec=0))
+        notifier = NotificationService(
+            repo,
+            ctx=NotificationContext(
+                send_telegram=False,
+                notify_safe_hold=False,
+                notify_safe_change_only=True,
+                dedupe_within_sec=0,
+            ),
+        )
     else:
         notifier = NotificationService(repo)
 

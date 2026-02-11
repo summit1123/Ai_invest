@@ -43,6 +43,7 @@ def _stable_hash(obj: Any) -> str:
 class NotificationContext:
     send_telegram: bool
     notify_safe_hold: bool
+    notify_safe_change_only: bool
     dedupe_within_sec: int
 
 
@@ -55,6 +56,7 @@ def load_notification_context() -> NotificationContext:
     return NotificationContext(
         send_telegram=parse_bool(os.environ.get("SEND_TELEGRAM", "")),
         notify_safe_hold=parse_bool(os.environ.get("NOTIFY_SAFE_DECISION_HOLD", "")),
+        notify_safe_change_only=parse_bool(os.environ.get("NOTIFY_SAFE_DECISION_CHANGE_ONLY", "1")),
         dedupe_within_sec=max(0, dedupe_sec),
     )
 
@@ -63,6 +65,35 @@ class NotificationService:
     def __init__(self, repo: PostgresRepo, ctx: NotificationContext | None = None) -> None:
         self._repo = repo
         self._ctx = ctx or load_notification_context()
+        self._safe_decision_state_cache: dict[str, str] = {}
+
+    def _safe_decision_state_signature(
+        self,
+        *,
+        symbol: str,
+        action: str,
+        reasons: list[str],
+        context: Mapping[str, Any],
+    ) -> str:
+        c = dict(context or {})
+        action_u = str(action or "").upper()
+        reasons_n = sorted(str(r or "").strip().upper() for r in list(reasons or []) if str(r or "").strip())
+        state = {
+            "symbol": str(symbol or "").upper(),
+            "action": action_u,
+            "reasons": reasons_n,
+            "market_signal": str(c.get("market_signal") or "").upper(),
+            "regime_trade_allowed": bool(c.get("regime_trade_allowed")),
+            "risk_veto": bool(c.get("risk_veto")),
+            "ops_veto": bool(c.get("ops_veto")),
+            "reconciliation_status": str(c.get("reconciliation_status") or "").upper(),
+            "pause_state": bool(c.get("pause_state")),
+            "trade_plan_slot_key": str(c.get("trade_plan_slot_key") or ""),
+            "trade_plan_target_pct": c.get("trade_plan_target_pct"),
+            "capital_tier": str(c.get("capital_tier") or ""),
+            "capital_target_cap_pct": c.get("capital_target_cap_pct"),
+        }
+        return _stable_hash(state)
 
     def _deliver_telegram(
         self,
@@ -153,6 +184,39 @@ class NotificationService:
         context: Mapping[str, Any] | None = None,
     ) -> None:
         action = action.upper()
+        safe_ctx = dict(context or {})
+        if self._ctx.notify_safe_change_only:
+            symbol_key = str(symbol or "").upper()
+            sig = self._safe_decision_state_signature(
+                symbol=symbol_key,
+                action=action,
+                reasons=list(reasons or []),
+                context=safe_ctx,
+            )
+            prev = self._safe_decision_state_cache.get(symbol_key)
+            if prev == sig:
+                self._repo.insert_notification_delivery(
+                    delivery_id=uuid.uuid4(),
+                    event_id=event_id,
+                    channel="TELEGRAM",
+                    template_id="tpl_safe_decision",
+                    severity="NORMAL",
+                    status="SKIPPED",
+                    attempt_count=0,
+                    last_error="unchanged safe decision state",
+                    dedupe_key=f"DECISION:SAFE:{symbol_key}:{sig}",
+                    payload={
+                        "symbol": symbol,
+                        "action": action,
+                        "reasons": reasons,
+                        "context": safe_ctx,
+                        "skip_mode": "change_only",
+                    },
+                    sent_at=None,
+                )
+                return
+            self._safe_decision_state_cache[symbol_key] = sig
+
         if action == "HOLD" and not self._ctx.notify_safe_hold:
             self._repo.insert_notification_delivery(
                 delivery_id=uuid.uuid4(),
@@ -197,7 +261,7 @@ class NotificationService:
                 "symbol": symbol,
                 "action": action,
                 "reasons": reasons,
-                "context": dict(context or {}),
+                "context": safe_ctx,
                 "run_id": str(run_id),
             },
         )
