@@ -517,6 +517,49 @@ class NotificationService:
             },
         )
 
+    def notify_weekly_review(
+        self,
+        *,
+        event_id: uuid.UUID,
+        week_label: str,
+        weekly_pnl: float,
+        win_rate: float,
+        loss_tags_top3: str,
+        rule_patch_status: str,
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_review()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_weekly_review",
+                severity="NORMAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"week_label": week_label}},
+                sent_at=None,
+            )
+            return
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_weekly_review",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=f"REVIEW:WEEKLY:{week_label}",
+            payload={
+                **_ts_payload(),
+                "week_label": week_label,
+                "weekly_pnl": weekly_pnl,
+                "win_rate": win_rate,
+                "loss_tags_top3": loss_tags_top3,
+                "rule_patch_status": rule_patch_status,
+            },
+        )
+
     def notify_meeting_summary(
         self,
         *,

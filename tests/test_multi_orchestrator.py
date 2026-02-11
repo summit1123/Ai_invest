@@ -22,12 +22,14 @@ class MultiOrchestratorTests(unittest.TestCase):
             decision_interval_sec=15,
             work_interval_sec=1800,
             governance_sleep_sec=30,
+            review_sleep_sec=60,
             enable_paper=True,
             enable_work=True,
             enable_governance=True,
+            enable_review=True,
         )
         names = [name for name, _ in cmds]
-        self.assertEqual(names, ["paper_loop", "work_loop", "governance_loop"])
+        self.assertEqual(names, ["paper_loop", "work_loop", "governance_loop", "review_loop"])
 
     def test_build_commands_respects_disable_flags(self) -> None:
         mod = _load_module()
@@ -36,13 +38,14 @@ class MultiOrchestratorTests(unittest.TestCase):
             decision_interval_sec=15,
             work_interval_sec=1800,
             governance_sleep_sec=30,
+            review_sleep_sec=60,
             enable_paper=False,
             enable_work=True,
             enable_governance=False,
+            enable_review=False,
         )
         self.assertEqual([name for name, _ in cmds], ["work_loop"])
 
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import uuid
@@ -275,3 +276,17 @@ def weekly_review() -> dict[str, Any]:
     pnl = repo.fetch_pnl_daily(limit=14)
     trades = repo.fetch_realized_trades(limit=200)
     return ok({"pnl_daily": pnl, "realized_trades": trades})
+
+
+@app.get("/api/v1/ui/orchestrator/status", tags=["운영"], summary="멀티 오케스트레이터 상태")
+def orchestrator_status() -> dict[str, Any]:
+    status_path = Path(os.environ.get("ORCHESTRATOR_STATUS_PATH", "runtime/orchestrator_status.json"))
+    if not status_path.exists():
+        return ok({"running": False, "status_file": str(status_path), "status": None})
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return ok({"running": False, "status_file": str(status_path), "status": None, "error": str(exc)})
+    workers = status.get("workers") if isinstance(status, Mapping) else {}
+    running = any(bool((v or {}).get("alive")) for v in (workers or {}).values()) if isinstance(workers, Mapping) else False
+    return ok({"running": running, "status_file": str(status_path), "status": status})
