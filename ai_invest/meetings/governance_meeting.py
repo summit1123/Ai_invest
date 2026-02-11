@@ -160,7 +160,7 @@ class RiskDraft(BaseModel):
     max_position_pct: float = Field(..., ge=0.0, le=100.0)
     max_loss_per_trade_pct: float = Field(..., ge=0.0, le=100.0)
     max_daily_loss_pct: float = Field(..., ge=0.0, le=100.0)
-    required_constraints: dict[str, Any] = Field(default_factory=dict)
+    required_constraints: dict[str, float] = Field(default_factory=dict)
     notes: str = Field(..., max_length=800)
 
 
@@ -185,7 +185,7 @@ class FinalTradePlan(BaseModel):
     cooldown_minutes: int = Field(60, ge=0, le=7 * 24 * 60)
     valid_from_kst: str = Field(..., max_length=40)
     valid_to_kst: str = Field(..., max_length=40)
-    constraints: dict[str, Any] = Field(default_factory=dict)
+    constraints: dict[str, float] = Field(default_factory=dict)
     rationale: dict[str, str] = Field(default_factory=dict, description="agent_name -> 1~3문장 근거 요약")
     evidence_refs: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
@@ -253,8 +253,23 @@ def enforce_final_trade_plan(
     tgt2 = 0.0 if not buy_allowed else max(0.0, min(float(tgt), float(max_pos)))
 
     # Constraints: start from cost_guard, then merge risk.required_constraints, then plan.constraints.
-    base_constraints = dict(((fact_pack.get("rules") or {}).get("cost_guard") or {}))
-    merged_constraints: dict[str, Any] = {**base_constraints, **dict(risk.required_constraints or {}), **dict(plan.constraints or {})}
+    def _num_map(obj: Any) -> dict[str, float]:
+        if not isinstance(obj, Mapping):
+            return {}
+        out: dict[str, float] = {}
+        for k, v in obj.items():
+            try:
+                out[str(k)] = float(v)
+            except Exception:
+                continue
+        return out
+
+    base_constraints = _num_map(((fact_pack.get("rules") or {}).get("cost_guard") or {}))
+    merged_constraints: dict[str, float] = {
+        **base_constraints,
+        **dict(risk.required_constraints or {}),
+        **dict(plan.constraints or {}),
+    }
 
     conflict = list(plan.conflict_resolution or [])
     if sym != str(plan.symbol or "").strip():
@@ -301,8 +316,8 @@ def _to_model_settings(route: LLMRoute) -> Any:
     effort = str(route.reasoning_effort or "").strip().lower()
     if effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
         reasoning = Reasoning(effort=effort)
-    temperature = float(route.temperature) if route.temperature is not None else None
-    return ModelSettings(temperature=temperature, reasoning=reasoning, include_usage=True)
+    # Many reasoning models reject temperature (400: unsupported parameter). Keep unset.
+    return ModelSettings(reasoning=reasoning, include_usage=True)
 
 
 def _run_agent_typed(
@@ -441,10 +456,12 @@ def run_governance_protocol(
     *,
     fact_pack: Mapping[str, Any],
     rules_raw: Mapping[str, Any],
+    on_step: Callable[[str, str, BaseModel | str, AgentRunMeta], None] | None = None,
 ) -> GovernanceOutputs:
     """Run multi-agent governance protocol (2 rounds + final + secretary).
 
-    This function is designed to be pure-ish (no DB writes) so it can be unit-tested.
+    - When `on_step` is provided, it is called after each agent completes (for live UI/streaming).
+    - No DB writes happen in this function; persistence belongs to the meeting runner.
     """
 
     # ----- Routes / toggles -----
@@ -454,6 +471,15 @@ def run_governance_protocol(
 
     def _route(agent_name: str) -> LLMRoute:
         return llm_route_for_agent(rules_raw=rules_raw, agent_name=agent_name)
+
+    def _step(sender_agent: str, message_type: str, output: BaseModel | str, meta: AgentRunMeta) -> None:
+        if on_step is None:
+            return
+        try:
+            on_step(str(sender_agent), str(message_type), output, meta)
+        except Exception:
+            # Never let UI streaming callback break protocol execution.
+            return
 
     # ----- Deterministic fallbacks -----
     allowed = set(str(s) for s in (fact_pack.get("allowed_symbols") or []) if str(s).strip())
@@ -603,6 +629,9 @@ def run_governance_protocol(
         llm_meta["ops_manager"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=None)
         llm_meta["governance_coordinator"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=None)
         llm_meta["secretary_agent"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=None)
+        for agent_key in det_critiques.keys():
+            llm_meta[f"{agent_key}_critique"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=None)
+
         secretary_minutes = _clip(
             "\n".join(
                 [
@@ -616,6 +645,17 @@ def run_governance_protocol(
             ),
             3200,
         )
+
+        # Live callback support (even in deterministic mode).
+        _step("research_agent", "ROUND1_EVIDENCE", det_research, llm_meta["research_agent"])
+        _step("quant_strategist", "ROUND1_PROPOSAL", det_quant, llm_meta["quant_strategist"])
+        _step("risk_manager", "ROUND1_CONSTRAINTS", det_risk, llm_meta["risk_manager"])
+        _step("ops_manager", "ROUND1_OPS", det_ops, llm_meta["ops_manager"])
+        for agent_key, crit in det_critiques.items():
+            _step(agent_key, "ROUND2_CRITIQUE", crit, llm_meta[f"{agent_key}_critique"])
+        _step("governance_coordinator", "FINAL_TRADE_PLAN", det_final, llm_meta["governance_coordinator"])
+        _step("secretary_agent", "MINUTES", secretary_minutes, llm_meta["secretary_agent"])
+
         return GovernanceOutputs(
             research=det_research,
             quant=det_quant,
@@ -660,6 +700,7 @@ def run_governance_protocol(
     except Exception as exc:
         llm_meta["research_agent"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=str(exc)[:200])
         r1_research = det_research
+    _step("research_agent", "ROUND1_EVIDENCE", r1_research, llm_meta["research_agent"])
 
     try:
         r1_quant, m_quant = _run_agent_typed(
@@ -683,6 +724,7 @@ def run_governance_protocol(
     except Exception as exc:
         llm_meta["quant_strategist"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=str(exc)[:200])
         r1_quant = det_quant
+    _step("quant_strategist", "ROUND1_PROPOSAL", r1_quant, llm_meta["quant_strategist"])
 
     try:
         r1_risk, m_risk = _run_agent_typed(
@@ -704,6 +746,7 @@ def run_governance_protocol(
     except Exception as exc:
         llm_meta["risk_manager"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=str(exc)[:200])
         r1_risk = det_risk
+    _step("risk_manager", "ROUND1_CONSTRAINTS", r1_risk, llm_meta["risk_manager"])
 
     try:
         r1_ops, m_ops = _run_agent_typed(
@@ -725,6 +768,7 @@ def run_governance_protocol(
     except Exception as exc:
         llm_meta["ops_manager"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=str(exc)[:200])
         r1_ops = det_ops
+    _step("ops_manager", "ROUND1_OPS", r1_ops, llm_meta["ops_manager"])
 
     # Round 2: critique (each agent gets others' outputs)
     critique_input = dict(fact_pack)
@@ -762,6 +806,7 @@ def run_governance_protocol(
         except Exception as exc:
             llm_meta[f"{agent_key}_critique"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=str(exc)[:200])
             critiques[agent_key] = det_critiques.get(agent_key) or CritiqueOutput(critical_issues=[], suggested_changes=[])
+        _step(agent_key, "ROUND2_CRITIQUE", critiques[agent_key], llm_meta[f"{agent_key}_critique"])
 
     # Final: coordinator composes plan (hard constraints first)
     final_input = dict(fact_pack)
@@ -803,6 +848,7 @@ def run_governance_protocol(
         fallback_symbol=best_symbol,
         hard_max_position_pct=max_pos,
     )
+    _step("governance_coordinator", "FINAL_TRADE_PLAN", final_plan, llm_meta["governance_coordinator"])
 
     # Secretary: human minutes
     secretary_input = dict(fact_pack)
@@ -832,7 +878,20 @@ def run_governance_protocol(
         llm_meta["secretary_agent"] = m_minutes
     except Exception as exc:
         llm_meta["secretary_agent"] = AgentRunMeta(used_llm=False, model=None, response_id=None, error=str(exc)[:200])
-        minutes = det_final.notes
+        minutes = _clip(
+            "\n".join(
+                [
+                    "회의록(요약, fallback)",
+                    f"- 결론: {final_plan.symbol} 목표비중 {final_plan.target_position_pct:.1f}%",
+                    f"- 근거(리서치): {r1_research.briefing}",
+                    f"- 근거(전략): {r1_quant.notes}",
+                    f"- 제약(리스크): {r1_risk.notes}",
+                    f"- 제약(운영): {r1_ops.notes}",
+                ]
+            ),
+            3200,
+        )
+    _step("secretary_agent", "MINUTES", _clip(str(minutes), 3200), llm_meta["secretary_agent"])
 
     return GovernanceOutputs(
         research=r1_research,
@@ -963,30 +1022,6 @@ def run_governance_meeting_now(
     slot_key = force_slot_key or f"{now_kst.date().isoformat()} LIVE {now_kst.strftime('%H:%M:%S')}"
 
     symbols = list(rules.universe.symbols)
-    evaluated = evaluate_candidates(rules_raw=rules_raw, rules=rules, symbols=symbols)
-
-    pause = repo.fetch_pause_state()
-    recon = repo.fetch_latest_reconciliation()
-
-    best_symbol = str((evaluated[0] if evaluated else {}).get("symbol") or (symbols[0] if symbols else "KRW-BTC"))
-    try:
-        headlines = fetch_crypto_headlines(symbol=best_symbol, limit=10)
-    except Exception:
-        headlines = []
-    research_brief = {"headlines": headlines, "headlines_text": summarize_headlines_text(headlines, max_items=6)}
-
-    # Account state snapshot (paper sizing / context)
-    try:
-        quote_ccy = best_symbol.split("-", 1)[0] if "-" in best_symbol else "KRW"
-    except Exception:
-        quote_ccy = "KRW"
-    cash = repo.fetch_cash_balance(currency=quote_ccy)
-    pos = repo.fetch_position(best_symbol)
-    account_state = {
-        "cash_krw": float(cash),
-        "current_qty": float(pos.qty) if pos else 0.0,
-        "avg_entry_price": float(pos.avg_entry_price) if (pos and pos.avg_entry_price) else None,
-    }
 
     # Valid window (deterministic):
     # - scheduled slot: [slot_dt, next_slot_dt)
@@ -1008,19 +1043,6 @@ def run_governance_meeting_now(
         vf_kst = now_kst
         vt_kst = now_kst + timedelta(hours=8)
         agenda_mode = "LIVE"
-
-    fact_pack = _default_fact_pack(
-        rules_raw=rules_raw,
-        rules=rules,
-        slot_key=slot_key,
-        symbols=symbols,
-        evaluated=evaluated,
-        ops_state={"pause": pause, "latest_reconciliation": recon},
-        research_brief=research_brief,
-        account_state=account_state,
-    )
-    fact_pack["valid_from_kst"] = vf_kst.isoformat()
-    fact_pack["valid_to_kst"] = vt_kst.isoformat()
 
     meeting_id = uuid.uuid4()
     started_at = _utcnow()
@@ -1073,186 +1095,215 @@ def run_governance_meeting_now(
             },
         )
 
-    # Protocol run (LLM or fallback)
-    outputs = run_governance_protocol(fact_pack=fact_pack, rules_raw=rules_raw)
+    try:
+        evaluated = evaluate_candidates(rules_raw=rules_raw, rules=rules, symbols=symbols)
 
-    # Store transcript messages in natural order.
-    _store_message(
-        repo=repo,
-        meeting_id=meeting_id,
-        sender_agent="research_agent",
-        message_type="ROUND1_EVIDENCE",
-        content=_msg_content_for(outputs.research),
-        payload={"output": outputs.research.model_dump(), "llm_meta": asdict(outputs.llm_meta.get("research_agent")) if outputs.llm_meta.get("research_agent") else None},
-        confidence=0.75,
-        emit=emit,
-    )
-    _store_message(
-        repo=repo,
-        meeting_id=meeting_id,
-        sender_agent="quant_strategist",
-        message_type="ROUND1_PROPOSAL",
-        content=_msg_content_for(outputs.quant),
-        payload={"output": outputs.quant.model_dump(), "llm_meta": asdict(outputs.llm_meta.get("quant_strategist")) if outputs.llm_meta.get("quant_strategist") else None},
-        confidence=0.7,
-        emit=emit,
-    )
-    _store_message(
-        repo=repo,
-        meeting_id=meeting_id,
-        sender_agent="risk_manager",
-        message_type="ROUND1_CONSTRAINTS",
-        content=_msg_content_for(outputs.risk),
-        payload={"output": outputs.risk.model_dump(), "llm_meta": asdict(outputs.llm_meta.get("risk_manager")) if outputs.llm_meta.get("risk_manager") else None},
-        confidence=0.75,
-        emit=emit,
-    )
-    _store_message(
-        repo=repo,
-        meeting_id=meeting_id,
-        sender_agent="ops_manager",
-        message_type="ROUND1_OPS",
-        content=_msg_content_for(outputs.ops),
-        payload={"output": outputs.ops.model_dump(), "llm_meta": asdict(outputs.llm_meta.get("ops_manager")) if outputs.llm_meta.get("ops_manager") else None},
-        confidence=0.75,
-        emit=emit,
-    )
+        pause = repo.fetch_pause_state()
+        recon = repo.fetch_latest_reconciliation()
 
-    for agent_key, crit in outputs.critiques.items():
-        _store_message(
-            repo=repo,
+        best_symbol = str((evaluated[0] if evaluated else {}).get("symbol") or (symbols[0] if symbols else "KRW-BTC"))
+        try:
+            headlines_raw = fetch_crypto_headlines(symbol=best_symbol, limit=12)
+        except Exception:
+            headlines_raw = []
+        headlines_compact = []
+        for h in list(headlines_raw)[:10]:
+            if not isinstance(h, Mapping):
+                continue
+            headlines_compact.append(
+                {
+                    "source": h.get("source"),
+                    "title": h.get("title"),
+                    "url": h.get("url"),
+                    "published_at": h.get("published_at"),
+                }
+            )
+        research_brief = {"headlines": headlines_compact, "headlines_text": summarize_headlines_text(headlines_compact, max_items=6)}
+
+        # Account state snapshot (paper sizing / context)
+        try:
+            quote_ccy = best_symbol.split("-", 1)[0] if "-" in best_symbol else "KRW"
+        except Exception:
+            quote_ccy = "KRW"
+        cash = repo.fetch_cash_balance(currency=quote_ccy)
+        pos = repo.fetch_position(best_symbol)
+        account_state = {
+            "cash_krw": float(cash),
+            "current_qty": float(pos.qty) if pos else 0.0,
+            "avg_entry_price": float(pos.avg_entry_price) if (pos and pos.avg_entry_price) else None,
+        }
+
+        fact_pack = _default_fact_pack(
+            rules_raw=rules_raw,
+            rules=rules,
+            slot_key=slot_key,
+            symbols=symbols,
+            evaluated=evaluated,
+            ops_state={"pause": pause, "latest_reconciliation": recon},
+            research_brief=research_brief,
+            account_state=account_state,
+        )
+        fact_pack["valid_from_kst"] = vf_kst.isoformat()
+        fact_pack["valid_to_kst"] = vt_kst.isoformat()
+
+        def _confidence_for(message_type: str) -> float | None:
+            m = str(message_type or "")
+            if m.startswith("ROUND1_"):
+                return 0.75
+            if m.startswith("ROUND2_"):
+                return 0.65
+            if m.startswith("FINAL"):
+                return 0.75
+            if m.startswith("MINUTES"):
+                return 0.7
+            return None
+
+        def on_step(sender_agent: str, message_type: str, output: BaseModel | str, meta: AgentRunMeta) -> None:
+            payload: dict[str, Any] = {"llm_meta": asdict(meta)}
+            if isinstance(output, BaseModel):
+                payload["output"] = output.model_dump()
+            else:
+                payload["output"] = {"text": str(output)}
+            _store_message(
+                repo=repo,
+                meeting_id=meeting_id,
+                sender_agent=sender_agent,
+                message_type=message_type,
+                content=_msg_content_for(output),
+                payload=payload,
+                confidence=_confidence_for(message_type),
+                emit=emit,
+            )
+
+        # Protocol run (LLM or fallback). Messages are persisted/streamed via `on_step`.
+        outputs = run_governance_protocol(fact_pack=fact_pack, rules_raw=rules_raw, on_step=on_step)
+
+        ended_at = _utcnow()
+        summary_short = f"[{slot_key}] Trade Plan: {outputs.final_plan.symbol} target={outputs.final_plan.target_position_pct:.1f}%"
+        action_items = [
+            {"owner": "research_agent", "action": "주요 뉴스 원문 확인 및 영향 업데이트", "due_date": str(now_kst.date())},
+            {"owner": "ops_manager", "action": "recon/pause/알림 누락 여부 점검", "due_date": str(now_kst.date())},
+            {"owner": "quant_strategist", "action": "과매매 방지(cooldown/rebalance band) 파라미터 점검", "due_date": str(now_kst.date())},
+        ]
+
+        repo.update_meeting_session(
             meeting_id=meeting_id,
-            sender_agent=agent_key,
-            message_type="ROUND2_CRITIQUE",
-            content=_msg_content_for(crit),
-            payload={"output": crit.model_dump(), "llm_meta": asdict(outputs.llm_meta.get(f"{agent_key}_critique")) if outputs.llm_meta.get(f"{agent_key}_critique") else None},
-            confidence=0.65,
-            emit=emit,
+            status="CLOSED",
+            ended_at=ended_at,
+            summary=outputs.secretary_minutes,
+            decisions={"trade_plan": outputs.final_plan.model_dump()},
+            action_items={"items": action_items},
         )
 
-    _store_message(
-        repo=repo,
-        meeting_id=meeting_id,
-        sender_agent="governance_coordinator",
-        message_type="FINAL_TRADE_PLAN",
-        content=_msg_content_for(outputs.final_plan),
-        payload={"trade_plan": outputs.final_plan.model_dump(), "llm_meta": asdict(outputs.llm_meta.get("governance_coordinator")) if outputs.llm_meta.get("governance_coordinator") else None},
-        confidence=0.75,
-        emit=emit,
-    )
-
-    ended_at = _utcnow()
-    summary_short = f"[{slot_key}] Trade Plan: {outputs.final_plan.symbol} target={outputs.final_plan.target_position_pct:.1f}%"
-    action_items = [
-        {"owner": "research_agent", "action": "주요 뉴스 원문 확인 및 영향 업데이트", "due_date": str(now_kst.date())},
-        {"owner": "ops_manager", "action": "recon/pause/알림 누락 여부 점검", "due_date": str(now_kst.date())},
-        {"owner": "quant_strategist", "action": "과매매 방지(cooldown/rebalance band) 파라미터 점검", "due_date": str(now_kst.date())},
-    ]
-
-    repo.update_meeting_session(
-        meeting_id=meeting_id,
-        status="CLOSED",
-        ended_at=ended_at,
-        summary=outputs.secretary_minutes,
-        decisions={"trade_plan": outputs.final_plan.model_dump()},
-        action_items={"items": action_items},
-    )
-
-    summary_event_id = uuid.uuid4()
-    repo.insert_event(
-        DbEvent(
-            event_id=summary_event_id,
-            ts=ended_at,
-            event_type="MEETING_SUMMARY",
-            entity_type="meeting_sessions",
-            entity_id=str(meeting_id),
-            run_id=None,
-            rule_version_id=None,
-            payload={
-                "meeting_id": str(meeting_id),
-                "slot_key": slot_key,
-                "summary_short": summary_short,
-                "assistant_minutes": outputs.secretary_minutes,
-                "llm_meta": {k: asdict(v) for k, v in outputs.llm_meta.items()},
-            },
+        summary_event_id = uuid.uuid4()
+        repo.insert_event(
+            DbEvent(
+                event_id=summary_event_id,
+                ts=ended_at,
+                event_type="MEETING_SUMMARY",
+                entity_type="meeting_sessions",
+                entity_id=str(meeting_id),
+                run_id=None,
+                rule_version_id=None,
+                payload={
+                    "meeting_id": str(meeting_id),
+                    "slot_key": slot_key,
+                    "summary_short": summary_short,
+                    "assistant_minutes": outputs.secretary_minutes,
+                    "llm_meta": {k: asdict(v) for k, v in outputs.llm_meta.items()},
+                },
+            )
         )
-    )
-    try:
-        notifier.notify_meeting_summary(
-            event_id=summary_event_id,
-            meeting_id=str(meeting_id),
-            summary=summary_short,
-            assistant_minutes=outputs.secretary_minutes,
-            assistant_meta={"llm_meta": {k: asdict(v) for k, v in outputs.llm_meta.items()}},
-        )
-    except Exception:
-        pass
+        try:
+            notifier.notify_meeting_summary(
+                event_id=summary_event_id,
+                meeting_id=str(meeting_id),
+                summary=summary_short,
+                assistant_minutes=outputs.secretary_minutes,
+                assistant_meta={"llm_meta": {k: asdict(v) for k, v in outputs.llm_meta.items()}},
+            )
+        except Exception:
+            pass
 
-    action_event_id = uuid.uuid4()
-    repo.insert_event(
-        DbEvent(
-            event_id=action_event_id,
-            ts=ended_at,
-            event_type="MEETING_ACTION_ASSIGNED",
-            entity_type="meeting_sessions",
-            entity_id=str(meeting_id),
-            run_id=None,
-            rule_version_id=None,
-            payload={"meeting_id": str(meeting_id), "slot_key": slot_key, "items": action_items},
+        action_event_id = uuid.uuid4()
+        repo.insert_event(
+            DbEvent(
+                event_id=action_event_id,
+                ts=ended_at,
+                event_type="MEETING_ACTION_ASSIGNED",
+                entity_type="meeting_sessions",
+                entity_id=str(meeting_id),
+                run_id=None,
+                rule_version_id=None,
+                payload={"meeting_id": str(meeting_id), "slot_key": slot_key, "items": action_items},
+            )
         )
-    )
-    try:
-        notifier.notify_meeting_action_items(event_id=action_event_id, meeting_id=str(meeting_id), items=action_items)
-    except Exception:
-        pass
+        try:
+            notifier.notify_meeting_action_items(event_id=action_event_id, meeting_id=str(meeting_id), items=action_items)
+        except Exception:
+            pass
 
-    # Trade plan event (runtime consumes latest active by valid_to_kst).
-    plan_payload = {
-        "slot_key": slot_key,
-        "meeting_id": str(meeting_id),
-        "symbol": outputs.final_plan.symbol,
-        "target_position_pct": float(outputs.final_plan.target_position_pct),
-        "valid_from_kst": outputs.final_plan.valid_from_kst,
-        "valid_to_kst": outputs.final_plan.valid_to_kst,
-        "constraints": outputs.final_plan.constraints,
-        "notes": outputs.final_plan.notes,
-        # Extended fields (safe judge may start consuming later)
-        "allowed_actions": outputs.final_plan.allowed_actions.model_dump(),
-        "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
-        "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
-        "rationale": outputs.final_plan.rationale,
-        "conflict_resolution": outputs.final_plan.conflict_resolution,
-        "evidence_refs": outputs.final_plan.evidence_refs,
-        "open_questions": outputs.final_plan.open_questions,
-    }
-    repo.insert_event(
-        DbEvent(
-            event_id=uuid.uuid4(),
-            ts=ended_at,
-            event_type="TRADE_PLAN_SET",
-            entity_type="trade_plans",
-            entity_id=slot_key,
-            run_id=None,
-            rule_version_id=None,
-            payload=plan_payload,
+        # Trade plan event (runtime consumes latest active by valid_to_kst).
+        plan_payload = {
+            "slot_key": slot_key,
+            "meeting_id": str(meeting_id),
+            "symbol": outputs.final_plan.symbol,
+            "target_position_pct": float(outputs.final_plan.target_position_pct),
+            "valid_from_kst": outputs.final_plan.valid_from_kst,
+            "valid_to_kst": outputs.final_plan.valid_to_kst,
+            "constraints": outputs.final_plan.constraints,
+            "notes": outputs.final_plan.notes,
+            # Extended fields (safe judge may start consuming later)
+            "allowed_actions": outputs.final_plan.allowed_actions.model_dump(),
+            "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
+            "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
+            "rationale": outputs.final_plan.rationale,
+            "conflict_resolution": outputs.final_plan.conflict_resolution,
+            "evidence_refs": outputs.final_plan.evidence_refs,
+            "open_questions": outputs.final_plan.open_questions,
+        }
+        repo.insert_event(
+            DbEvent(
+                event_id=uuid.uuid4(),
+                ts=ended_at,
+                event_type="TRADE_PLAN_SET",
+                entity_type="trade_plans",
+                entity_id=slot_key,
+                run_id=None,
+                rule_version_id=None,
+                payload=plan_payload,
+            )
         )
-    )
 
-    if emit is not None:
-        emit(
-            "summary",
-            {
-                "meeting_id": str(meeting_id),
-                "slot_key": slot_key,
-                "ended_at": ended_at.isoformat(),
-                "summary_short": summary_short,
-                "assistant_minutes": outputs.secretary_minutes,
-                "trade_plan": plan_payload,
-            },
+        if emit is not None:
+            emit(
+                "summary",
+                {
+                    "meeting_id": str(meeting_id),
+                    "slot_key": slot_key,
+                    "ended_at": ended_at.isoformat(),
+                    "summary_short": summary_short,
+                    "assistant_minutes": outputs.secretary_minutes,
+                    "trade_plan": plan_payload,
+                },
+            )
+            emit("done", {"ok": True})
+
+        return slot_key
+    except Exception as exc:
+        ended_at = _utcnow()
+        repo.update_meeting_session(
+            meeting_id=meeting_id,
+            status="CLOSED",
+            ended_at=ended_at,
+            summary=_clip(f"회의 실행 실패: {exc}", 900),
+            decisions={"error": str(exc)[:300]},
+            action_items={"items": []},
         )
-        emit("done", {"ok": True})
-
-    return slot_key
+        if emit is not None:
+            emit("error", {"error": str(exc)[:300]})
+            emit("done", {"ok": False})
+        return slot_key
 
 
 def maybe_run_scheduled_governance_meeting(
