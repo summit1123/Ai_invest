@@ -137,9 +137,6 @@ def score_symbol(
     score += (volz - vol_min) / 10.0
     if spread > max_spread_bps:
         score -= (spread - max_spread_bps) / 100.0
-    # Slight bias for BTC ticker
-    if str(symbol).endswith("-BTC"):
-        score += 0.02
     return float(score)
 
 
@@ -410,32 +407,43 @@ def evaluate_candidates(
 
     evaluated: list[dict[str, Any]] = []
     for sym in symbols:
-        snap = fetch_market_snapshot(sym)
-        candles = fetch_candles_minutes(sym, unit=tf_min, count=200)
-        highs = [float(c["high_price"]) for c in candles]
-        lows = [float(c["low_price"]) for c in candles]
-        closes = [float(c["trade_price"]) for c in candles]
-        volumes = [float(c["candle_acc_trade_volume"]) for c in candles]
-        feat = build_feature_snapshot_from_candles(highs=highs, lows=lows, closes=closes, volumes=volumes)
+        try:
+            snap = fetch_market_snapshot(sym)
+            candles = fetch_candles_minutes(sym, unit=tf_min, count=200)
+            highs = [float(c["high_price"]) for c in candles]
+            lows = [float(c["low_price"]) for c in candles]
+            closes = [float(c["trade_price"]) for c in candles]
+            volumes = [float(c["candle_acc_trade_volume"]) for c in candles]
+            feat = build_feature_snapshot_from_candles(highs=highs, lows=lows, closes=closes, volumes=volumes)
 
-        snapshot_map = {"last_price": snap.last_price, "spread_bps": snap.spread_bps, "mid_price": snap.mid_price}
-        features_map = {"rsi_14": feat.rsi_14, "atr_pct": feat.atr_pct, "vol_zscore": feat.vol_zscore}
-        score = score_symbol(
-            symbol=sym,
-            snapshot=snapshot_map,
-            features=features_map,
-            rsi_min=rsi_min,
-            vol_min=vol_min,
-            max_spread_bps=max_spread,
-        )
-        evaluated.append(
-            {
-                "symbol": sym,
-                "score": float(score),
-                "snapshot": snapshot_map,
-                "features": features_map,
-            }
-        )
+            snapshot_map = {"last_price": snap.last_price, "spread_bps": snap.spread_bps, "mid_price": snap.mid_price}
+            features_map = {"rsi_14": feat.rsi_14, "atr_pct": feat.atr_pct, "vol_zscore": feat.vol_zscore}
+            score = score_symbol(
+                symbol=sym,
+                snapshot=snapshot_map,
+                features=features_map,
+                rsi_min=rsi_min,
+                vol_min=vol_min,
+                max_spread_bps=max_spread,
+            )
+            evaluated.append(
+                {
+                    "symbol": sym,
+                    "score": float(score),
+                    "snapshot": snapshot_map,
+                    "features": features_map,
+                }
+            )
+        except Exception as exc:
+            evaluated.append(
+                {
+                    "symbol": sym,
+                    "score": -9.0,
+                    "snapshot": {},
+                    "features": {},
+                    "error": str(exc)[:180],
+                }
+            )
 
     # Sort desc by score for stable ordering.
     evaluated.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)

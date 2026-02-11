@@ -13,7 +13,9 @@ class RulesLoaderTests(unittest.TestCase):
     def test_load_rules_yaml_success(self) -> None:
         cfg = load_rules(Path("rules.yaml"))
         self.assertEqual(cfg.version, "v1.0")
-        self.assertEqual(cfg.universe.symbols, ("KRW-BTC",))
+        self.assertGreaterEqual(len(cfg.universe.symbols), 2)
+        self.assertIn("KRW-BTC", cfg.universe.symbols)
+        self.assertIn("KRW-ETH", cfg.universe.symbols)
         self.assertGreater(cfg.cost_guard.min_expected_edge_bps, cfg.cost_guard.max_total_cost_bps)
         self.assertFalse(cfg.stop_policy.include_tax_in_realtime_stop)
 
@@ -38,4 +40,3 @@ class RulesLoaderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

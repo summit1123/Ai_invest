@@ -57,6 +57,22 @@ def _opt_float(payload: Mapping[str, Any], path: str) -> float | None:
         return None
 
 
+def _opt_bool(payload: Mapping[str, Any], path: str) -> bool | None:
+    try:
+        value = _dot_get(payload, path)
+    except Exception:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"true", "1", "yes", "y", "on"}:
+            return True
+        if s in {"false", "0", "no", "n", "off"}:
+            return False
+    return None
+
+
 @dataclass(frozen=True)
 class SafeJudgeDecision:
     action: str  # BUY / SELL / HOLD / PAUSE
@@ -93,6 +109,8 @@ def safe_judge_decide(
 
     # Optional context fields (paper/live sizing, trade plan).
     trade_plan_target_pct = _opt_float(payload, "context.trade_plan.target_position_pct")
+    trade_plan_buy_allowed = _opt_bool(payload, "context.trade_plan.allowed_actions.buy")
+    trade_plan_sell_allowed = _opt_bool(payload, "context.trade_plan.allowed_actions.sell")
     current_position_pct = _opt_float(payload, "context.position.current_position_pct")
     cash_krw = _opt_float(payload, "context.account.cash_krw")
 
@@ -106,6 +124,8 @@ def safe_judge_decide(
         "spread_bps": spread_bps,
         "max_spread_bps_entry": rules.cost_guard.max_spread_bps_entry,
         "trade_plan_target_pct": trade_plan_target_pct,
+        "trade_plan_buy_allowed": trade_plan_buy_allowed,
+        "trade_plan_sell_allowed": trade_plan_sell_allowed,
         "current_position_pct": current_position_pct,
         "cash_krw": cash_krw,
     }
@@ -165,6 +185,13 @@ def safe_judge_decide(
         else:
             action = "HOLD"
         reasons.append(ReasonCode.RG_PASS)
+
+        if action == "BUY" and trade_plan_buy_allowed is False:
+            action = "HOLD"
+            reasons = [ReasonCode.RG_TRADE_PLAN_FLAT]
+        elif action == "SELL" and trade_plan_sell_allowed is False:
+            action = "HOLD"
+            reasons = [ReasonCode.RG_SIGNAL_CONFLICT]
 
         # Trade Plan gating (position sizing guard): if plan says "flat" or already at target, do not buy.
         if action == "BUY" and trade_plan_target_pct is not None:

@@ -3,8 +3,12 @@ as_of_date: "2026-02-09"
 
 universe:
   market: "upbit"
+  # 거버넌스 회의에서 AI/결정로직이 선택할 후보 심볼 유니버스
   symbols:
     - "KRW-BTC"
+    - "KRW-ETH"
+    - "KRW-XRP"
+    - "KRW-SOL"
   trade_side: "long_only"
   mode: "paper"
   max_open_positions: 1

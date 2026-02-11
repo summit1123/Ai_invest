@@ -285,6 +285,11 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     "target_position_pct": plan_target_pct,
                     "raw_target_position_pct": (plan.get("target_position_pct") if plan else None),
                     "valid_to_kst": plan.get("valid_to_kst") if plan else None,
+                    "allowed_actions": (
+                        plan.get("allowed_actions")
+                        if (plan and isinstance(plan.get("allowed_actions"), dict))
+                        else {}
+                    ),
                 },
             },
         )
@@ -409,6 +414,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                         "symbol": plan.get("symbol"),
                         "target_position_pct": plan.get("target_position_pct"),
                         "valid_to_kst": plan.get("valid_to_kst"),
+                        "allowed_actions": plan.get("allowed_actions"),
                     }
                     if plan
                     else None,

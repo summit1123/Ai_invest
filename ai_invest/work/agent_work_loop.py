@@ -200,23 +200,34 @@ def _quant_candidate_rows(*, rules_raw: Mapping[str, Any], rules: RulesConfig, s
 
     out: list[dict[str, Any]] = []
     for sym in list(symbols):
-        snapshot, features = _build_features(symbol=sym, tf_min=tf_min)
-        score = _candidate_score(
-            rsi=_as_float(features.get("rsi_14")),
-            vol_z=_as_float(features.get("vol_zscore")),
-            spread_bps=_as_float(snapshot.get("spread_bps")),
-            rsi_min=rsi_min,
-            vol_min=vol_min,
-            max_spread=max_spread,
-        )
-        out.append(
-            {
-                "symbol": sym,
-                "score": score,
-                "snapshot": snapshot,
-                "features": features,
-            }
-        )
+        try:
+            snapshot, features = _build_features(symbol=sym, tf_min=tf_min)
+            score = _candidate_score(
+                rsi=_as_float(features.get("rsi_14")),
+                vol_z=_as_float(features.get("vol_zscore")),
+                spread_bps=_as_float(snapshot.get("spread_bps")),
+                rsi_min=rsi_min,
+                vol_min=vol_min,
+                max_spread=max_spread,
+            )
+            out.append(
+                {
+                    "symbol": sym,
+                    "score": score,
+                    "snapshot": snapshot,
+                    "features": features,
+                }
+            )
+        except Exception as exc:
+            out.append(
+                {
+                    "symbol": sym,
+                    "score": -9.0,
+                    "snapshot": {},
+                    "features": {},
+                    "error": str(exc)[:180],
+                }
+            )
     out.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
     return out
 
@@ -243,15 +254,21 @@ def run_agent_work_cycle(
 
     rules = load_rules("rules.yaml")
     symbols = list(rules.universe.symbols)
-    symbol = symbols[0]
+    default_symbol = symbols[0]
     tf_min = _timeframe_to_minutes(str((rules_raw.get("signal") or {}).get("timeframe_entry") or "15m"))
+    candidates = _quant_candidate_rows(rules_raw=rules_raw, rules=rules, symbols=symbols, tf_min=tf_min)
+    top = candidates[0] if candidates else {"symbol": default_symbol, "score": 0.0, "snapshot": {}, "features": {}}
+    symbol = str(top.get("symbol") or default_symbol)
+    snapshot = (top.get("snapshot") or {}) if isinstance(top.get("snapshot"), Mapping) else {}
+    features = (top.get("features") or {}) if isinstance(top.get("features"), Mapping) else {}
+    if not snapshot or not features:
+        snapshot, features = _build_features(symbol=symbol, tf_min=tf_min)
 
     # Shared state
     pause = repo.fetch_pause_state()
-    recon = repo.fetch_latest_reconciliation(symbol=symbol)
+    recon = repo.fetch_latest_reconciliation()
 
     # 1) research_agent prework
-    snapshot, features = _build_features(symbol=symbol, tf_min=tf_min)
     try:
         headlines = fetch_crypto_headlines(symbol=symbol, limit=12)
     except Exception:
@@ -280,7 +297,6 @@ def run_agent_work_cycle(
     )
 
     # 2) quant_strategist prework
-    candidates = _quant_candidate_rows(rules_raw=rules_raw, rules=rules, symbols=symbols, tf_min=tf_min)
     top = candidates[0] if candidates else {"symbol": symbol, "score": 0.0, "snapshot": snapshot, "features": features}
     default_target = _as_float(((rules_raw.get("governance") or {}).get("default_target_position_pct")), default=10.0)
     max_pos = float(rules.risk.max_position_pct_per_symbol)

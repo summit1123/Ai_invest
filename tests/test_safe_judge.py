@@ -116,6 +116,36 @@ class SafeJudgeTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "BUY")
 
+    def test_trade_plan_disallow_buy_blocks_buy(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {"allowed_actions": {"buy": False, "sell": True}, "target_position_pct": 10.0}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "BUY", "confidence": 0.7},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_TRADE_PLAN_FLAT.value])
+
+    def test_trade_plan_disallow_sell_blocks_sell(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {"allowed_actions": {"buy": True, "sell": False}, "target_position_pct": 10.0}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "SELL", "confidence": 0.7},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_SIGNAL_CONFLICT.value])
+
     def test_multiple_reasons_are_capped_to_three(self) -> None:
         # Construct a scenario where HOLD reasons would pile up if not capped.
         payload = base_payload()
