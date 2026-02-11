@@ -235,7 +235,7 @@ def meetings_governance_live(
                 emit=emit,
             )
         except Exception as exc:
-            emit("error", {"error": str(exc)[:300]})
+            emit("run_error", {"error": str(exc)[:300]})
             emit("done", {"ok": False})
 
     threading.Thread(target=worker, daemon=True).start()

@@ -69,6 +69,7 @@ export function MeetingRoomPage() {
 
     const es = new EventSource('/api/v1/ui/meetings/governance/live')
     esRef.current = es
+    let doneReceived = false
 
     es.addEventListener('meta', (ev: MessageEvent) => {
       try {
@@ -97,20 +98,29 @@ export function MeetingRoomPage() {
       }
     })
 
-    es.addEventListener('error', (ev: any) => {
-      // SSE network errors also arrive here without payload.
+    es.addEventListener('run_error', (ev: MessageEvent) => {
       try {
-        const data = JSON.parse(String(ev?.data || '{}')) as any
-        const msg = String(data?.error ?? '알 수 없는 에러')
+        const data = JSON.parse(String(ev.data || '{}')) as any
+        const msg = String(data?.error ?? '회의 실행 중 오류가 발생했습니다.')
         setErr(msg)
       } catch {
-        setErr('연결 오류 또는 서버 에러')
+        setErr('회의 실행 중 오류가 발생했습니다.')
       }
       setPhase('error')
       stopStream()
     })
 
+    es.onerror = () => {
+      // Native EventSource error fires for transport/reconnect events.
+      // Ignore if we already received done.
+      if (doneReceived) return
+      setErr('서버 연결이 끊겼습니다. 백엔드 상태를 확인 후 다시 시도해주세요.')
+      setPhase('error')
+      stopStream()
+    }
+
     es.addEventListener('done', (ev: MessageEvent) => {
+      doneReceived = true
       try {
         const data = JSON.parse(String(ev.data || '{}')) as any
         if (data?.ok === false) {

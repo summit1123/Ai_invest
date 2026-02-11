@@ -1305,7 +1305,7 @@ def run_governance_meeting_now(
             action_items={"items": []},
         )
         if emit is not None:
-            emit("error", {"error": str(exc)[:300]})
+            emit("run_error", {"error": str(exc)[:300]})
             emit("done", {"ok": False})
         return slot_key
 
