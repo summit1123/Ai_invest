@@ -27,7 +27,7 @@ Thumbs.db
 *.log
 data/
 exports/
-runtime/
+/runtime/
 
 # Node / frontend
 node_modules/

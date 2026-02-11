@@ -122,6 +122,10 @@ pgvector:
 | `PAPER_TRADING` | Y | `true` | 실거래 전 기본 true |
 | `ENABLE_LIVE_TRADING` | Y | `false` | 실거래 스위치 |
 | `MAX_DAILY_LOSS_PCT_OVERRIDE` | N | `1.5` | 긴급 오버라이드(권장: 미사용) |
+| `APP_AUTOSTART_ORCHESTRATOR` | N | `true` | API 서버 부팅 시 오케스트레이터 자동 기동(기본: true, pytest 환경은 기본 false) |
+| `APP_AUTOSTART_FORCE` | N | `false` | 외부 오케스트레이터가 떠 있어도 강제 기동 |
+| `APP_AUTOSTART_LOG_PATH` | N | `logs/orchestrator.autostart.log` | 자동기동 오케스트레이터 로그 경로 |
+| `ORCHESTRATOR_STATUS_PATH` | N | `runtime/orchestrator_status.json` | 오케스트레이터 상태 파일 경로 |
 
 ## 10) 보안/운영 원칙
 

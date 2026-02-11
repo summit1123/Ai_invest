@@ -18,6 +18,7 @@ from ai_invest.config.dotenv import load_dotenv
 from ai_invest.config.rules_loader import load_rules
 from ai_invest.meetings.governance_meeting import run_governance_meeting_now
 from ai_invest.notifications.service import NotificationService
+from ai_invest.runtime.orchestrator_autostart import maybe_start_orchestrator, stop_orchestrator
 from ai_invest.storage.postgres import PostgresRepo
 from ai_invest.work.agent_work_loop import collect_latest_work_reports
 
@@ -35,7 +36,12 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     # Contract-first: rules must load at boot or the app should fail fast.
     load_dotenv()
     load_rules("rules.yaml")
-    yield
+    orchestrator_state = maybe_start_orchestrator()
+    app.state.orchestrator_autostart = orchestrator_state
+    try:
+        yield
+    finally:
+        stop_orchestrator(orchestrator_state)
 
 
 app = FastAPI(title="ai-invest", version="0.1.0", lifespan=lifespan)
@@ -281,12 +287,21 @@ def weekly_review() -> dict[str, Any]:
 @app.get("/api/v1/ui/orchestrator/status", tags=["운영"], summary="멀티 오케스트레이터 상태")
 def orchestrator_status() -> dict[str, Any]:
     status_path = Path(os.environ.get("ORCHESTRATOR_STATUS_PATH", "runtime/orchestrator_status.json"))
+    autostart = getattr(app.state, "orchestrator_autostart", None)
+    autostart_meta = None
+    if autostart is not None:
+        autostart_meta = {
+            "enabled": bool(getattr(autostart, "enabled", False)),
+            "started_here": bool(getattr(autostart, "started_here", False)),
+            "reason": str(getattr(autostart, "reason", "")),
+            "log_path": str(getattr(autostart, "log_path", "")),
+        }
     if not status_path.exists():
-        return ok({"running": False, "status_file": str(status_path), "status": None})
+        return ok({"running": False, "status_file": str(status_path), "status": None, "autostart": autostart_meta})
     try:
         status = json.loads(status_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        return ok({"running": False, "status_file": str(status_path), "status": None, "error": str(exc)})
+        return ok({"running": False, "status_file": str(status_path), "status": None, "error": str(exc), "autostart": autostart_meta})
     workers = status.get("workers") if isinstance(status, Mapping) else {}
     running = any(bool((v or {}).get("alive")) for v in (workers or {}).values()) if isinstance(workers, Mapping) else False
-    return ok({"running": running, "status_file": str(status_path), "status": status})
+    return ok({"running": running, "status_file": str(status_path), "status": status, "autostart": autostart_meta})

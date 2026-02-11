@@ -68,6 +68,7 @@ class FastApiAppTests(unittest.TestCase):
         self.assertTrue(resp4.json()["ok"])
         self.assertTrue(resp5.json()["ok"])
         self.assertTrue(resp6.json()["ok"])
+        self.assertIn("autostart", resp6.json()["data"])
 
 
 if __name__ == "__main__":
