@@ -79,6 +79,7 @@ def collect_latest_work_reports(
     agent_names: Sequence[str],
     max_age_minutes: int = 360,
     now_utc: datetime | None = None,
+    include_details: bool = True,
 ) -> dict[str, Any]:
     now = now_utc or _utcnow()
     reports: dict[str, Any] = {}
@@ -98,13 +99,19 @@ def collect_latest_work_reports(
         if age_min is None or age_min > float(max_age_minutes):
             stale.append(name)
 
-        reports[name] = {
+        row_out = {
             "report_id": row.get("report_id"),
             "created_at": row.get("created_at").isoformat() if isinstance(row.get("created_at"), datetime) else row.get("created_at"),
             "title": row.get("title"),
             "summary": row.get("summary"),
             "age_minutes": age_min,
         }
+        if include_details:
+            row_out["team_scope"] = row.get("team_scope")
+            row_out["findings"] = row.get("findings")
+            row_out["risks"] = row.get("risks")
+            row_out["action_items"] = row.get("action_items")
+        reports[name] = row_out
 
     return {
         "reports": reports,
@@ -366,11 +373,15 @@ class WorkCycleResult:
     report_ids: dict[str, str]
 
 
+WORK_AGENT_NAMES = ("research_agent", "quant_strategist", "risk_manager", "ops_manager")
+
+
 def run_agent_work_cycle(
     *,
     repo: PostgresRepo,
     rules_raw: Mapping[str, Any],
     meeting_context: str | None = None,
+    selected_agents: Sequence[str] | None = None,
 ) -> WorkCycleResult:
     """Run one pre-meeting agent work cycle and persist reports.
 
@@ -380,207 +391,228 @@ def run_agent_work_cycle(
     now_kst = _now_kst()
     cycle_key = now_kst.strftime("%Y-%m-%d %H:%M:%S")
 
+    selected = {str(a).strip() for a in (selected_agents or WORK_AGENT_NAMES) if str(a).strip()}
+    selected &= set(WORK_AGENT_NAMES)
+    if not selected:
+        raise ValueError("selected_agents is empty")
+
     rules = load_rules("rules.yaml")
     universe = resolve_dynamic_universe(rules_raw=rules_raw, fallback_symbols=list(rules.universe.symbols))
-    symbols = list(universe.symbols)
+    symbols = list(universe.symbols) or list(rules.universe.symbols)
     default_symbol = symbols[0]
     tf_min = _timeframe_to_minutes(str((rules_raw.get("signal") or {}).get("timeframe_entry") or "15m"))
-    candidates = _quant_candidate_rows(rules_raw=rules_raw, rules=rules, symbols=symbols, tf_min=tf_min)
+
+    need_market_ctx = bool({"research_agent", "quant_strategist"} & selected)
+    candidates: list[dict[str, Any]] = _quant_candidate_rows(rules_raw=rules_raw, rules=rules, symbols=symbols, tf_min=tf_min) if need_market_ctx else []
     top = candidates[0] if candidates else {"symbol": default_symbol, "score": 0.0, "snapshot": {}, "features": {}}
     symbol = str(top.get("symbol") or default_symbol)
     snapshot = (top.get("snapshot") or {}) if isinstance(top.get("snapshot"), Mapping) else {}
     features = (top.get("features") or {}) if isinstance(top.get("features"), Mapping) else {}
-    if not snapshot or not features:
+    if need_market_ctx and (not snapshot or not features):
         snapshot, features = _build_features(symbol=symbol, tf_min=tf_min)
 
     # Shared state
     pause = repo.fetch_pause_state()
     recon = repo.fetch_latest_reconciliation()
+    report_ids: dict[str, str] = {}
 
-    # 1) research_agent prework
-    try:
-        headlines = fetch_crypto_headlines(symbol=symbol, limit=12)
-    except Exception:
-        headlines = []
-    research_route = llm_route_for_agent(rules_raw=rules_raw, agent_name="research_agent")
-    brief = research_agent_daily_brief(
-        symbol=symbol,
-        snapshot=snapshot,
-        features=features,
-        ops={"pause": pause, "latest_reconciliation": recon},
-        headlines=headlines,
-        llm_route=research_route,
-    )
-    research_id = _store_report(
-        repo=repo,
-        report_date_kst=now_kst,
-        cycle_key=cycle_key,
-        meeting_context=meeting_context,
-        agent_name="research_agent",
-        team_scope="RESEARCH",
-        title="사전업무 리포트(Research)",
-        summary=brief.summary,
-        findings={"key_findings": list(brief.key_findings), "llm_meta": brief.llm_meta, "symbol": symbol},
-        risks={"watchlist": list(brief.risk_watchlist)},
-        action_items={"next_actions": list(brief.next_actions)},
-    )
-
-    # 2) quant_strategist prework
-    top = candidates[0] if candidates else {"symbol": symbol, "score": 0.0, "snapshot": snapshot, "features": features}
-    signal_cfg = (rules_raw.get("signal") or {}) if isinstance(rules_raw, Mapping) else {}
-    rsi_min = _as_float(signal_cfg.get("rsi_min"), default=50.0)
-    vol_min = _as_float(signal_cfg.get("volume_zscore_min"), default=1.2)
-    fees_cfg = (rules_raw.get("fees") or {}) if isinstance(rules_raw, Mapping) else {}
-    fee_total_bps = _as_float(fees_cfg.get("fallback_bid_fee_bps"), default=5.0) + _as_float(
-        fees_cfg.get("fallback_ask_fee_bps"), default=5.0
-    )
-    backtests: list[dict[str, Any]] = []
-    for row in candidates[: min(8, len(candidates))]:
-        sym = str(row.get("symbol") or "").strip().upper()
-        if not sym:
-            continue
-        bt = _quick_backtest_candidate(
-            symbol=sym,
-            tf_min=tf_min,
-            rsi_min=rsi_min,
-            vol_min=vol_min,
-            fee_total_bps=fee_total_bps,
-            hold_bars=24,
-            lookback_bars=500,
+    if "research_agent" in selected:
+        try:
+            headlines = fetch_crypto_headlines(symbol=symbol, limit=12)
+        except Exception:
+            headlines = []
+        research_route = llm_route_for_agent(rules_raw=rules_raw, agent_name="research_agent")
+        brief = research_agent_daily_brief(
+            symbol=symbol,
+            snapshot=snapshot,
+            features=features,
+            ops={"pause": pause, "latest_reconciliation": recon},
+            headlines=headlines,
+            llm_route=research_route,
         )
-        backtests.append(bt)
-    if backtests:
-        bt_rank = sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)
-        bt_best = bt_rank[0]
-        bt_best_symbol = str(bt_best.get("symbol") or "").strip()
-        if bt_best_symbol:
-            for row in candidates:
-                if str(row.get("symbol") or "").strip().upper() == bt_best_symbol.upper():
-                    top = row
-                    break
-    default_target = _as_float(((rules_raw.get("governance") or {}).get("default_target_position_pct")), default=10.0)
-    max_pos = float(rules.risk.max_position_pct_per_symbol)
-    quote_ccy = _quote_currency(str(top.get("symbol") or symbol))
-    cash = float(repo.fetch_cash_balance(currency=quote_ccy))
-    top_snapshot = (top.get("snapshot") or {}) if isinstance(top.get("snapshot"), Mapping) else {}
-    top_mid = _as_float(top_snapshot.get("mid_price"), default=0.0)
-    top_pos = repo.fetch_position(str(top.get("symbol") or symbol))
-    top_qty = float(top_pos.qty) if top_pos else 0.0
-    equity = float(cash) + float(top_qty) * float(top_mid)
-    capital_profile = resolve_capital_policy(
-        rules_raw=rules_raw,
-        equity_krw=equity,
-        default_target_position_pct=default_target,
-        max_position_pct_per_symbol=max_pos,
-        cooldown_minutes_after_trigger=int(rules.risk.cooldown_minutes_after_trigger),
-    )
-    target = min(
-        float(capital_profile.max_target_position_pct),
-        float(capital_profile.max_position_pct_per_symbol),
-        max(0.0, default_target if float(top.get("score") or 0.0) > 0 else 0.0),
-    )
-    quant_summary = (
-        f"후보 1순위 {top.get('symbol')} (signal_score={float(top.get('score') or 0.0):.3f}), "
-        f"권장 목표비중 {target:.1f}% (tier={capital_profile.tier_name}, equity={equity:.0f} KRW)"
-    )
-    quant_risks: list[str] = []
-    if _as_float((top.get("snapshot") or {}).get("spread_bps"), default=0.0) > float(rules.cost_guard.max_spread_bps_entry):
-        quant_risks.append("상위 후보의 스프레드가 제한보다 넓음")
-    quant_id = _store_report(
-        repo=repo,
-        report_date_kst=now_kst,
-        cycle_key=cycle_key,
-        meeting_context=meeting_context,
-        agent_name="quant_strategist",
-        team_scope="STRATEGY",
-        title="사전업무 리포트(Quant)",
-        summary=quant_summary,
-        findings={
-            "universe_selection": {
-                "source": universe.source,
-                "total_krw_markets": universe.total_krw_markets,
-                "ranked_count": universe.ranked_count,
-                "symbols": symbols[:20],
-                "top24h_turnover": universe.top24h_turnover[:10],
+        compact_headlines: list[dict[str, Any]] = []
+        for h in list(headlines or [])[:10]:
+            if not isinstance(h, Mapping):
+                continue
+            compact_headlines.append(
+                {
+                    "source": h.get("source"),
+                    "title": h.get("title"),
+                    "url": h.get("url"),
+                    "published_at": h.get("published_at"),
+                }
+            )
+        research_id = _store_report(
+            repo=repo,
+            report_date_kst=now_kst,
+            cycle_key=cycle_key,
+            meeting_context=meeting_context,
+            agent_name="research_agent",
+            team_scope="RESEARCH",
+            title="사전업무 리포트(Research)",
+            summary=brief.summary,
+            findings={
+                "key_findings": list(brief.key_findings),
+                "llm_meta": brief.llm_meta,
+                "symbol": symbol,
+                "headlines": compact_headlines,
             },
-            "candidates": candidates[:5],
-            "backtest": {
-                "engine": "quick_rsi_vol_replay_v1",
-                "params": {"tf_min": tf_min, "rsi_min": rsi_min, "vol_min": vol_min, "fee_total_bps": fee_total_bps},
-                "ranked": sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)[:5],
+            risks={"watchlist": list(brief.risk_watchlist)},
+            action_items={"next_actions": list(brief.next_actions)},
+        )
+        report_ids["research_agent"] = str(research_id)
+
+    if "quant_strategist" in selected:
+        top = candidates[0] if candidates else {"symbol": symbol, "score": 0.0, "snapshot": snapshot, "features": features}
+        signal_cfg = (rules_raw.get("signal") or {}) if isinstance(rules_raw, Mapping) else {}
+        rsi_min = _as_float(signal_cfg.get("rsi_min"), default=50.0)
+        vol_min = _as_float(signal_cfg.get("volume_zscore_min"), default=1.2)
+        fees_cfg = (rules_raw.get("fees") or {}) if isinstance(rules_raw, Mapping) else {}
+        fee_total_bps = _as_float(fees_cfg.get("fallback_bid_fee_bps"), default=5.0) + _as_float(
+            fees_cfg.get("fallback_ask_fee_bps"), default=5.0
+        )
+        backtests: list[dict[str, Any]] = []
+        for row in candidates[: min(8, len(candidates))]:
+            sym = str(row.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            bt = _quick_backtest_candidate(
+                symbol=sym,
+                tf_min=tf_min,
+                rsi_min=rsi_min,
+                vol_min=vol_min,
+                fee_total_bps=fee_total_bps,
+                hold_bars=24,
+                lookback_bars=500,
+            )
+            backtests.append(bt)
+        if backtests:
+            bt_rank = sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)
+            bt_best = bt_rank[0]
+            bt_best_symbol = str(bt_best.get("symbol") or "").strip()
+            if bt_best_symbol:
+                for row in candidates:
+                    if str(row.get("symbol") or "").strip().upper() == bt_best_symbol.upper():
+                        top = row
+                        break
+        default_target = _as_float(((rules_raw.get("governance") or {}).get("default_target_position_pct")), default=10.0)
+        max_pos = float(rules.risk.max_position_pct_per_symbol)
+        quote_ccy = _quote_currency(str(top.get("symbol") or symbol))
+        cash = float(repo.fetch_cash_balance(currency=quote_ccy))
+        top_snapshot = (top.get("snapshot") or {}) if isinstance(top.get("snapshot"), Mapping) else {}
+        top_mid = _as_float(top_snapshot.get("mid_price"), default=0.0)
+        top_pos = repo.fetch_position(str(top.get("symbol") or symbol))
+        top_qty = float(top_pos.qty) if top_pos else 0.0
+        equity = float(cash) + float(top_qty) * float(top_mid)
+        capital_profile = resolve_capital_policy(
+            rules_raw=rules_raw,
+            equity_krw=equity,
+            default_target_position_pct=default_target,
+            max_position_pct_per_symbol=max_pos,
+            cooldown_minutes_after_trigger=int(rules.risk.cooldown_minutes_after_trigger),
+        )
+        target = min(
+            float(capital_profile.max_target_position_pct),
+            float(capital_profile.max_position_pct_per_symbol),
+            max(0.0, default_target if float(top.get("score") or 0.0) > 0 else 0.0),
+        )
+        quant_summary = (
+            f"후보 1순위 {top.get('symbol')} (signal_score={float(top.get('score') or 0.0):.3f}), "
+            f"권장 목표비중 {target:.1f}% (tier={capital_profile.tier_name}, equity={equity:.0f} KRW)"
+        )
+        quant_risks: list[str] = []
+        if _as_float((top.get("snapshot") or {}).get("spread_bps"), default=0.0) > float(rules.cost_guard.max_spread_bps_entry):
+            quant_risks.append("상위 후보의 스프레드가 제한보다 넓음")
+        quant_id = _store_report(
+            repo=repo,
+            report_date_kst=now_kst,
+            cycle_key=cycle_key,
+            meeting_context=meeting_context,
+            agent_name="quant_strategist",
+            team_scope="STRATEGY",
+            title="사전업무 리포트(Quant)",
+            summary=quant_summary,
+            findings={
+                "universe_selection": {
+                    "source": universe.source,
+                    "total_krw_markets": universe.total_krw_markets,
+                    "ranked_count": universe.ranked_count,
+                    "symbols": symbols[:20],
+                    "top24h_turnover": universe.top24h_turnover[:10],
+                },
+                "candidates": candidates[:8],
+                "backtest": {
+                    "engine": "quick_rsi_vol_replay_v1",
+                    "params": {"tf_min": tf_min, "rsi_min": rsi_min, "vol_min": vol_min, "fee_total_bps": fee_total_bps},
+                    "ranked": sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)[:8],
+                },
+                "suggested_plan": {"symbol": top.get("symbol"), "target_position_pct": target},
+                "capital_profile": capital_profile.as_dict(),
             },
-            "suggested_plan": {"symbol": top.get("symbol"), "target_position_pct": target},
-            "capital_profile": capital_profile.as_dict(),
-        },
-        risks={"watchlist": quant_risks},
-        action_items={
-            "next_actions": [
-                "회의에서 상위 후보의 비용/리스크 충돌 여부 검증",
-                "target_position_pct와 cooldown/rebalance_band 합의",
-                "자본 티어(capital_policy) 상한과 플랜 비중 일치 여부 확인",
-            ]
-        },
-    )
+            risks={"watchlist": quant_risks},
+            action_items={
+                "next_actions": [
+                    "회의에서 상위 후보의 비용/리스크 충돌 여부 검증",
+                    "target_position_pct와 cooldown/rebalance_band 합의",
+                    "자본 티어(capital_policy) 상한과 플랜 비중 일치 여부 확인",
+                ]
+            },
+        )
+        report_ids["quant_strategist"] = str(quant_id)
 
-    # 3) risk_manager prework
-    latest_pnl = (repo.fetch_pnl_daily(limit=1) or [None])[0]
-    risk_watch: list[str] = []
-    if pause.get("paused"):
-        risk_watch.append("현재 PAUSE 상태")
-    if str((recon or {}).get("status") or "OK").upper() == "FAIL":
-        risk_watch.append("정합성 FAIL 상태")
-    risk_summary = (
-        f"리스크 한도: 일손실 {rules.risk.max_daily_loss_pct:.2f}%, "
-        f"심볼 최대비중 {rules.risk.max_position_pct_per_symbol:.1f}%"
-    )
-    if latest_pnl:
-        risk_summary += f", 최근 일손익={latest_pnl.get('realized_pnl')}"
-    risk_id = _store_report(
-        repo=repo,
-        report_date_kst=now_kst,
-        cycle_key=cycle_key,
-        meeting_context=meeting_context,
-        agent_name="risk_manager",
-        team_scope="RISK",
-        title="사전업무 리포트(Risk)",
-        summary=risk_summary,
-        findings={"limits": {"max_daily_loss_pct": rules.risk.max_daily_loss_pct, "max_position_pct_per_symbol": rules.risk.max_position_pct_per_symbol}},
-        risks={"watchlist": risk_watch},
-        action_items={"next_actions": ["회의에서 하드게이트(veto 조건) 재확인"]},
-    )
+    if "risk_manager" in selected:
+        latest_pnl = (repo.fetch_pnl_daily(limit=1) or [None])[0]
+        risk_watch: list[str] = []
+        if pause.get("paused"):
+            risk_watch.append("현재 PAUSE 상태")
+        if str((recon or {}).get("status") or "OK").upper() == "FAIL":
+            risk_watch.append("정합성 FAIL 상태")
+        risk_summary = (
+            f"리스크 한도: 일손실 {rules.risk.max_daily_loss_pct:.2f}%, "
+            f"심볼 최대비중 {rules.risk.max_position_pct_per_symbol:.1f}%"
+        )
+        if latest_pnl:
+            risk_summary += f", 최근 일손익={latest_pnl.get('realized_pnl')}"
+        risk_id = _store_report(
+            repo=repo,
+            report_date_kst=now_kst,
+            cycle_key=cycle_key,
+            meeting_context=meeting_context,
+            agent_name="risk_manager",
+            team_scope="RISK",
+            title="사전업무 리포트(Risk)",
+            summary=risk_summary,
+            findings={"limits": {"max_daily_loss_pct": rules.risk.max_daily_loss_pct, "max_position_pct_per_symbol": rules.risk.max_position_pct_per_symbol}},
+            risks={"watchlist": risk_watch},
+            action_items={"next_actions": ["회의에서 하드게이트(veto 조건) 재확인"]},
+        )
+        report_ids["risk_manager"] = str(risk_id)
 
-    # 4) ops_manager prework
-    deliveries = repo.fetch_notification_deliveries(limit=30)
-    failed_n = len([d for d in deliveries if str(d.get("status") or "").upper() == "FAILED"])
-    ops_summary = (
-        f"운영상태 recon={str((recon or {}).get('status') or 'OK').upper()}, "
-        f"paused={bool(pause.get('paused'))}, 최근 알림 실패={failed_n}건"
-    )
-    ops_risks: list[str] = []
-    if failed_n > 0:
-        ops_risks.append("최근 알림 전송 실패 존재")
-    if bool(pause.get("paused")):
-        ops_risks.append("시스템 PAUSE 상태")
-    ops_id = _store_report(
-        repo=repo,
-        report_date_kst=now_kst,
-        cycle_key=cycle_key,
-        meeting_context=meeting_context,
-        agent_name="ops_manager",
-        team_scope="OPS",
-        title="사전업무 리포트(Ops)",
-        summary=ops_summary,
-        findings={"reconciliation": recon, "pause": pause, "notification_failures_recent": failed_n},
-        risks={"watchlist": ops_risks},
-        action_items={"next_actions": ["회의 전 recon/pause 상태 재검증", "알림 실패 원인 점검"]},
-    )
+    if "ops_manager" in selected:
+        deliveries = repo.fetch_notification_deliveries(limit=30)
+        failed_n = len([d for d in deliveries if str(d.get("status") or "").upper() == "FAILED"])
+        ops_summary = (
+            f"운영상태 recon={str((recon or {}).get('status') or 'OK').upper()}, "
+            f"paused={bool(pause.get('paused'))}, 최근 알림 실패={failed_n}건"
+        )
+        ops_risks: list[str] = []
+        if failed_n > 0:
+            ops_risks.append("최근 알림 전송 실패 존재")
+        if bool(pause.get("paused")):
+            ops_risks.append("시스템 PAUSE 상태")
+        ops_id = _store_report(
+            repo=repo,
+            report_date_kst=now_kst,
+            cycle_key=cycle_key,
+            meeting_context=meeting_context,
+            agent_name="ops_manager",
+            team_scope="OPS",
+            title="사전업무 리포트(Ops)",
+            summary=ops_summary,
+            findings={"reconciliation": recon, "pause": pause, "notification_failures_recent": failed_n},
+            risks={"watchlist": ops_risks},
+            action_items={"next_actions": ["회의 전 recon/pause 상태 재검증", "알림 실패 원인 점검"]},
+        )
+        report_ids["ops_manager"] = str(ops_id)
 
-    return WorkCycleResult(
-        cycle_key=cycle_key,
-        report_ids={
-            "research_agent": str(research_id),
-            "quant_strategist": str(quant_id),
-            "risk_manager": str(risk_id),
-            "ops_manager": str(ops_id),
-        },
-    )
+    return WorkCycleResult(cycle_key=cycle_key, report_ids=report_ids)

@@ -23,12 +23,11 @@ from ai_invest.config.capital_policy import resolve_capital_policy
 from ai_invest.config.llm_router import LLMRoute, llm_route_for_agent
 from ai_invest.config.rules_loader import RulesConfig, load_rules
 from ai_invest.market_data.features import build_feature_snapshot_from_candles
-from ai_invest.market_data.universe_selector import resolve_dynamic_universe
 from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_market_snapshot
 from ai_invest.notifications.service import NotificationService
-from ai_invest.research.rss import fetch_crypto_headlines, summarize_headlines_text
+from ai_invest.research.rss import summarize_headlines_text
 from ai_invest.storage.postgres import DbEvent, DbMeetingMessage, DbMeetingSession, PostgresRepo
-from ai_invest.work.agent_work_loop import collect_latest_work_reports, run_agent_work_cycle
+from ai_invest.work.agent_work_loop import collect_latest_work_reports
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -1003,8 +1002,8 @@ def run_governance_meeting_now(
     times = get_meeting_times_kst(rules_raw)
     slot_key = force_slot_key or f"{now_kst.date().isoformat()} LIVE {now_kst.strftime('%H:%M:%S')}"
 
-    universe = resolve_dynamic_universe(rules_raw=rules_raw, fallback_symbols=list(rules.universe.symbols))
-    symbols = list(universe.symbols)
+    # Governance meeting must consume DB prework outputs (no live universe scan here).
+    symbols = list(rules.universe.symbols)
 
     # Valid window (deterministic):
     # - scheduled slot: [slot_dt, next_slot_dt)
@@ -1035,8 +1034,7 @@ def run_governance_meeting_now(
     session_agenda = {
         "slot_key": slot_key,
         "symbols": symbols,
-        "universe_source": universe.source,
-        "universe_total_krw_markets": universe.total_krw_markets,
+        "universe_source": "prework_reports",
         "timeframe_entry": str((rules_raw.get("signal") or {}).get("timeframe_entry") or "15m"),
         "mode": agenda_mode,
     }
@@ -1085,16 +1083,13 @@ def run_governance_meeting_now(
         prework_agents = ["research_agent", "quant_strategist", "risk_manager", "ops_manager"]
         prework_max_age_min = int(((rules_raw.get("governance") or {}).get("prework_max_age_min") or 360) if isinstance(rules_raw, Mapping) else 360)
         require_prework_reports = bool(((rules_raw.get("governance") or {}).get("require_prework_reports")) if isinstance(rules_raw, Mapping) else False)
-        prework = collect_latest_work_reports(repo=repo, agent_names=prework_agents, max_age_minutes=prework_max_age_min)
-        prework_cycle_info: dict[str, Any] | None = None
-
-        if list(prework.get("missing") or []) or list(prework.get("stale") or []):
-            try:
-                cycle = run_agent_work_cycle(repo=repo, rules_raw=rules_raw, meeting_context=slot_key)
-                prework_cycle_info = {"cycle_key": cycle.cycle_key, "report_ids": cycle.report_ids}
-                prework = collect_latest_work_reports(repo=repo, agent_names=prework_agents, max_age_minutes=prework_max_age_min)
-            except Exception as exc:
-                prework_cycle_info = {"error": str(exc)[:200]}
+        prework = collect_latest_work_reports(
+            repo=repo,
+            agent_names=prework_agents,
+            max_age_minutes=prework_max_age_min,
+            include_details=True,
+        )
+        prework_cycle_info: dict[str, Any] | None = {"mode": "db_only"}
 
         fresh_agents = sorted(
             set(prework_agents)
@@ -1127,29 +1122,27 @@ def run_governance_meeting_now(
                 f"prework_missing_or_stale: missing={list(prework.get('missing') or [])}, stale={list(prework.get('stale') or [])}"
             )
 
-        evaluated = evaluate_candidates(rules_raw=rules_raw, rules=rules, symbols=symbols)
+        prework_reports = dict((prework or {}).get("reports") or {})
+        quant_report = prework_reports.get("quant_strategist") if isinstance(prework_reports.get("quant_strategist"), Mapping) else {}
+        quant_findings = dict((quant_report or {}).get("findings") or {}) if isinstance(quant_report, Mapping) else {}
+        evaluated_raw = quant_findings.get("candidates") if isinstance(quant_findings.get("candidates"), list) else []
+        evaluated = [x for x in list(evaluated_raw or []) if isinstance(x, Mapping)]
+        if not evaluated:
+            evaluated = [{"symbol": (symbols[0] if symbols else "KRW-BTC"), "score": -9.0, "snapshot": {}, "features": {}}]
 
         pause = repo.fetch_pause_state()
         recon = repo.fetch_latest_reconciliation()
 
-        best_symbol = str((evaluated[0] if evaluated else {}).get("symbol") or (symbols[0] if symbols else "KRW-BTC"))
-        try:
-            headlines_raw = fetch_crypto_headlines(symbol=best_symbol, limit=12)
-        except Exception:
-            headlines_raw = []
-        headlines_compact = []
-        for h in list(headlines_raw)[:10]:
-            if not isinstance(h, Mapping):
-                continue
-            headlines_compact.append(
-                {
-                    "source": h.get("source"),
-                    "title": h.get("title"),
-                    "url": h.get("url"),
-                    "published_at": h.get("published_at"),
-                }
-            )
-        research_brief = {"headlines": headlines_compact, "headlines_text": summarize_headlines_text(headlines_compact, max_items=6)}
+        suggested_plan = quant_findings.get("suggested_plan") if isinstance(quant_findings.get("suggested_plan"), Mapping) else {}
+        best_symbol = str((suggested_plan or {}).get("symbol") or (evaluated[0] if evaluated else {}).get("symbol") or (symbols[0] if symbols else "KRW-BTC"))
+        research_report = prework_reports.get("research_agent") if isinstance(prework_reports.get("research_agent"), Mapping) else {}
+        research_findings = dict((research_report or {}).get("findings") or {}) if isinstance(research_report, Mapping) else {}
+        headlines_compact = [h for h in list(research_findings.get("headlines") or []) if isinstance(h, Mapping)][:10]
+        research_summary = str((research_report or {}).get("summary") or "").strip()
+        research_brief = {
+            "headlines": headlines_compact,
+            "headlines_text": summarize_headlines_text(headlines_compact, max_items=6) or research_summary,
+        }
 
         # Account state snapshot (paper sizing / context)
         try:
@@ -1198,11 +1191,12 @@ def run_governance_meeting_now(
         fact_pack["valid_from_kst"] = vf_kst.isoformat()
         fact_pack["valid_to_kst"] = vt_kst.isoformat()
         fact_pack["capital_profile"] = capital_profile.as_dict()
+        universe_selection = quant_findings.get("universe_selection") if isinstance(quant_findings.get("universe_selection"), Mapping) else {}
         fact_pack["universe_selection"] = {
-            "source": universe.source,
-            "total_krw_markets": universe.total_krw_markets,
-            "ranked_count": universe.ranked_count,
-            "top24h_turnover": universe.top24h_turnover[:10],
+            "source": str((universe_selection or {}).get("source") or "prework_unknown"),
+            "total_krw_markets": int(_as_float((universe_selection or {}).get("total_krw_markets"), default=0.0)),
+            "ranked_count": int(_as_float((universe_selection or {}).get("ranked_count"), default=0.0)),
+            "top24h_turnover": [x for x in list((universe_selection or {}).get("top24h_turnover") or []) if isinstance(x, Mapping)][:10],
         }
 
         def _confidence_for(message_type: str) -> float | None:

@@ -20,7 +20,10 @@ class MultiOrchestratorTests(unittest.TestCase):
         cmds = mod._build_commands(
             python_bin="python",
             decision_interval_sec=15,
-            work_interval_sec=1800,
+            research_interval_sec=3600,
+            quant_interval_sec=1800,
+            risk_interval_sec=300,
+            ops_interval_sec=60,
             governance_sleep_sec=30,
             review_sleep_sec=60,
             enable_paper=True,
@@ -29,14 +32,28 @@ class MultiOrchestratorTests(unittest.TestCase):
             enable_review=True,
         )
         names = [name for name, _ in cmds]
-        self.assertEqual(names, ["paper_loop", "work_loop", "governance_loop", "review_loop"])
+        self.assertEqual(
+            names,
+            [
+                "paper_loop",
+                "research_work_loop",
+                "quant_work_loop",
+                "risk_work_loop",
+                "ops_work_loop",
+                "governance_loop",
+                "review_loop",
+            ],
+        )
 
     def test_build_commands_respects_disable_flags(self) -> None:
         mod = _load_module()
         cmds = mod._build_commands(
             python_bin="python",
             decision_interval_sec=15,
-            work_interval_sec=1800,
+            research_interval_sec=3600,
+            quant_interval_sec=1800,
+            risk_interval_sec=300,
+            ops_interval_sec=60,
             governance_sleep_sec=30,
             review_sleep_sec=60,
             enable_paper=False,
@@ -44,7 +61,7 @@ class MultiOrchestratorTests(unittest.TestCase):
             enable_governance=False,
             enable_review=False,
         )
-        self.assertEqual([name for name, _ in cmds], ["work_loop"])
+        self.assertEqual([name for name, _ in cmds], ["research_work_loop", "quant_work_loop", "risk_work_loop", "ops_work_loop"])
 
 
 if __name__ == "__main__":

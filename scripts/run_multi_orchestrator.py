@@ -25,7 +25,10 @@ def _build_commands(
     *,
     python_bin: str,
     decision_interval_sec: float,
-    work_interval_sec: float,
+    research_interval_sec: float,
+    quant_interval_sec: float,
+    risk_interval_sec: float,
+    ops_interval_sec: float,
     governance_sleep_sec: float,
     review_sleep_sec: float,
     enable_paper: bool,
@@ -51,12 +54,53 @@ def _build_commands(
     if enable_work:
         cmds.append(
             (
-                "work_loop",
+                "research_work_loop",
                 [
                     python_bin,
                     str(ROOT / "scripts" / "run_agent_work_loop.py"),
+                    "--agent",
+                    "research",
                     "--sleep-sec",
-                    str(float(work_interval_sec)),
+                    str(float(research_interval_sec)),
+                ],
+            )
+        )
+        cmds.append(
+            (
+                "quant_work_loop",
+                [
+                    python_bin,
+                    str(ROOT / "scripts" / "run_agent_work_loop.py"),
+                    "--agent",
+                    "quant",
+                    "--sleep-sec",
+                    str(float(quant_interval_sec)),
+                ],
+            )
+        )
+        cmds.append(
+            (
+                "risk_work_loop",
+                [
+                    python_bin,
+                    str(ROOT / "scripts" / "run_agent_work_loop.py"),
+                    "--agent",
+                    "risk",
+                    "--sleep-sec",
+                    str(float(risk_interval_sec)),
+                ],
+            )
+        )
+        cmds.append(
+            (
+                "ops_work_loop",
+                [
+                    python_bin,
+                    str(ROOT / "scripts" / "run_agent_work_loop.py"),
+                    "--agent",
+                    "ops",
+                    "--sleep-sec",
+                    str(float(ops_interval_sec)),
                 ],
             )
         )
@@ -101,7 +145,11 @@ def _write_status_file(status_file: Path, data: dict[str, Any]) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description="Run unified multi-agent orchestrator (paper/work/governance loops).")
     p.add_argument("--decision-interval-sec", type=float, default=-1.0, help="paper loop decision interval")
-    p.add_argument("--work-interval-sec", type=float, default=1800.0, help="prework loop interval")
+    p.add_argument("--work-interval-sec", type=float, default=-1.0, help="legacy: apply same interval to all work loops")
+    p.add_argument("--research-interval-sec", type=float, default=-1.0, help="research worker interval")
+    p.add_argument("--quant-interval-sec", type=float, default=-1.0, help="quant worker interval")
+    p.add_argument("--risk-interval-sec", type=float, default=-1.0, help="risk worker interval")
+    p.add_argument("--ops-interval-sec", type=float, default=-1.0, help="ops worker interval")
     p.add_argument("--governance-sleep-sec", type=float, default=30.0, help="governance scheduler check interval")
     p.add_argument("--review-sleep-sec", type=float, default=60.0, help="daily/weekly review loop interval")
     p.add_argument("--restart-delay-sec", type=float, default=5.0, help="delay before restarting a crashed worker")
@@ -116,11 +164,24 @@ def main() -> int:
     rules = _load_rules()
     default_decision_interval = float(((rules.get("scheduling") or {}).get("decision_interval_sec") or 15))
     decision_interval = float(args.decision_interval_sec if args.decision_interval_sec > 0 else default_decision_interval)
+    workers_cfg = rules.get("workers") or {}
+    legacy_work_interval = float(args.work_interval_sec)
+    default_research = float((workers_cfg.get("research_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 3600)))
+    default_quant = float((workers_cfg.get("quant_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 1800)))
+    default_risk = float((workers_cfg.get("risk_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 300)))
+    default_ops = float((workers_cfg.get("ops_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 60)))
+    research_interval = float(args.research_interval_sec if args.research_interval_sec > 0 else default_research)
+    quant_interval = float(args.quant_interval_sec if args.quant_interval_sec > 0 else default_quant)
+    risk_interval = float(args.risk_interval_sec if args.risk_interval_sec > 0 else default_risk)
+    ops_interval = float(args.ops_interval_sec if args.ops_interval_sec > 0 else default_ops)
 
     commands = _build_commands(
         python_bin=sys.executable,
         decision_interval_sec=decision_interval,
-        work_interval_sec=float(args.work_interval_sec),
+        research_interval_sec=research_interval,
+        quant_interval_sec=quant_interval,
+        risk_interval_sec=risk_interval,
+        ops_interval_sec=ops_interval,
         governance_sleep_sec=float(args.governance_sleep_sec),
         review_sleep_sec=float(args.review_sleep_sec),
         enable_paper=not bool(args.no_paper),

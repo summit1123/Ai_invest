@@ -33,6 +33,13 @@ scheduling:
     - "15m"
     - "1h"
 
+# 독립 워커 실행 주기(초)
+workers:
+  research_interval_sec: 3600
+  quant_interval_sec: 1800
+  risk_interval_sec: 300
+  ops_interval_sec: 60
+
 governance:
   # 정기 회의(하루 3회, 8시간 간격 권장). 실시간 트리거(수익/손절/비용/레짐/운영)는 즉시 Safe Judge로 처리하고,
   # 회의는 "종목/비중/허용조건(Trade Plan)"과 "룰 패치 제안"을 갱신하는 거버넌스 용도.
