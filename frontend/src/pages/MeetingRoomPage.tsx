@@ -18,6 +18,10 @@ type LiveSummary = {
   summary_short: string
   assistant_minutes: string
   trade_plan: any
+  policy_version?: number
+  activation_status?: string
+  activation_gate?: any
+  assigned_tasks?: any[]
 }
 
 type LiveMsg = MeetingMessageView & { meeting_id: string }
@@ -200,6 +204,11 @@ export function MeetingRoomPage() {
                     Trade Plan: <span className="mono">{tradePlanLine}</span>
                   </div>
                 ) : null}
+                <div className="muted" style={{ fontSize: 12 }}>
+                  활성화: <span className="mono">{String(summary.activation_status ?? '-')}</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  정책v: <span className="mono">{String(summary.policy_version ?? '-')}</span>
+                </div>
               </>
             ) : null}
           </div>
@@ -257,6 +266,12 @@ export function MeetingRoomPage() {
                 <summary>Trade Plan 원문(JSON)</summary>
                 <pre className="codeBlock">{safeJson(summary.trade_plan)}</pre>
               </details>
+              {Array.isArray(summary.assigned_tasks) && summary.assigned_tasks.length > 0 ? (
+                <details className="reportDetails" style={{ marginTop: 10 }}>
+                  <summary>업무 배정(JSON)</summary>
+                  <pre className="codeBlock">{safeJson(summary.assigned_tasks)}</pre>
+                </details>
+              ) : null}
             </div>
           ) : null}
         </div>

@@ -145,6 +145,7 @@ export type MeetingSessionView = {
   facilitator: string
   participants: unknown
   summary: string | null
+  decisions?: unknown
   action_items: unknown
   run_id: string | null
 }
@@ -170,6 +171,16 @@ export type StrategyReviewView = {
   status: string
   evidence: unknown
   created_at: string
+}
+
+export type GovernanceStatusView = {
+  policy_active: TimelineEvent | null
+  policy_proposed: TimelineEvent | null
+  plan_active: TimelineEvent | null
+  plan_proposed: TimelineEvent | null
+  plan_blocked: TimelineEvent | null
+  ready_tasks: Record<string, unknown[]>
+  completed_tasks: TimelineEvent[]
 }
 
 export type AgentOpinionView = {

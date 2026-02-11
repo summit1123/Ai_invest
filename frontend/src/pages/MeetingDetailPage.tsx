@@ -57,6 +57,8 @@ export function MeetingDetailPage() {
   const messages = data.messages ?? []
   const s = data.session as any
   const actionItems = (s?.action_items as any)?.items
+  const decisions = s?.decisions as any
+  const assignedTasks = Array.isArray(decisions?.assigned_tasks) ? (decisions.assigned_tasks as any[]) : []
   const participants = Array.isArray(s?.participants) ? (s.participants as string[]) : []
 
   return (
@@ -81,6 +83,11 @@ export function MeetingDetailPage() {
             <span className="mono">{s?.status ?? ''}</span>
             <span style={{ opacity: 0.35 }}> · </span>
             진행자: <span className="mono">{s?.facilitator ?? ''}</span>
+          </div>
+          <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+            활성화: <span className="mono">{String(decisions?.activation_status ?? '-')}</span>
+            <span style={{ opacity: 0.35 }}> · </span>
+            정책버전: <span className="mono">{String(decisions?.policy_version ?? '-')}</span>
           </div>
           {participants.length > 0 ? (
             <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
@@ -109,6 +116,27 @@ export function MeetingDetailPage() {
                       기한: <span className="mono">{it?.due_date ?? ''}</span>
                     </div>
                     <div style={{ marginTop: 6, fontSize: 13, lineHeight: 1.55 }}>{String(it?.action ?? '')}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {assignedTasks.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
+                회의 배정 업무
+              </div>
+              <div className="stack" style={{ gap: 8 }}>
+                {assignedTasks.slice(0, 12).map((it: any, idx: number) => (
+                  <div key={idx} className="msgCard">
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      담당: <span className="mono">{it?.target_agent ?? ''}</span>
+                      <span style={{ opacity: 0.35 }}> · </span>
+                      우선순위: <span className="mono">{it?.priority ?? ''}</span>
+                      <span style={{ opacity: 0.35 }}> · </span>
+                      기한: <span className="mono">{it?.due_ts_kst ?? ''}</span>
+                    </div>
+                    <div style={{ marginTop: 6, fontSize: 13, lineHeight: 1.55 }}>{String(it?.description ?? '')}</div>
                   </div>
                 ))}
               </div>

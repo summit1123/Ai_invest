@@ -234,6 +234,39 @@ def latest_trade_plan() -> dict[str, Any]:
     return ok({"event": ev})
 
 
+@app.get("/api/v1/ui/governance/status", tags=["거버넌스"], summary="거버넌스 상태(정책/플랜/업무배정)")
+def governance_status(
+    task_limit_per_agent: int = Query(10, ge=1, le=100, description="에이전트별 READY 업무 최대 개수"),
+    completed_limit: int = Query(30, ge=1, le=200, description="최근 완료 업무 최대 개수"),
+) -> dict[str, Any]:
+    repo = PostgresRepo()
+    policy_active = repo.fetch_latest_event(event_type="GOVERNANCE_POLICY_SET")
+    policy_proposed = repo.fetch_latest_event(event_type="GOVERNANCE_POLICY_PROPOSED")
+    plan_active = repo.fetch_latest_event(event_type="TRADE_PLAN_SET")
+    plan_proposed = repo.fetch_latest_event(event_type="TRADE_PLAN_PROPOSED")
+    plan_blocked = repo.fetch_latest_event(event_type="TRADE_PLAN_BLOCKED")
+
+    agents = ["research_agent", "quant_strategist", "risk_manager", "ops_manager"]
+    ready_tasks = {
+        name: repo.fetch_ready_agent_tasks(agent_name=name, limit=int(task_limit_per_agent))
+        for name in agents
+    }
+    recent_events = repo.fetch_recent_events(limit=max(200, int(completed_limit) * 6))
+    completed = [e for e in recent_events if str(e.get("event_type") or "") == "AGENT_TASK_COMPLETED"][: int(completed_limit)]
+
+    return ok(
+        {
+            "policy_active": policy_active,
+            "policy_proposed": policy_proposed,
+            "plan_active": plan_active,
+            "plan_proposed": plan_proposed,
+            "plan_blocked": plan_blocked,
+            "ready_tasks": ready_tasks,
+            "completed_tasks": completed,
+        }
+    )
+
+
 @app.get("/api/v1/ui/meetings/governance/live", tags=["회의"], summary="거버넌스 회의 라이브 실행(SSE, 멀티 LLM)")
 def meetings_governance_live(
     slot_key: str | None = Query(None, description="(선택) 강제 slot_key. 비우면 LIVE 슬롯으로 생성"),

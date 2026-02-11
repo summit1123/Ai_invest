@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { apiGet } from '../shared/api/client'
-import type { AgentDailyReportView, MeetingSessionView, StrategyReviewView, TodayOverview } from '../shared/api/types'
+import type { AgentDailyReportView, GovernanceStatusView, MeetingSessionView, StrategyReviewView, TodayOverview } from '../shared/api/types'
 import { fmtTsKst } from '../shared/format'
 import { reasonTitleKo } from '../shared/domain/reasonCodesKo'
 import { Link } from 'react-router-dom'
@@ -38,16 +38,21 @@ export function TodayPage() {
     queryFn: () => apiGet<{ items: MeetingSessionView[] }>('/api/v1/ui/meetings?limit=1'),
     refetchInterval: 60_000,
   })
+  const qGovStatus = useQuery({
+    queryKey: ['governance-status'],
+    queryFn: () => apiGet<GovernanceStatusView>('/api/v1/ui/governance/status'),
+    refetchInterval: 30_000,
+  })
 
-  if (q.isLoading || qResearch.isLoading || qGov.isLoading || qMeet.isLoading) {
+  if (q.isLoading || qResearch.isLoading || qGov.isLoading || qMeet.isLoading || qGovStatus.isLoading) {
     return (
       <div className="page">
         <div className="card">로딩 중...</div>
       </div>
     )
   }
-  if (q.isError || qResearch.isError || qGov.isError || qMeet.isError) {
-    const err = (q.error ?? qResearch.error ?? qGov.error ?? qMeet.error) as unknown
+  if (q.isError || qResearch.isError || qGov.isError || qMeet.isError || qGovStatus.isError) {
+    const err = (q.error ?? qResearch.error ?? qGov.error ?? qMeet.error ?? qGovStatus.error) as unknown
     return (
       <div className="page">
         <div className="errorBox">
@@ -66,6 +71,11 @@ export function TodayPage() {
   const latestReport = qResearch.data?.items?.[0] ?? null
   const latestPriority = qGov.data?.items?.[0] ?? null
   const latestMeeting = qMeet.data?.items?.[0] ?? null
+  const governanceStatus = qGovStatus.data ?? null
+  const readyTasksMap = (governanceStatus?.ready_tasks ?? {}) as Record<string, any[]>
+  const readyTaskCount = Object.values(readyTasksMap).reduce((acc, rows) => acc + (Array.isArray(rows) ? rows.length : 0), 0)
+  const planActive = governanceStatus?.plan_active as any
+  const planProposed = governanceStatus?.plan_proposed as any
   const watchlist = (latestReport?.risks as any)?.watchlist
 
   return (
@@ -193,6 +203,14 @@ export function TodayPage() {
                 시작(KST): <span className="mono">{fmtTsKst(latestMeeting.started_at)}</span>
                 <span style={{ opacity: 0.35 }}> · </span>
                 종류: <span className="mono">{latestMeeting.meeting_type}</span>
+              </div>
+              <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                활성 플랜: <span className="mono">{planActive?.entity_id ?? '-'}</span>
+                <span style={{ opacity: 0.35 }}> · </span>
+                제안 플랜: <span className="mono">{planProposed?.entity_id ?? '-'}</span>
+              </div>
+              <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                READY 업무: <span className="mono">{readyTaskCount}</span>
               </div>
               <div style={{ marginTop: 8 }}>
                 <Link to={`/meetings/${latestMeeting.meeting_id}`} className="link">

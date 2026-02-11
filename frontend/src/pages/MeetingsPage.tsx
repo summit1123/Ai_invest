@@ -54,6 +54,8 @@ export function MeetingsPage() {
                 <th style={{ width: 160 }}>시작(KST)</th>
                 <th style={{ width: 140 }}>종류</th>
                 <th style={{ width: 90 }}>상태</th>
+                <th style={{ width: 90 }}>활성화</th>
+                <th style={{ width: 80 }}>정책v</th>
                 <th style={{ width: 140 }}>진행자</th>
                 <th>meeting_id</th>
               </tr>
@@ -64,6 +66,8 @@ export function MeetingsPage() {
                   <td className="mono">{fmtTsKst(m.started_at)}</td>
                   <td className="mono">{m.meeting_type}</td>
                   <td>{m.status}</td>
+                  <td className="mono">{String((m.decisions as any)?.activation_status ?? '-')}</td>
+                  <td className="mono">{String((m.decisions as any)?.policy_version ?? '-')}</td>
                   <td className="mono">{m.facilitator}</td>
                   <td className="mono">
                     <Link to={`/meetings/${m.meeting_id}`} className="link">
