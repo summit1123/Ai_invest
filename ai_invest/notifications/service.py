@@ -474,53 +474,6 @@ class NotificationService:
             },
         )
 
-    def notify_finance_monthly_review(
-        self,
-        *,
-        event_id: uuid.UUID,
-        period_label: str,
-        tax_export_status: str,
-        discrepancy_alerts: list[str],
-        summary: str,
-        manifest_ref: str,
-        llm_used: bool,
-        llm_model: str | None,
-    ) -> None:
-        try:
-            chat_id = telegram_client.chat_id_review()
-        except Exception as exc:  # pragma: no cover
-            self._repo.insert_notification_delivery(
-                delivery_id=uuid.uuid4(),
-                event_id=event_id,
-                channel="TELEGRAM",
-                template_id="tpl_finance_monthly_review",
-                severity="NORMAL",
-                status="FAILED",
-                attempt_count=0,
-                last_error=f"telegram config error: {exc}",
-                dedupe_key=None,
-                payload={"event": {"period_label": period_label}},
-                sent_at=None,
-            )
-            return
-        self._deliver_telegram(
-            event_id=event_id,
-            template_id="tpl_finance_monthly_review",
-            severity="NORMAL",
-            chat_id=chat_id,
-            dedupe_key=f"FINANCE:MONTHLY_REVIEW:{period_label}:{manifest_ref}",
-            payload={
-                **_ts_payload(),
-                "period_label": period_label,
-                "tax_export_status": tax_export_status,
-                "discrepancy_alerts": list(discrepancy_alerts or [])[:5],
-                "summary": summary,
-                "manifest_ref": manifest_ref,
-                "llm_used": bool(llm_used),
-                "llm_model": llm_model,
-            },
-        )
-
     def notify_research_daily_brief(
         self,
         *,

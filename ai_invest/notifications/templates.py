@@ -130,26 +130,6 @@ def tpl_tax_export_fail(data: Mapping[str, Any]) -> str:
     )
 
 
-def tpl_finance_monthly_review(data: Mapping[str, Any]) -> str:
-    alerts = data.get("discrepancy_alerts") if isinstance(data.get("discrepancy_alerts"), list) else []
-    lines: list[str] = []
-    for a in alerts[:5]:
-        s = str(a or "").strip()
-        if s:
-            lines.append(f"- {s}")
-    alerts_txt = "\n".join(lines) if lines else "- (없음)"
-    return (
-        "[정산][월말] Finance/Tax 리뷰\n"
-        f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- 기간: {data.get('period_label')}\n"
-        f"- tax_export_status: {data.get('tax_export_status')}\n"
-        f"- manifest_ref: {data.get('manifest_ref')}\n"
-        f"- LLM: {'사용' if data.get('llm_used') else '미사용'} ({data.get('llm_model')})\n"
-        f"- 요약: {_clip(data.get('summary'), 220)}\n"
-        f"- 불일치 경보:\n{alerts_txt}\n"
-    )
-
-
 def tpl_order_rejected(data: Mapping[str, Any]) -> str:
     return (
         "[거래][높음] 주문 거부\n"
@@ -295,7 +275,6 @@ TEMPLATES = {
     "tpl_fill_notice": tpl_fill_notice,
     "tpl_tax_export_done": tpl_tax_export_done,
     "tpl_tax_export_fail": tpl_tax_export_fail,
-    "tpl_finance_monthly_review": tpl_finance_monthly_review,
     "tpl_order_rejected": tpl_order_rejected,
     "tpl_daily_review": tpl_daily_review,
     "tpl_weekly_review": tpl_weekly_review,

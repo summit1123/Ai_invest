@@ -58,14 +58,7 @@ def main() -> int:
     execm = repo.fetch_execution_metrics(limit=200)
     recon = repo.fetch_reconciliation_checks(limit=200)
 
-    # 주간 우선순위는 별도 라우트(strategy_coordinator_weekly)를 우선 사용한다.
-    # 미설정 시 기존 strategy_coordinator 라우트로 자동 폴백.
-    agents_cfg = ((rules_raw.get("llm") or {}).get("agents") or {}) if isinstance(rules_raw, dict) else {}
-    weekly_key_exists = isinstance(agents_cfg, dict) and ("strategy_coordinator_weekly" in agents_cfg)
-    route = llm_route_for_agent(
-        rules_raw=rules_raw,
-        agent_name=("strategy_coordinator_weekly" if weekly_key_exists else "strategy_coordinator"),
-    )
+    route = llm_route_for_agent(rules_raw=rules_raw, agent_name="strategy_coordinator")
     proposal = propose_weekly_priority(
         today_kst=now_kst.date(),
         pnl_daily=pnl,
@@ -141,3 +134,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

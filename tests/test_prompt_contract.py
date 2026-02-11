@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 
 from ai_invest.agents.prompt_contract import (
-    finance_monthly_system_prompt,
     governance_coordinator_instructions,
     governance_critique_instructions,
     governance_ops_instructions,
@@ -46,7 +45,6 @@ class PromptContractTests(unittest.TestCase):
             strategy_trade_plan_system_prompt(),
             strategy_weekly_priority_system_prompt(),
             secretary_minutes_system_prompt(),
-            finance_monthly_system_prompt(),
         ]
         for p in prompts:
             self._assert_required_headers(p)
@@ -63,3 +61,4 @@ class PromptContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

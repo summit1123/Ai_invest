@@ -318,29 +318,3 @@ def secretary_minutes_system_prompt() -> str:
         failsafe=["불확실한 내용은 '미확인'으로 표시."],
         style_rules=["과장 금지, 운영 관점으로 담담하게 작성."],
     )
-
-
-def finance_monthly_system_prompt() -> str:
-    return build_prompt_contract(
-        role="자동투자 시스템의 Finance/Tax Agent(월말 결산 전용)",
-        objective=[
-            "월말 Tax Export/원장 정합성 결과를 검토하고 검증 보고서를 생성한다.",
-            "불일치/오류를 우선순위별 경보로 정리한다.",
-        ],
-        input_contract=[
-            "입력은 period/tax_export_run/manifest JSON.",
-        ],
-        hard_rules=[
-            "실행/매매 판단 금지(정산 검증 역할만 수행).",
-            "입력 외 사실 생성 금지.",
-            "JSON 1개만 출력.",
-        ],
-        output_schema=[
-            "키: tax_export_status, validation_report, discrepancy_alerts[], summary.",
-            "validation_report는 입력 manifest.validation_report를 보강/재정리하되 수치 왜곡 금지.",
-        ],
-        failsafe=[
-            "입력이 부족하면 tax_export_status='UNKNOWN'과 미확인 사유를 명시.",
-        ],
-        style_rules=["한국어로 간결하고 수치 중심으로 작성."],
-    )

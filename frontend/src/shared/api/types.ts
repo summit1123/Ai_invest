@@ -43,25 +43,6 @@ export type TodayOverview = {
   latest_ai_decision: DecisionView | null
   pause: { paused: boolean; latest: unknown | null }
   latest_reconciliation: unknown | null
-  portfolio: {
-    quote_currency: string
-    cash_krw: number
-    position_value_krw: number
-    equity_krw: number
-    exposure_pct: number
-    positions_count: number
-    positions: {
-      symbol: string
-      qty: number
-      avg_entry_price: number | null
-      mark_price: number
-      mid_price: number | null
-      value_krw: number
-      unrealized_pnl_krw: number | null
-      ts_updated: string | null
-      quote_ts: string | null
-    }[]
-  }
 }
 
 export type TimelineEvent = {

@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { apiGet } from '../shared/api/client'
 import type { AgentDailyReportView, GovernanceStatusView, MeetingSessionView, StrategyReviewView, TodayOverview } from '../shared/api/types'
-import { fmtNumber, fmtTsKst } from '../shared/format'
+import { fmtTsKst } from '../shared/format'
 import { reasonTitleKo } from '../shared/domain/reasonCodesKo'
 import { Link } from 'react-router-dom'
 
@@ -68,7 +68,6 @@ export function TodayPage() {
   const ai = data.latest_ai_decision
   const paused = data.pause?.paused ?? false
   const reconStatus = (data.latest_reconciliation as any)?.status as string | undefined
-  const portfolio = data.portfolio
   const latestReport = qResearch.data?.items?.[0] ?? null
   const latestPriority = qGov.data?.items?.[0] ?? null
   const latestMeeting = qMeet.data?.items?.[0] ?? null
@@ -89,19 +88,6 @@ export function TodayPage() {
           </div>
           <div className="muted" style={{ fontSize: 12 }}>
             정합성 상태: <span className="mono">{reconStatus ?? 'N/A'}</span>
-          </div>
-          <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-            현금(KRW): <span className="mono">{fmtNumber(portfolio?.cash_krw, 0)}</span>
-          </div>
-          <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-            포지션 평가: <span className="mono">{fmtNumber(portfolio?.position_value_krw, 0)}</span>
-            <span style={{ opacity: 0.35 }}> · </span>
-            보유종목: <span className="mono">{portfolio?.positions_count ?? 0}</span>
-          </div>
-          <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-            총자산: <span className="mono">{fmtNumber(portfolio?.equity_krw, 0)}</span>
-            <span style={{ opacity: 0.35 }}> · </span>
-            노출비중: <span className="mono">{fmtNumber(portfolio?.exposure_pct, 1)}%</span>
           </div>
         </div>
 
