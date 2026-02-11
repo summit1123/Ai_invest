@@ -142,6 +142,13 @@ resume_policy:
 settlement:
   timezone: "Asia/Seoul"
 
+reporting:
+  # 일일 리뷰 알림 전송 시각(KST)
+  daily_review_time_kst: "23:10"
+  # 주간 리뷰 알림(week window: 월~일)
+  weekly_review_day: "SUN"
+  weekly_review_time_kst: "21:00"
+
 # LLM 라우팅(Agent별 모델/성능/엔드포인트). 실행 경로(Safe Judge/주문)는 LLM에 의존하지 않는다.
 llm:
   default:

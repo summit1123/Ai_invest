@@ -87,6 +87,13 @@
 
 ## 6. 운영 체크리스트
 
+### 6.0 런타임 상태 확인
+
+1. 오케스트레이터 상태 파일: `runtime/orchestrator_status.json`
+2. API 상태 조회: `GET /api/v1/ui/orchestrator/status`
+3. worker 상태(`paper_loop/work_loop/governance_loop/review_loop`)가 `alive=true`인지 확인
+4. `restarts`가 급증하면 해당 worker 로그/원인 점검
+
 ### 6.1 장 시작 전
 
 1. WS 연결 상태 확인
@@ -106,8 +113,9 @@
 
 1. `pnl_daily` 정합성 확인
 2. `ledger_entries` 누락 확인
-3. Daily Review 전송 확인
+3. Daily Review 전송 확인 (`reporting.daily_review_time_kst`, 기본 23:10 KST)
 4. 장애 이벤트 RCA 메모(`AAR_NOTE`) 작성
+5. 주간 종료일(SUN)에는 Weekly Review 전송 확인 (`reporting.weekly_review_time_kst`, 기본 21:00 KST)
 
 ---
 
