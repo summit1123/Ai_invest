@@ -23,6 +23,9 @@ class FastApiAppTests(unittest.TestCase):
         body = resp.json()
         self.assertTrue(body["ok"])
         self.assertIn("latest_safe_decision", body["data"])
+        self.assertIn("portfolio", body["data"])
+        self.assertIn("cash_krw", body["data"]["portfolio"])
+        self.assertIn("equity_krw", body["data"]["portfolio"])
 
     def test_timeline_ok(self) -> None:
         with TestClient(app) as client:
