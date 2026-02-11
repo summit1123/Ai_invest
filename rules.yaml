@@ -126,20 +126,56 @@ llm:
     timeout_sec: 45
   agents:
     research_agent:
-      model: "gpt-5.2-pro"
+      model: "gpt-5.2"
       api_style: "responses"
       reasoning_effort: "high"
       temperature: 0.2
       timeout_sec: 60
     secretary_agent:
-      model: "gpt-5.2-pro"
+      model: "gpt-5-nano"
       api_style: "responses"
-      reasoning_effort: "medium"
+      reasoning_effort: "low"
       temperature: 0.2
       timeout_sec: 60
     strategy_coordinator:
-      model: "gpt-5.2-pro"
+      model: "gpt-5.2"
       api_style: "responses"
       reasoning_effort: "high"
       temperature: 0.2
       timeout_sec: 90
+    governance_research_agent:
+      model: "gpt-5.2"
+      api_style: "responses"
+      reasoning_effort: "high"
+      temperature: 0.2
+      timeout_sec: 90
+    governance_quant_strategist:
+      model: "gpt-5.2"
+      api_style: "responses"
+      reasoning_effort: "high"
+      temperature: 0.2
+      timeout_sec: 120
+    governance_risk_manager:
+      model: "gpt-5.2"
+      api_style: "responses"
+      reasoning_effort: "medium"
+      temperature: 0.1
+      timeout_sec: 90
+    governance_ops_manager:
+      model: "gpt-5-mini"
+      api_style: "responses"
+      reasoning_effort: "low"
+      temperature: 0.1
+      timeout_sec: 60
+    governance_coordinator:
+      model: "gpt-5.2"
+      api_style: "responses"
+      reasoning_effort: "high"
+      temperature: 0.1
+      timeout_sec: 180
+    governance_secretary:
+      model: "gpt-5-nano"
+      api_style: "responses"
+      reasoning_effort: "low"
+      temperature: 0.2
+      timeout_sec: 60

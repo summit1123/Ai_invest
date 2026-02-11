@@ -985,6 +985,56 @@ class PostgresRepo:
             )
             conn.commit()
 
+    def update_meeting_session(
+        self,
+        *,
+        meeting_id: uuid.UUID,
+        status: str | None = None,
+        ended_at: datetime | None = None,
+        summary: str | None = None,
+        decisions: Any | None = None,
+        action_items: Any | None = None,
+    ) -> None:
+        """Update mutable fields for a meeting session.
+
+        Used for live meetings: create session as OPEN, then close it with summary/decisions.
+        """
+
+        sets: list[str] = []
+        params: list[Any] = []
+
+        if status is not None:
+            sets.append("status=%s")
+            params.append(str(status))
+        if ended_at is not None:
+            sets.append("ended_at=%s")
+            params.append(ended_at)
+        if summary is not None:
+            sets.append("summary=%s")
+            params.append(str(summary))
+        if decisions is not None:
+            sets.append("decisions=%s::jsonb")
+            params.append(json_dumps(decisions))
+        if action_items is not None:
+            sets.append("action_items=%s::jsonb")
+            params.append(json_dumps(action_items))
+
+        if not sets:
+            return
+
+        params.append(meeting_id)
+
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                update meeting_sessions
+                set {", ".join(sets)}
+                where meeting_id=%s
+                """,
+                tuple(params),
+            )
+            conn.commit()
+
     def insert_meeting_message(self, msg: DbMeetingMessage) -> None:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
