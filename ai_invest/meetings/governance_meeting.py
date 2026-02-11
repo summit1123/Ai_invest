@@ -27,7 +27,7 @@ from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_mark
 from ai_invest.notifications.service import NotificationService
 from ai_invest.research.rss import summarize_headlines_text
 from ai_invest.storage.postgres import DbEvent, DbMeetingMessage, DbMeetingSession, PostgresRepo
-from ai_invest.work.agent_work_loop import collect_latest_work_reports
+from ai_invest.work.agent_work_loop import collect_latest_work_reports, run_agent_work_cycle
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -74,6 +74,168 @@ def should_block_prework(*, require_prework_reports: bool, prework: Mapping[str,
     missing = list(prework.get("missing") or []) if isinstance(prework, Mapping) else []
     stale = list(prework.get("stale") or []) if isinstance(prework, Mapping) else []
     return bool(missing or stale)
+
+
+def _prework_refresh_slot_payload(
+    *,
+    slot_key: str,
+    prework: Mapping[str, Any],
+    selected_agents: Sequence[str],
+    reason_code: str,
+) -> dict[str, Any]:
+    return {
+        "slot_key": str(slot_key),
+        "reason_code": str(reason_code),
+        "missing": [str(x) for x in list(prework.get("missing") or [])],
+        "stale": [str(x) for x in list(prework.get("stale") or [])],
+        "selected_agents": [str(x) for x in list(selected_agents or [])],
+        "max_age_minutes": int(_as_float(prework.get("max_age_minutes"), default=0.0)),
+        "checked_at_utc": str(prework.get("checked_at_utc") or ""),
+    }
+
+
+def _recent_prework_refresh_requested(
+    *,
+    repo: PostgresRepo,
+    slot_key: str,
+    cooldown_min: int,
+) -> bool:
+    last = repo.fetch_event_by_entity(
+        event_type="MEETING_PREWORK_REFRESH_REQUESTED",
+        entity_type="meeting_slots",
+        entity_id=str(slot_key),
+    )
+    if not isinstance(last, Mapping):
+        return False
+    ts = last.get("ts")
+    if not isinstance(ts, datetime):
+        return False
+    ts_utc = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    age_min = (_utcnow() - ts_utc).total_seconds() / 60.0
+    return age_min < float(max(1, int(cooldown_min)))
+
+
+def ensure_prework_ready_for_slot(
+    *,
+    repo: PostgresRepo,
+    rules_raw: Mapping[str, Any],
+    slot_key: str,
+) -> bool:
+    gov = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    require_prework_reports = bool(gov.get("require_prework_reports", False))
+    prework_max_age_min = int(_as_float(gov.get("prework_max_age_min"), default=360.0))
+    refresh_cooldown_min = int(_as_float(gov.get("prework_refresh_cooldown_min"), default=5.0))
+    prework_agents = ["research_agent", "quant_strategist", "risk_manager", "ops_manager"]
+
+    prework = collect_latest_work_reports(
+        repo=repo,
+        agent_names=prework_agents,
+        max_age_minutes=prework_max_age_min,
+        include_details=True,
+    )
+    if not should_block_prework(require_prework_reports=require_prework_reports, prework=prework):
+        return True
+
+    selected_agents = sorted(
+        set(str(x) for x in list(prework.get("missing") or []) + list(prework.get("stale") or []) if str(x).strip())
+    )
+
+    # Avoid storm: if we already requested refresh recently for this slot, wait for next scheduler tick.
+    if _recent_prework_refresh_requested(repo=repo, slot_key=slot_key, cooldown_min=refresh_cooldown_min):
+        return False
+
+    repo.insert_event(
+        DbEvent(
+            event_id=uuid.uuid4(),
+            ts=_utcnow(),
+            event_type="MEETING_PREWORK_REFRESH_REQUESTED",
+            entity_type="meeting_slots",
+            entity_id=str(slot_key),
+            run_id=None,
+            rule_version_id=None,
+            payload=_prework_refresh_slot_payload(
+                slot_key=slot_key,
+                prework=prework,
+                selected_agents=selected_agents,
+                reason_code="PREWORK_MISSING_OR_STALE",
+            ),
+        )
+    )
+
+    try:
+        run_agent_work_cycle(
+            repo=repo,
+            rules_raw=rules_raw,
+            meeting_context=f"scheduler_prework_refresh:{slot_key}",
+            selected_agents=selected_agents,
+        )
+    except Exception as exc:
+        repo.insert_event(
+            DbEvent(
+                event_id=uuid.uuid4(),
+                ts=_utcnow(),
+                event_type="MEETING_PREWORK_REFRESH_FAILED",
+                entity_type="meeting_slots",
+                entity_id=str(slot_key),
+                run_id=None,
+                rule_version_id=None,
+                payload={
+                    **_prework_refresh_slot_payload(
+                        slot_key=slot_key,
+                        prework=prework,
+                        selected_agents=selected_agents,
+                        reason_code="PREWORK_REFRESH_EXCEPTION",
+                    ),
+                    "error": str(exc)[:240],
+                },
+            )
+        )
+        return False
+
+    prework2 = collect_latest_work_reports(
+        repo=repo,
+        agent_names=prework_agents,
+        max_age_minutes=prework_max_age_min,
+        include_details=True,
+    )
+    if should_block_prework(require_prework_reports=require_prework_reports, prework=prework2):
+        repo.insert_event(
+            DbEvent(
+                event_id=uuid.uuid4(),
+                ts=_utcnow(),
+                event_type="MEETING_PREWORK_PENDING",
+                entity_type="meeting_slots",
+                entity_id=str(slot_key),
+                run_id=None,
+                rule_version_id=None,
+                payload=_prework_refresh_slot_payload(
+                    slot_key=slot_key,
+                    prework=prework2,
+                    selected_agents=selected_agents,
+                    reason_code="PREWORK_STILL_NOT_READY",
+                ),
+            )
+        )
+        return False
+
+    repo.insert_event(
+        DbEvent(
+            event_id=uuid.uuid4(),
+            ts=_utcnow(),
+            event_type="MEETING_PREWORK_READY",
+            entity_type="meeting_slots",
+            entity_id=str(slot_key),
+            run_id=None,
+            rule_version_id=None,
+            payload=_prework_refresh_slot_payload(
+                slot_key=slot_key,
+                prework=prework2,
+                selected_agents=selected_agents,
+                reason_code="PREWORK_READY_AFTER_REFRESH",
+            ),
+        )
+    )
+    return True
 
 
 def _timeframe_to_minutes(tf: str) -> int:
@@ -1760,6 +1922,8 @@ def maybe_run_scheduled_governance_meeting(
         slot_key = f"{now_kst.date().isoformat()} {now_kst.strftime('%H:%M')}"
         if repo.meeting_slot_exists(slot_key=slot_key):
             return slot_key
+        if not ensure_prework_ready_for_slot(repo=repo, rules_raw=rules_raw, slot_key=slot_key):
+            return None
         run_governance_meeting_now(repo=repo, notifier=notifier, rules_raw=rules_raw, force_slot_key=slot_key, emit=None)
         return slot_key
 
@@ -1780,6 +1944,8 @@ def maybe_run_scheduled_governance_meeting(
             continue
         slot_key = _slot_key_for_dt(slot_dt)
         if not repo.meeting_slot_exists(slot_key=slot_key):
+            if not ensure_prework_ready_for_slot(repo=repo, rules_raw=rules_raw, slot_key=slot_key):
+                return None
             run_governance_meeting_now(repo=repo, notifier=notifier, rules_raw=rules_raw, force_slot_key=slot_key, emit=None)
             return slot_key
 
@@ -1815,6 +1981,8 @@ def maybe_run_scheduled_governance_meeting(
         slot_key = _slot_key_for_dt(slot_dt)
         if repo.meeting_slot_exists(slot_key=slot_key):
             continue
+        if not ensure_prework_ready_for_slot(repo=repo, rules_raw=rules_raw, slot_key=slot_key):
+            return None
         run_governance_meeting_now(repo=repo, notifier=notifier, rules_raw=rules_raw, force_slot_key=slot_key, emit=None)
         return slot_key
     return None

@@ -33,6 +33,7 @@ def test_catchup_picks_missed_slot_when_outside_window(monkeypatch):
 
     monkeypatch.setattr(gm, "_now_kst", lambda: fixed_now)
     monkeypatch.setattr(gm, "run_governance_meeting_now", _fake_run)
+    monkeypatch.setattr(gm, "ensure_prework_ready_for_slot", lambda **_: True)
 
     slot = gm.maybe_run_scheduled_governance_meeting(
         repo=repo,  # type: ignore[arg-type]
@@ -62,6 +63,7 @@ def test_window_slot_has_priority_over_older_catchup(monkeypatch):
 
     monkeypatch.setattr(gm, "_now_kst", lambda: fixed_now)
     monkeypatch.setattr(gm, "run_governance_meeting_now", _fake_run)
+    monkeypatch.setattr(gm, "ensure_prework_ready_for_slot", lambda **_: True)
 
     slot = gm.maybe_run_scheduled_governance_meeting(
         repo=repo,  # type: ignore[arg-type]
