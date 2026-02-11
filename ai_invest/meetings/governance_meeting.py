@@ -343,7 +343,7 @@ class RiskDraft(BaseModel):
     max_position_pct: float = Field(..., ge=0.0, le=100.0)
     max_loss_per_trade_pct: float = Field(..., ge=0.0, le=100.0)
     max_daily_loss_pct: float = Field(..., ge=0.0, le=100.0)
-    required_constraints: dict[str, float] = Field(default_factory=dict)
+    required_constraints: dict[str, Any] = Field(default_factory=dict)
     notes: str = Field(..., max_length=800)
 
 
@@ -368,7 +368,7 @@ class FinalTradePlan(BaseModel):
     cooldown_minutes: int = Field(60, ge=0, le=7 * 24 * 60)
     valid_from_kst: str = Field(..., max_length=40)
     valid_to_kst: str = Field(..., max_length=40)
-    constraints: dict[str, float] = Field(default_factory=dict)
+    constraints: dict[str, Any] = Field(default_factory=dict)
     rationale: dict[str, str] = Field(default_factory=dict, description="agent_name -> 1~3문장 근거 요약")
     evidence_refs: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
@@ -650,10 +650,12 @@ def enforce_final_trade_plan(
         return out
 
     base_constraints = _num_map(((fact_pack.get("rules") or {}).get("cost_guard") or {}))
+    risk_constraints = _num_map(dict(risk.required_constraints or {}))
+    plan_constraints = _num_map(dict(plan.constraints or {}))
     merged_constraints: dict[str, float] = {
         **base_constraints,
-        **dict(risk.required_constraints or {}),
-        **dict(plan.constraints or {}),
+        **risk_constraints,
+        **plan_constraints,
     }
 
     conflict = list(plan.conflict_resolution or [])
@@ -1350,6 +1352,77 @@ def _store_message(
         )
 
 
+def _as_kst_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc).astimezone(KST)
+        return value.astimezone(KST)
+    return None
+
+
+def _close_or_skip_open_meeting(
+    *,
+    repo: PostgresRepo,
+    rules_raw: Mapping[str, Any],
+    emit: Callable[[str, Mapping[str, Any]], None] | None,
+) -> bool:
+    """Return True when a currently running meeting should block a new one."""
+
+    governance_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    stale_min = int(governance_cfg.get("max_open_meeting_minutes") or 45)
+    now_kst = _now_kst()
+
+    sessions = repo.fetch_meeting_sessions(limit=30)
+    for s in sessions:
+        if str(s.get("meeting_type") or "").upper() != "DAILY_STRATEGY":
+            continue
+        if str(s.get("status") or "").upper() != "OPEN":
+            continue
+        mid = str(s.get("meeting_id") or "")
+        started_kst = _as_kst_dt(s.get("started_at"))
+        age_min = None
+        if started_kst is not None:
+            age_min = max(0.0, (now_kst - started_kst).total_seconds() / 60.0)
+
+        # 오래된 OPEN 회의는 자동 종료해서 다음 슬롯이 막히지 않게 한다.
+        if age_min is not None and age_min >= float(stale_min):
+            ended_at = _utcnow()
+            repo.update_meeting_session(
+                meeting_id=mid,
+                status="CLOSED",
+                ended_at=ended_at,
+                summary=_clip(f"자동 종료: 회의 최대 실행 시간 초과({age_min:.1f}분)", 900),
+                decisions={"error": "MEETING_TIMEOUT", "auto_closed": True, "age_min": age_min},
+                action_items={"items": []},
+            )
+            repo.insert_event(
+                DbEvent(
+                    event_id=uuid.uuid4(),
+                    ts=ended_at,
+                    event_type="MEETING_AUTO_CLOSED",
+                    entity_type="meeting_sessions",
+                    entity_id=mid,
+                    run_id=None,
+                    rule_version_id=None,
+                    payload={"meeting_id": mid, "reason_code": "MEETING_TIMEOUT", "age_min": age_min},
+                )
+            )
+            if emit is not None:
+                emit(
+                    "run_warning",
+                    {"meeting_id": mid, "reason": "stale_open_auto_closed", "age_min": age_min},
+                )
+            continue
+
+        if emit is not None:
+            emit(
+                "run_skipped",
+                {"reason": "another_meeting_open", "meeting_id": mid, "age_min": age_min},
+            )
+        return True
+    return False
+
+
 def run_governance_meeting_now(
     *,
     repo: PostgresRepo,
@@ -1369,6 +1442,9 @@ def run_governance_meeting_now(
     now_kst = _now_kst()
     times = get_meeting_times_kst(rules_raw)
     slot_key = force_slot_key or f"{now_kst.date().isoformat()} LIVE {now_kst.strftime('%H:%M:%S')}"
+
+    if _close_or_skip_open_meeting(repo=repo, rules_raw=rules_raw, emit=emit):
+        return slot_key
 
     # Governance meeting must consume DB prework outputs (no live universe scan here).
     symbols = list(rules.universe.symbols)

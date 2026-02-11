@@ -20,7 +20,7 @@ from ai_invest.judge.ai_judge import ai_judge_shadow_decide
 from ai_invest.judge.safe_judge import safe_judge_decide
 from ai_invest.learning.outcome_evaluator import evaluate_closed_trade
 from ai_invest.market_data.features import build_feature_snapshot_from_candles
-from ai_invest.market_data.upbit_public import MarketSnapshot, fetch_candles_minutes, fetch_market_snapshot
+from ai_invest.market_data.upbit_public import MarketSnapshot, UpbitPublicApiError, fetch_candles_minutes, fetch_market_snapshot
 from ai_invest.notifications.service import NotificationService
 from ai_invest.ops.reconciliation import record_reconciliation_check
 from ai_invest.storage.postgres import (
@@ -166,7 +166,13 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             if plan_symbol and plan_symbol in set(rules.universe.symbols):
                 symbol = plan_symbol
 
-        snapshot = fetch_market_snapshot(symbol)
+        try:
+            snapshot = fetch_market_snapshot(symbol)
+        except UpbitPublicApiError as exc:
+            # 거래소 공용 API 일시 제한(429) 등은 루프를 죽이지 않고 다음 사이클에서 재시도한다.
+            print(f"[경고] market snapshot failed for {symbol}: {exc}")
+            time.sleep(float(sleep_sec))
+            continue
         quote_ccy = _quote_currency(symbol)
         cash = repo.fetch_cash_balance(currency=quote_ccy)
         pos = repo.fetch_position(symbol)
