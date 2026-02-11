@@ -247,6 +247,7 @@ def _build_policy_payload(
     slot_key: str,
     outputs: GovernanceOutputs,
     fact_pack: Mapping[str, Any],
+    activation_gate: Mapping[str, Any],
 ) -> dict[str, Any]:
     universe_sel = fact_pack.get("universe_selection") if isinstance(fact_pack.get("universe_selection"), Mapping) else {}
     prework = fact_pack.get("prework_reports") if isinstance(fact_pack.get("prework_reports"), Mapping) else {}
@@ -257,6 +258,8 @@ def _build_policy_payload(
         "policy_version": int(policy_version),
         "slot_key": str(slot_key),
         "updated_at_kst": _now_kst().isoformat(),
+        "activation_status": "ACTIVE" if bool(activation_gate.get("passed")) else "PROPOSED",
+        "activation_gate": dict(activation_gate or {}),
         "quant": {
             "universe_selection": dict(universe_sel or {}),
             "backtest_engine": str((backtest or {}).get("engine") or "unknown"),
@@ -277,6 +280,101 @@ def _build_policy_payload(
             "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
             "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
         },
+    }
+
+
+def _extract_quant_backtest_for_symbol(*, fact_pack: Mapping[str, Any], symbol: str) -> Mapping[str, Any] | None:
+    prework = fact_pack.get("prework_reports") if isinstance(fact_pack.get("prework_reports"), Mapping) else {}
+    quant = prework.get("quant_strategist") if isinstance(prework, Mapping) else {}
+    findings = quant.get("findings") if isinstance(quant, Mapping) else {}
+    backtest = findings.get("backtest") if isinstance(findings, Mapping) else {}
+    ranked = backtest.get("ranked") if isinstance(backtest, Mapping) else []
+    rows = [r for r in list(ranked or []) if isinstance(r, Mapping)]
+    if not rows:
+        return None
+    sym = str(symbol or "").strip().upper()
+    if sym:
+        for row in rows:
+            if str(row.get("symbol") or "").strip().upper() == sym:
+                return row
+    return rows[0]
+
+
+def evaluate_policy_activation_gate(
+    *,
+    rules_raw: Mapping[str, Any],
+    fact_pack: Mapping[str, Any],
+    final_symbol: str,
+) -> dict[str, Any]:
+    gov = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    gate_cfg = (gov.get("activation_gate") or {}) if isinstance(gov, Mapping) else {}
+    enabled = bool(gate_cfg.get("enabled", True))
+    if not enabled:
+        return {
+            "enabled": False,
+            "passed": True,
+            "checks": [{"name": "gate_disabled", "passed": True, "actual": "disabled", "required": "disabled"}],
+            "selected_backtest": None,
+            "reason_code": "POLICY_GATE_DISABLED",
+        }
+
+    min_trades = int(_as_float(gate_cfg.get("min_backtest_trades"), default=3.0))
+    min_win_rate_pct = float(_as_float(gate_cfg.get("min_win_rate_pct"), default=40.0))
+    min_backtest_score = float(_as_float(gate_cfg.get("min_backtest_score"), default=0.0))
+    max_drawdown_pct = float(_as_float(gate_cfg.get("max_drawdown_pct"), default=25.0))
+    require_symbol_match = bool(gate_cfg.get("require_symbol_match", True))
+
+    bt = _extract_quant_backtest_for_symbol(fact_pack=fact_pack, symbol=final_symbol)
+    if bt is None:
+        return {
+            "enabled": True,
+            "passed": False,
+            "checks": [{"name": "backtest_presence", "passed": False, "actual": "missing", "required": "present"}],
+            "selected_backtest": None,
+            "reason_code": "POLICY_GATE_BACKTEST_MISSING",
+        }
+
+    bt_symbol = str(bt.get("symbol") or "").strip().upper()
+    final_symbol_u = str(final_symbol or "").strip().upper()
+    checks = [
+        {
+            "name": "symbol_match",
+            "passed": (not require_symbol_match) or (bt_symbol == final_symbol_u),
+            "actual": bt_symbol,
+            "required": final_symbol_u if require_symbol_match else "any",
+        },
+        {
+            "name": "trades",
+            "passed": int(_as_float(bt.get("trades"), default=0.0)) >= int(min_trades),
+            "actual": int(_as_float(bt.get("trades"), default=0.0)),
+            "required": int(min_trades),
+        },
+        {
+            "name": "win_rate_pct",
+            "passed": float(_as_float(bt.get("win_rate_pct"), default=0.0)) >= float(min_win_rate_pct),
+            "actual": float(_as_float(bt.get("win_rate_pct"), default=0.0)),
+            "required": float(min_win_rate_pct),
+        },
+        {
+            "name": "backtest_score",
+            "passed": float(_as_float(bt.get("backtest_score"), default=-999.0)) >= float(min_backtest_score),
+            "actual": float(_as_float(bt.get("backtest_score"), default=-999.0)),
+            "required": float(min_backtest_score),
+        },
+        {
+            "name": "max_drawdown_pct",
+            "passed": float(_as_float(bt.get("max_drawdown_pct"), default=999.0)) <= float(max_drawdown_pct),
+            "actual": float(_as_float(bt.get("max_drawdown_pct"), default=999.0)),
+            "required": float(max_drawdown_pct),
+        },
+    ]
+    passed = all(bool(c.get("passed")) for c in checks)
+    return {
+        "enabled": True,
+        "passed": bool(passed),
+        "checks": checks,
+        "selected_backtest": dict(bt),
+        "reason_code": "POLICY_GATE_PASS" if passed else "POLICY_GATE_BLOCKED",
     }
 
 
@@ -1340,19 +1438,87 @@ def run_governance_meeting_now(
         outputs = run_governance_protocol(fact_pack=fact_pack, rules_raw=rules_raw, on_step=on_step)
 
         ended_at = _utcnow()
-        summary_short = f"[{slot_key}] Trade Plan: {outputs.final_plan.symbol} target={outputs.final_plan.target_position_pct:.1f}%"
+        activation_gate = evaluate_policy_activation_gate(
+            rules_raw=rules_raw,
+            fact_pack=fact_pack,
+            final_symbol=outputs.final_plan.symbol,
+        )
+        activation_passed = bool(activation_gate.get("passed"))
+        activation_status = "ACTIVE" if activation_passed else "PROPOSED"
+
+        gate_checks = [x for x in list(activation_gate.get("checks") or []) if isinstance(x, Mapping)]
+        gate_fail_lines = [
+            f"- {str(c.get('name'))}: actual={c.get('actual')} required={c.get('required')}"
+            for c in gate_checks
+            if not bool(c.get("passed"))
+        ]
+        gate_msg = (
+            f"정책 활성화 게이트: {activation_status} "
+            f"(reason={activation_gate.get('reason_code')}, symbol={outputs.final_plan.symbol})"
+        )
+        if gate_fail_lines:
+            gate_msg += "\n" + "\n".join(gate_fail_lines[:8])
+        _store_message(
+            repo=repo,
+            meeting_id=meeting_id,
+            sender_agent="orchestrator",
+            message_type="POLICY_ACTIVATION_GATE",
+            content=_clip(gate_msg, 1400),
+            payload={"activation_gate": activation_gate},
+            confidence=0.95 if activation_passed else 0.8,
+            emit=emit,
+        )
+
+        summary_short = (
+            f"[{slot_key}] Trade Plan({activation_status}): "
+            f"{outputs.final_plan.symbol} target={outputs.final_plan.target_position_pct:.1f}%"
+        )
         action_items = [
             {"owner": "research_agent", "action": "주요 뉴스 원문 확인 및 영향 업데이트", "due_date": str(now_kst.date())},
             {"owner": "ops_manager", "action": "recon/pause/알림 누락 여부 점검", "due_date": str(now_kst.date())},
             {"owner": "quant_strategist", "action": "과매매 방지(cooldown/rebalance band) 파라미터 점검", "due_date": str(now_kst.date())},
         ]
+        if not activation_passed:
+            action_items.append(
+                {
+                    "owner": "quant_strategist",
+                    "action": "백테스트 게이트 미통과 원인 수정 후 재검증",
+                    "due_date": str(now_kst.date()),
+                }
+            )
+
+        # Trade plan payload (active/proposed 모두 저장).
+        plan_payload = {
+            "slot_key": slot_key,
+            "meeting_id": str(meeting_id),
+            "symbol": outputs.final_plan.symbol,
+            "target_position_pct": float(outputs.final_plan.target_position_pct),
+            "valid_from_kst": outputs.final_plan.valid_from_kst,
+            "valid_to_kst": outputs.final_plan.valid_to_kst,
+            "constraints": outputs.final_plan.constraints,
+            "notes": outputs.final_plan.notes,
+            "allowed_actions": outputs.final_plan.allowed_actions.model_dump(),
+            "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
+            "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
+            "rationale": outputs.final_plan.rationale,
+            "conflict_resolution": outputs.final_plan.conflict_resolution,
+            "evidence_refs": outputs.final_plan.evidence_refs,
+            "open_questions": outputs.final_plan.open_questions,
+            "activation_status": activation_status,
+            "activation_gate": activation_gate,
+        }
 
         repo.update_meeting_session(
             meeting_id=meeting_id,
             status="CLOSED",
             ended_at=ended_at,
             summary=outputs.secretary_minutes,
-            decisions={"trade_plan": outputs.final_plan.model_dump()},
+            decisions={
+                "trade_plan": outputs.final_plan.model_dump(),
+                "plan_payload": plan_payload,
+                "activation_status": activation_status,
+                "activation_gate": activation_gate,
+            },
             action_items={"items": action_items},
         )
 
@@ -1371,6 +1537,9 @@ def run_governance_meeting_now(
                     "slot_key": slot_key,
                     "summary_short": summary_short,
                     "assistant_minutes": outputs.secretary_minutes,
+                    "activation_status": activation_status,
+                    "activation_gate": activation_gate,
+                    "trade_plan": plan_payload,
                     "llm_meta": {k: asdict(v) for k, v in outputs.llm_meta.items()},
                 },
             )
@@ -1384,7 +1553,7 @@ def run_governance_meeting_now(
                 summary=summary_short,
                 assistant_minutes=outputs.secretary_minutes,
                 assistant_meta=secretary_meta,
-                trade_plan=outputs.final_plan.model_dump(),
+                trade_plan=plan_payload,
             )
         except Exception:
             pass
@@ -1407,31 +1576,16 @@ def run_governance_meeting_now(
         except Exception:
             pass
 
-        # Trade plan event (runtime consumes latest active by valid_to_kst).
-        plan_payload = {
-            "slot_key": slot_key,
-            "meeting_id": str(meeting_id),
-            "symbol": outputs.final_plan.symbol,
-            "target_position_pct": float(outputs.final_plan.target_position_pct),
-            "valid_from_kst": outputs.final_plan.valid_from_kst,
-            "valid_to_kst": outputs.final_plan.valid_to_kst,
-            "constraints": outputs.final_plan.constraints,
-            "notes": outputs.final_plan.notes,
-            # Extended fields (safe judge may start consuming later)
-            "allowed_actions": outputs.final_plan.allowed_actions.model_dump(),
-            "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
-            "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
-            "rationale": outputs.final_plan.rationale,
-            "conflict_resolution": outputs.final_plan.conflict_resolution,
-            "evidence_refs": outputs.final_plan.evidence_refs,
-            "open_questions": outputs.final_plan.open_questions,
-        }
+        # Trade plan activation gate:
+        # - pass: TRADE_PLAN_SET (runtime consumes)
+        # - fail: TRADE_PLAN_PROPOSED only (fail-closed)
+        plan_event_type = "TRADE_PLAN_SET" if activation_passed else "TRADE_PLAN_PROPOSED"
         trade_plan_event_id = uuid.uuid4()
         repo.insert_event(
             DbEvent(
                 event_id=trade_plan_event_id,
                 ts=ended_at,
-                event_type="TRADE_PLAN_SET",
+                event_type=plan_event_type,
                 entity_type="trade_plans",
                 entity_id=slot_key,
                 run_id=None,
@@ -1439,24 +1593,43 @@ def run_governance_meeting_now(
                 payload=plan_payload,
             )
         )
-        try:
-            rationale_lines = [str(x).strip() for x in list(outputs.final_plan.rationale or []) if str(x).strip()]
-            notifier.notify_trade_plan_set(
-                event_id=trade_plan_event_id,
-                meeting_id=str(meeting_id),
-                slot_key=slot_key,
-                symbol=outputs.final_plan.symbol,
-                target_position_pct=float(outputs.final_plan.target_position_pct),
-                valid_from_kst=outputs.final_plan.valid_from_kst,
-                valid_to_kst=outputs.final_plan.valid_to_kst,
-                allowed_actions=outputs.final_plan.allowed_actions.model_dump(),
-                rebalance_band_pct=float(outputs.final_plan.rebalance_band_pct),
-                cooldown_minutes=int(outputs.final_plan.cooldown_minutes),
-                constraints=outputs.final_plan.constraints,
-                rationale_summary=" | ".join(rationale_lines[:3]),
+        if activation_passed:
+            try:
+                rationale_lines = [str(x).strip() for x in list(outputs.final_plan.rationale or []) if str(x).strip()]
+                notifier.notify_trade_plan_set(
+                    event_id=trade_plan_event_id,
+                    meeting_id=str(meeting_id),
+                    slot_key=slot_key,
+                    symbol=outputs.final_plan.symbol,
+                    target_position_pct=float(outputs.final_plan.target_position_pct),
+                    valid_from_kst=outputs.final_plan.valid_from_kst,
+                    valid_to_kst=outputs.final_plan.valid_to_kst,
+                    allowed_actions=outputs.final_plan.allowed_actions.model_dump(),
+                    rebalance_band_pct=float(outputs.final_plan.rebalance_band_pct),
+                    cooldown_minutes=int(outputs.final_plan.cooldown_minutes),
+                    constraints=outputs.final_plan.constraints,
+                    rationale_summary=" | ".join(rationale_lines[:3]),
+                )
+            except Exception:
+                pass
+        else:
+            repo.insert_event(
+                DbEvent(
+                    event_id=uuid.uuid4(),
+                    ts=ended_at,
+                    event_type="TRADE_PLAN_BLOCKED",
+                    entity_type="trade_plans",
+                    entity_id=slot_key,
+                    run_id=None,
+                    rule_version_id=None,
+                    payload={
+                        "slot_key": slot_key,
+                        "meeting_id": str(meeting_id),
+                        "reason_code": activation_gate.get("reason_code"),
+                        "activation_gate": activation_gate,
+                    },
+                )
             )
-        except Exception:
-            pass
 
         # Governance memory loop: versioned policy snapshot + per-agent task assignment.
         policy_version = _next_policy_version(repo)
@@ -1465,13 +1638,14 @@ def run_governance_meeting_now(
             slot_key=slot_key,
             outputs=outputs,
             fact_pack=fact_pack,
+            activation_gate=activation_gate,
         )
         policy_event_id = uuid.uuid4()
         repo.insert_event(
             DbEvent(
                 event_id=policy_event_id,
                 ts=ended_at,
-                event_type="GOVERNANCE_POLICY_SET",
+                event_type="GOVERNANCE_POLICY_SET" if activation_passed else "GOVERNANCE_POLICY_PROPOSED",
                 entity_type="policies",
                 entity_id=f"v{policy_version}",
                 run_id=None,
@@ -1498,7 +1672,10 @@ def run_governance_meeting_now(
                 meeting_id=meeting_id,
                 decisions={
                     "trade_plan": outputs.final_plan.model_dump(),
+                    "plan_payload": plan_payload,
                     "policy_version": int(policy_version),
+                    "activation_status": activation_status,
+                    "activation_gate": activation_gate,
                     "assigned_tasks": assigned_tasks,
                 },
                 action_items={
@@ -1527,6 +1704,8 @@ def run_governance_meeting_now(
                     "assistant_minutes": outputs.secretary_minutes,
                     "trade_plan": plan_payload,
                     "policy_version": int(policy_version),
+                    "activation_status": activation_status,
+                    "activation_gate": activation_gate,
                     "assigned_tasks": assigned_tasks,
                 },
             )
@@ -1535,6 +1714,18 @@ def run_governance_meeting_now(
         return slot_key
     except Exception as exc:
         ended_at = _utcnow()
+        repo.insert_event(
+            DbEvent(
+                event_id=uuid.uuid4(),
+                ts=ended_at,
+                event_type="MEETING_FAIL_CLOSED",
+                entity_type="meeting_sessions",
+                entity_id=str(meeting_id),
+                run_id=None,
+                rule_version_id=None,
+                payload={"meeting_id": str(meeting_id), "slot_key": slot_key, "error": str(exc)[:300]},
+            )
+        )
         repo.update_meeting_session(
             meeting_id=meeting_id,
             status="CLOSED",
