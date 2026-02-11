@@ -63,6 +63,10 @@ governance:
   require_prework_reports: true
   # 슬롯 시간 기준으로 +/- 몇 분까지를 “해당 회의 시간대”로 볼지(중복 생성 방지)
   meeting_window_min: 5
+  # 재시작 후 누락된 정기 슬롯을 자동 보강할지 여부
+  catchup_enabled: true
+  # 보강 대상 최대 과거 범위(시간)
+  catchup_lookback_hours: 36
   # 회의 결과로 기본 채택할 목표 비중(실행은 Safe Judge 게이트 통과 시에만)
   default_target_position_pct: 10.0
   # 자본(에쿼티) 규모별 비중/상한/쿨다운 정책.

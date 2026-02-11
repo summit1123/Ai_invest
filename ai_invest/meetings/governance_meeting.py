@@ -95,6 +95,10 @@ def _slot_dt_for_today_kst(now_kst: datetime, hhmm: str) -> datetime:
     return now_kst.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
 
+def _slot_key_for_dt(slot_dt: datetime) -> str:
+    return f"{slot_dt.date().isoformat()} {slot_dt.strftime('%H:%M')}"
+
+
 def default_meeting_times_kst() -> list[str]:
     # 정기 회의: 하루 3회(8시간 간격) 권장
     # 24:00은 다음날 00:00과 동일하므로 00:00/08:00/16:00으로 표현한다.
@@ -1556,25 +1560,70 @@ def maybe_run_scheduled_governance_meeting(
 
     now_kst = _now_kst()
     times = get_meeting_times_kst(rules_raw)
-    window_min = int(((rules_raw.get("governance") or {}).get("meeting_window_min") or 5) if isinstance(rules_raw, Mapping) else 5)
+    governance_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    window_min = int((governance_cfg.get("meeting_window_min") or 5))
+    catchup_enabled = bool(governance_cfg.get("catchup_enabled", True))
+    catchup_lookback_hours = int(governance_cfg.get("catchup_lookback_hours") or 36)
 
-    hit_slot: str | None = None
     if force:
-        hit_slot = now_kst.strftime("%H:%M")
-    else:
-        for t in times:
-            slot_dt = _slot_dt_for_today_kst(now_kst, t)
-            delta_min = abs((now_kst - slot_dt).total_seconds()) / 60.0
-            if delta_min <= float(window_min):
-                hit_slot = t
-                break
-        if not hit_slot:
-            return None
-
-    slot_key = f"{now_kst.date().isoformat()} {hit_slot}"
-    if repo.meeting_slot_exists(slot_key=slot_key):
+        slot_key = f"{now_kst.date().isoformat()} {now_kst.strftime('%H:%M')}"
+        if repo.meeting_slot_exists(slot_key=slot_key):
+            return slot_key
+        run_governance_meeting_now(repo=repo, notifier=notifier, rules_raw=rules_raw, force_slot_key=slot_key, emit=None)
         return slot_key
 
-    # A scheduled slot is not "live"; use deterministic slot_key.
-    run_governance_meeting_now(repo=repo, notifier=notifier, rules_raw=rules_raw, force_slot_key=slot_key, emit=None)
-    return slot_key
+    # Strict schedule + restart catch-up:
+    # 1) near real-time window slot
+    # 2) if enabled, the oldest missed regular slot within lookback horizon
+    slot_candidates: list[datetime] = []
+    for t in times:
+        try:
+            slot_candidates.append(_slot_dt_for_today_kst(now_kst, t))
+        except Exception:
+            continue
+
+    now_date = now_kst.date()
+    for slot_dt in sorted(slot_candidates):
+        delta_min = abs((now_kst - slot_dt).total_seconds()) / 60.0
+        if delta_min > float(window_min):
+            continue
+        slot_key = _slot_key_for_dt(slot_dt)
+        if not repo.meeting_slot_exists(slot_key=slot_key):
+            run_governance_meeting_now(repo=repo, notifier=notifier, rules_raw=rules_raw, force_slot_key=slot_key, emit=None)
+            return slot_key
+
+    if not catchup_enabled:
+        return None
+
+    lookback_hours = max(1, int(catchup_lookback_hours))
+    start_dt = now_kst - timedelta(hours=lookback_hours)
+    day_cursor = start_dt.date()
+    due_slots: list[datetime] = []
+    while day_cursor <= now_date:
+        for t in times:
+            try:
+                hh, mm = _parse_hhmm(t)
+            except Exception:
+                continue
+            slot_dt = datetime(
+                year=day_cursor.year,
+                month=day_cursor.month,
+                day=day_cursor.day,
+                hour=hh,
+                minute=mm,
+                second=0,
+                microsecond=0,
+                tzinfo=KST,
+            )
+            if slot_dt < start_dt or slot_dt > now_kst:
+                continue
+            due_slots.append(slot_dt)
+        day_cursor += timedelta(days=1)
+
+    for slot_dt in sorted(due_slots):
+        slot_key = _slot_key_for_dt(slot_dt)
+        if repo.meeting_slot_exists(slot_key=slot_key):
+            continue
+        run_governance_meeting_now(repo=repo, notifier=notifier, rules_raw=rules_raw, force_slot_key=slot_key, emit=None)
+        return slot_key
+    return None
