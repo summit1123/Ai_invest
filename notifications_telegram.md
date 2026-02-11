@@ -96,6 +96,7 @@
 | `RESEARCH_DAILY_BRIEF` | `events(RESEARCH_DAILY_BRIEF)` | `NORMAL` | 5분 이내 | `tpl_research_daily_brief` | `brief_date + team` | Telegram+Slack `research-daily` |
 | `MEETING_SUMMARY` | `meeting_sessions` | `NORMAL` | 5분 이내 | `tpl_meeting_summary` | `meeting_id` | Telegram+Slack `agent-meeting` |
 | `MEETING_ACTION_ASSIGNED` | `meeting_messages` | `HIGH` | 5분 이내 | `tpl_meeting_action_items` | `meeting_id + action_hash` | Telegram+Slack `agent-meeting` |
+| `TRADE_PLAN_SET` | `events(TRADE_PLAN_SET)` | `HIGH` | 5분 이내 | `tpl_trade_plan_set` | `slot_key + symbol + plan_hash` | Telegram+Slack `agent-meeting` |
 | `PR_OPENED` | 변경관리 파이프라인 | `NORMAL` | 30초 이내 | `tpl_pr_opened` | `proposal_id + pr_number` | Telegram+Slack `engineering-change` |
 | `CI_FAILED` | 변경관리 파이프라인 | `HIGH` | 30초 이내 | `tpl_ci_failed` | `proposal_id + ci_run_id` | Telegram+Slack `engineering-change` |
 | `PR_READY` | 변경관리 파이프라인 | `NORMAL` | 30초 이내 | `tpl_pr_ready` | `proposal_id + pr_number` | Telegram+Slack `engineering-change` |
@@ -125,6 +126,7 @@
 - `tpl_research_daily_brief`
 - `tpl_meeting_summary`
 - `tpl_meeting_action_items`
+- `tpl_trade_plan_set`
 - `tpl_tax_export_fail`
 - `tpl_tax_export_done`
 - `tpl_weekly_priority`
@@ -244,6 +246,15 @@
 - 담당자: {owner}
 - 액션: {action_item}
 - 기한: {due_date}
+```
+
+`tpl_trade_plan_set`
+```text
+[거버넌스] 트레이드 플랜 확정
+- 회의/슬롯: {meeting_id}/{slot_key}
+- 심볼/목표비중: {symbol}/{target_position_pct}
+- 유효시간: {valid_from_kst} ~ {valid_to_kst}
+- 허용액션/제약/근거 요약: {allowed_actions}/{constraints}/{rationale_summary}
 ```
 
 `tpl_tax_export_done`

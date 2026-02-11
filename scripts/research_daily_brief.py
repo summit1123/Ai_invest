@@ -138,6 +138,7 @@ def main() -> int:
         rules_raw=rules_raw,
         repo=repo,
     )
+    headlines_for_notify = list((findings.get("news_headlines") if isinstance(findings, dict) else []) or [])
 
     report_id = uuid.uuid4()
     repo.insert_agent_daily_report(
@@ -173,6 +174,11 @@ def main() -> int:
                 "summary": summary,
                 "risk_watchlist": risk_watchlist,
                 "next_actions": next_actions,
+                "headlines": [
+                    {"source": h.get("source"), "title": h.get("title"), "url": h.get("url"), "published_at": h.get("published_at")}
+                    for h in headlines_for_notify[:5]
+                    if isinstance(h, dict)
+                ],
             },
         )
     )
@@ -183,6 +189,7 @@ def main() -> int:
             brief_date=brief_date,
             summary=summary,
             risk_watchlist=risk_watchlist,
+            headlines=headlines_for_notify,
         )
     except Exception:
         pass

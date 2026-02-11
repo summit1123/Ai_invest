@@ -399,6 +399,7 @@ class NotificationService:
         brief_date: str,
         summary: str,
         risk_watchlist: list[str],
+        headlines: list[Mapping[str, Any]] | None = None,
     ) -> None:
         try:
             chat_id = telegram_client.chat_id_research()
@@ -428,6 +429,7 @@ class NotificationService:
                 "brief_date": brief_date,
                 "summary": summary,
                 "risk_watchlist": risk_watchlist[:5],
+                "headlines": list(headlines or [])[:3],
             },
         )
 
@@ -523,6 +525,7 @@ class NotificationService:
         summary: str,
         assistant_minutes: str | None = None,
         assistant_meta: Mapping[str, Any] | None = None,
+        trade_plan: Mapping[str, Any] | None = None,
     ) -> None:
         try:
             chat_id = telegram_client.chat_id_meeting()
@@ -553,6 +556,7 @@ class NotificationService:
                 "summary": summary,
                 "assistant_minutes": assistant_minutes,
                 "assistant_meta": dict(assistant_meta or {}),
+                "trade_plan": dict(trade_plan or {}),
             },
         )
 
@@ -585,5 +589,70 @@ class NotificationService:
                 **_ts_payload(),
                 "meeting_id": meeting_id,
                 "items": items[:10],
+            },
+        )
+
+    def notify_trade_plan_set(
+        self,
+        *,
+        event_id: uuid.UUID,
+        meeting_id: str | None,
+        slot_key: str,
+        symbol: str,
+        target_position_pct: float,
+        valid_from_kst: str | None,
+        valid_to_kst: str | None,
+        allowed_actions: Mapping[str, Any] | None = None,
+        rebalance_band_pct: float | None = None,
+        cooldown_minutes: int | None = None,
+        constraints: Mapping[str, Any] | None = None,
+        rationale_summary: str | None = None,
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_meeting()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_trade_plan_set",
+                severity="HIGH",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"slot_key": slot_key, "symbol": symbol}},
+                sent_at=None,
+            )
+            return
+
+        dedupe = _stable_hash(
+            {
+                "slot_key": slot_key,
+                "symbol": symbol,
+                "target": target_position_pct,
+                "valid_to": valid_to_kst,
+                "allowed": dict(allowed_actions or {}),
+            }
+        )
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_trade_plan_set",
+            severity="HIGH",
+            chat_id=chat_id,
+            dedupe_key=f"GOV:TRADE_PLAN:{slot_key}:{symbol}:{dedupe}",
+            payload={
+                **_ts_payload(),
+                "meeting_id": meeting_id,
+                "slot_key": slot_key,
+                "symbol": symbol,
+                "target_position_pct": target_position_pct,
+                "valid_from_kst": valid_from_kst,
+                "valid_to_kst": valid_to_kst,
+                "allowed_actions": dict(allowed_actions or {}),
+                "rebalance_band_pct": rebalance_band_pct,
+                "cooldown_minutes": cooldown_minutes,
+                "constraints": dict(constraints or {}),
+                "rationale_summary": rationale_summary or "",
             },
         )

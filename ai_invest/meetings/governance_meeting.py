@@ -1231,12 +1231,15 @@ def run_governance_meeting_now(
             )
         )
         try:
+            secretary_meta = asdict(outputs.llm_meta.get("secretary_agent")) if outputs.llm_meta.get("secretary_agent") else {}
+            secretary_meta["llm_meta"] = {k: asdict(v) for k, v in outputs.llm_meta.items()}
             notifier.notify_meeting_summary(
                 event_id=summary_event_id,
                 meeting_id=str(meeting_id),
                 summary=summary_short,
                 assistant_minutes=outputs.secretary_minutes,
-                assistant_meta={"llm_meta": {k: asdict(v) for k, v in outputs.llm_meta.items()}},
+                assistant_meta=secretary_meta,
+                trade_plan=outputs.final_plan.model_dump(),
             )
         except Exception:
             pass
@@ -1278,9 +1281,10 @@ def run_governance_meeting_now(
             "evidence_refs": outputs.final_plan.evidence_refs,
             "open_questions": outputs.final_plan.open_questions,
         }
+        trade_plan_event_id = uuid.uuid4()
         repo.insert_event(
             DbEvent(
-                event_id=uuid.uuid4(),
+                event_id=trade_plan_event_id,
                 ts=ended_at,
                 event_type="TRADE_PLAN_SET",
                 entity_type="trade_plans",
@@ -1290,6 +1294,24 @@ def run_governance_meeting_now(
                 payload=plan_payload,
             )
         )
+        try:
+            rationale_lines = [str(x).strip() for x in list(outputs.final_plan.rationale or []) if str(x).strip()]
+            notifier.notify_trade_plan_set(
+                event_id=trade_plan_event_id,
+                meeting_id=str(meeting_id),
+                slot_key=slot_key,
+                symbol=outputs.final_plan.symbol,
+                target_position_pct=float(outputs.final_plan.target_position_pct),
+                valid_from_kst=outputs.final_plan.valid_from_kst,
+                valid_to_kst=outputs.final_plan.valid_to_kst,
+                allowed_actions=outputs.final_plan.allowed_actions.model_dump(),
+                rebalance_band_pct=float(outputs.final_plan.rebalance_band_pct),
+                cooldown_minutes=int(outputs.final_plan.cooldown_minutes),
+                constraints=outputs.final_plan.constraints,
+                rationale_summary=" | ".join(rationale_lines[:3]),
+            )
+        except Exception:
+            pass
 
         if emit is not None:
             emit(

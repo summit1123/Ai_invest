@@ -1,9 +1,65 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Mapping
 
 from ai_invest.domain.reason_codes_ko import format_reason_codes_ko
+
+
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _as_float(value: Any, *, digits: int = 2) -> str:
+    try:
+        if value is None:
+            return "-"
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return "-"
+
+
+def _as_int(value: Any) -> str:
+    try:
+        if value is None:
+            return "-"
+        return str(int(value))
+    except Exception:
+        return "-"
+
+
+def _as_bool_ko(value: Any) -> str:
+    if isinstance(value, bool):
+        return "예" if value else "아니오"
+    return "-"
+
+
+def _clip(text: Any, max_len: int) -> str:
+    s = str(text or "").strip()
+    if len(s) <= max_len:
+        return s
+    return f"{s[:max_len].rstrip()} ..."
+
+
+def _format_risks(risks: Any, *, limit: int = 8) -> str:
+    if not isinstance(risks, list):
+        return "- (없음)"
+    lines: list[str] = []
+    for r in risks[:limit]:
+        s = str(r or "").strip()
+        if s:
+            lines.append(f"- {s}")
+    return "\n".join(lines) if lines else "- (없음)"
+
+
+def _operator_hint_for_action(action: str) -> str:
+    a = str(action or "").upper()
+    if a == "PAUSE":
+        return "정합성/운영 상태를 확인하고 수동 재개 여부를 점검하세요."
+    if a == "HOLD":
+        return "신규 진입 없이 관찰 유지. 차단 사유 해소 시 다음 사이클에서 재평가됩니다."
+    if a in {"BUY", "SELL"}:
+        return "체결/슬리피지/수수료를 확인하세요."
+    return "-"
 
 
 def tpl_pause_critical(data: Mapping[str, Any]) -> str:
@@ -13,6 +69,7 @@ def tpl_pause_critical(data: Mapping[str, Any]) -> str:
         f"- 사유: {data.get('reason_type')}\n"
         f"- 심볼: {data.get('symbol')}\n"
         f"- 실행ID: {data.get('run_id')}\n"
+        "- 운영자 확인: 정합성/지연/레이트리밋 상태를 확인하세요.\n"
     )
 
 
@@ -22,22 +79,23 @@ def tpl_recon_fail(data: Mapping[str, Any]) -> str:
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- 심볼: {data.get('symbol')}\n"
         f"- 요약: {data.get('diff_summary')}\n"
+        "- 운영자 확인: 원장/포지션/체결 정합성을 우선 점검하세요.\n"
     )
 
 
 def tpl_safe_decision(data: Mapping[str, Any]) -> str:
-    reasons = data.get("reasons")
-    if not isinstance(reasons, list):
-        reasons = []
-    ctx = data.get("context") if isinstance(data.get("context"), Mapping) else {}
+    reasons = data.get("reasons") if isinstance(data.get("reasons"), list) else []
+    ctx = _as_mapping(data.get("context"))
+    action = str(data.get("action") or "-").upper()
     return (
         "[거래] Safe 결정\n"
+        f"- 한 줄 요약: {data.get('symbol')} {action} ({format_reason_codes_ko(reasons)})\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- 심볼: {data.get('symbol')}\n"
-        f"- 액션: {data.get('action')}\n"
-        f"- 이유: {format_reason_codes_ko(reasons)}\n"
-        f"- 핵심지표: spread_bps={ctx.get('spread_bps')}, rsi_14={ctx.get('rsi_14')}, atr_pct={ctx.get('atr_pct')}, vol_z={ctx.get('vol_zscore')}\n"
-        f"- 에이전트: market={ctx.get('market_signal')}/{ctx.get('market_confidence')}, regime={ctx.get('regime')}/{ctx.get('regime_trade_allowed')}, risk_veto={ctx.get('risk_veto')}, ops={ctx.get('ops_state')}/{ctx.get('ops_veto')}\n"
+        f"- 핵심지표: spread={_as_float(ctx.get('spread_bps'))}bps, rsi={_as_float(ctx.get('rsi_14'))}, atr={_as_float(ctx.get('atr_pct'))}%, vol_z={_as_float(ctx.get('vol_zscore'))}\n"
+        f"- 게이트상태: regime_trade_allowed={_as_bool_ko(ctx.get('regime_trade_allowed'))}, risk_veto={_as_bool_ko(ctx.get('risk_veto'))}, ops_veto={_as_bool_ko(ctx.get('ops_veto'))}, recon={ctx.get('reconciliation_status')}\n"
+        f"- 시장신호: market={ctx.get('market_signal')} ({_as_float(ctx.get('market_confidence'))})\n"
+        f"- 적용플랜: slot={ctx.get('trade_plan_slot_key')}, target={_as_float(ctx.get('trade_plan_target_pct'))}%\n"
+        f"- 운영자 확인: {_operator_hint_for_action(action)}\n"
     )
 
 
@@ -102,18 +160,22 @@ def tpl_weekly_review(data: Mapping[str, Any]) -> str:
 
 
 def tpl_research_daily_brief(data: Mapping[str, Any]) -> str:
-    risks = data.get("risk_watchlist")
-    risk_lines: list[str] = []
-    if isinstance(risks, list):
-        for r in risks[:8]:
-            s = str(r or "").strip()
-            if s:
-                risk_lines.append(f"- {s}")
-    risks_txt = "\n".join(risk_lines) if risk_lines else "- (없음)"
+    headlines = data.get("headlines") if isinstance(data.get("headlines"), list) else []
+    links: list[str] = []
+    for h in headlines[:3]:
+        if not isinstance(h, Mapping):
+            continue
+        title = str(h.get("title") or "").strip()
+        url = str(h.get("url") or "").strip()
+        if title or url:
+            links.append(f"- {title} ({url})" if url else f"- {title}")
+    links_txt = "\n".join(links) if links else "- (없음)"
+
     return (
         f"[리서치][일간] {data.get('brief_date')}\n"
-        f"- 요약: {data.get('summary')}\n"
-        f"- 리스크:\n{risks_txt}\n"
+        f"- 한 줄 요약: {_clip(data.get('summary'), 240)}\n"
+        f"- 리스크:\n{_format_risks(data.get('risk_watchlist'))}\n"
+        f"- 주요 링크:\n{links_txt}\n"
     )
 
 
@@ -127,22 +189,33 @@ def tpl_agent_daily_report(data: Mapping[str, Any]) -> str:
 
 def tpl_meeting_summary(data: Mapping[str, Any]) -> str:
     assistant_minutes = data.get("assistant_minutes")
-    if not isinstance(assistant_minutes, str) or not assistant_minutes.strip():
-        assistant_minutes = None
-    assistant_meta = data.get("assistant_meta") if isinstance(data.get("assistant_meta"), Mapping) else {}
+    assistant_minutes = assistant_minutes if isinstance(assistant_minutes, str) and assistant_minutes.strip() else None
+    assistant_meta = _as_mapping(data.get("assistant_meta"))
     used_llm = bool(assistant_meta.get("used_llm") or False)
     model = assistant_meta.get("model")
+    trade_plan = _as_mapping(data.get("trade_plan"))
 
-    body = assistant_minutes or str(data.get("summary") or "").strip()
-    if not body:
-        body = "(요약 없음)"
+    source_line = "- 생성: deterministic"
+    if used_llm:
+        source_line = f"- 생성: LLM({model})" if model else "- 생성: LLM"
+
+    plan_line = ""
+    if trade_plan:
+        plan_line = (
+            f"- 최종 플랜: {trade_plan.get('symbol')} / target={_as_float(trade_plan.get('target_position_pct'))}%"
+            f" / valid={trade_plan.get('valid_from_kst')}~{trade_plan.get('valid_to_kst')}\n"
+        )
+
+    body = assistant_minutes or str(data.get("summary") or "").strip() or "(요약 없음)"
     return (
         "[회의] 회의록\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- meeting_id: {data.get('meeting_id')}\n"
-        + (f"- 생성: LLM({model})\n" if used_llm and model else ("- 생성: deterministic\n" if not used_llm else ""))
+        f"{source_line}\n"
+        f"- 한 줄 결론: {_clip(data.get('summary'), 180)}\n"
+        + plan_line
         + "\n"
-        + f"{body}\n"
+        + f"{_clip(body, 3200)}\n"
     )
 
 
@@ -153,11 +226,11 @@ def tpl_meeting_action_items(data: Mapping[str, Any]) -> str:
         for it in items[:10]:
             if not isinstance(it, Mapping):
                 continue
-            owner = str(it.get("owner") or "")
-            action = str(it.get("action") or "")
-            due = str(it.get("due_date") or "")
+            owner = str(it.get("owner") or "").strip()
+            action = str(it.get("action") or "").strip()
+            due = str(it.get("due_date") or "").strip()
             if owner or action:
-                lines.append(f"- {owner}: {action} (기한 {due})")
+                lines.append(f"- {owner}: {action} (기한 {due or '-'})")
     items_txt = "\n".join(lines) if lines else "- (없음)"
     return (
         "[회의][액션아이템]\n"
@@ -177,6 +250,23 @@ def tpl_weekly_priority(data: Mapping[str, Any]) -> str:
     )
 
 
+def tpl_trade_plan_set(data: Mapping[str, Any]) -> str:
+    allowed = _as_mapping(data.get("allowed_actions"))
+    constraints = _as_mapping(data.get("constraints"))
+    return (
+        "[거버넌스] 트레이드 플랜 확정\n"
+        f"- 시각(KST): {data.get('ts_kst')}\n"
+        f"- 회의/슬롯: {data.get('meeting_id')} / {data.get('slot_key')}\n"
+        f"- 심볼/목표비중: {data.get('symbol')} / {_as_float(data.get('target_position_pct'))}%\n"
+        f"- 유효시간(KST): {data.get('valid_from_kst')} ~ {data.get('valid_to_kst')}\n"
+        f"- 허용 액션: buy={_as_bool_ko(allowed.get('buy'))}, sell={_as_bool_ko(allowed.get('sell'))}\n"
+        f"- 과매매 방지: cooldown={_as_int(data.get('cooldown_minutes'))}분, rebalance_band={_as_float(data.get('rebalance_band_pct'))}%\n"
+        f"- 실행 제약: max_spread={constraints.get('max_spread_bps')}bps, max_slippage={constraints.get('max_slippage_bps')}bps, max_position={constraints.get('max_position_pct')}%\n"
+        f"- 근거 요약: {_clip(data.get('rationale_summary'), 240)}\n"
+        "- 운영자 확인: TTL 만료 전 회의 갱신 여부를 확인하세요.\n"
+    )
+
+
 TEMPLATES = {
     "tpl_pause_critical": tpl_pause_critical,
     "tpl_recon_fail": tpl_recon_fail,
@@ -192,6 +282,7 @@ TEMPLATES = {
     "tpl_meeting_summary": tpl_meeting_summary,
     "tpl_meeting_action_items": tpl_meeting_action_items,
     "tpl_weekly_priority": tpl_weekly_priority,
+    "tpl_trade_plan_set": tpl_trade_plan_set,
 }
 
 
