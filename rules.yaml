@@ -3,12 +3,21 @@ as_of_date: "2026-02-09"
 
 universe:
   market: "upbit"
-  # 거버넌스 회의에서 AI/결정로직이 선택할 후보 심볼 유니버스
+  # fallback 유니버스(동적 스캔 실패 시 사용)
   symbols:
     - "KRW-BTC"
     - "KRW-ETH"
     - "KRW-XRP"
     - "KRW-SOL"
+  # 동적 유니버스: 업비트 API로 KRW 마켓을 스캔해 거래대금 상위 후보를 자동 선정
+  dynamic:
+    enabled: true
+    quote_currency: "KRW"
+    top_n_by_24h_turnover: 40
+    max_candidates: 12
+    min_24h_turnover_krw: 5000000000
+    include_symbols: []
+    exclude_symbols: []
   trade_side: "long_only"
   mode: "paper"
   max_open_positions: 1

@@ -56,6 +56,23 @@ def fetch_ticker(symbol: str) -> dict[str, Any]:
     return data[0]
 
 
+def fetch_tickers(symbols: list[str]) -> list[dict[str, Any]]:
+    markets = [str(s).strip().upper() for s in list(symbols or []) if str(s).strip()]
+    if not markets:
+        return []
+    data = _get("/v1/ticker", {"markets": ",".join(markets)})
+    if not isinstance(data, list):
+        raise UpbitPublicApiError("Unexpected ticker response list")
+    return [row for row in data if isinstance(row, dict)]
+
+
+def fetch_markets_all(*, is_details: bool = False) -> list[dict[str, Any]]:
+    data = _get("/v1/market/all", {"isDetails": str(bool(is_details)).lower()})
+    if not isinstance(data, list):
+        raise UpbitPublicApiError("Unexpected market/all response list")
+    return [row for row in data if isinstance(row, dict)]
+
+
 def fetch_market_snapshot(symbol: str) -> MarketSnapshot:
     ob = fetch_orderbook(symbol)
     units = ob.get("orderbook_units") or []
@@ -83,4 +100,3 @@ def fetch_candles_minutes(symbol: str, *, unit: int, count: int = 200) -> list[d
         raise UpbitPublicApiError("Unexpected candle response")
     # Upbit returns most recent first; reverse to chronological order.
     return list(reversed(data))
-

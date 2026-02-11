@@ -11,7 +11,8 @@ from ai_invest.agents.research_agent import research_agent_daily_brief
 from ai_invest.config.capital_policy import resolve_capital_policy
 from ai_invest.config.llm_router import llm_route_for_agent
 from ai_invest.config.rules_loader import RulesConfig, load_rules
-from ai_invest.market_data.features import build_feature_snapshot_from_candles
+from ai_invest.market_data.features import build_feature_snapshot_from_candles, compute_rsi, compute_volume_zscore
+from ai_invest.market_data.universe_selector import resolve_dynamic_universe
 from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_market_snapshot
 from ai_invest.research.rss import fetch_crypto_headlines
 from ai_invest.storage.postgres import DbAgentDailyReport, DbEvent, PostgresRepo
@@ -232,6 +233,133 @@ def _quant_candidate_rows(*, rules_raw: Mapping[str, Any], rules: RulesConfig, s
     return out
 
 
+def _quick_backtest_candidate(
+    *,
+    symbol: str,
+    tf_min: int,
+    rsi_min: float,
+    vol_min: float,
+    fee_total_bps: float,
+    hold_bars: int = 24,
+    lookback_bars: int = 500,
+) -> dict[str, Any]:
+    """Lightweight rule replay for quant prework.
+
+    This is intentionally simple/fast:
+    - entry: RSI>=rsi_min and vol_z>=vol_min
+    - exit : RSI < max(45, rsi_min-8) or hold_bars timeout
+    - fees: round-trip fixed bps
+    """
+
+    try:
+        candles = fetch_candles_minutes(symbol, unit=tf_min, count=max(80, int(lookback_bars)))
+    except Exception as exc:
+        return {
+            "symbol": symbol,
+            "ok": False,
+            "error": f"candles_fetch_failed:{str(exc)[:120]}",
+            "trades": 0,
+            "win_rate_pct": 0.0,
+            "net_return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "avg_trade_return_pct": 0.0,
+            "backtest_score": -99.0,
+        }
+
+    closes = [float(c.get("trade_price") or 0.0) for c in candles]
+    volumes = [float(c.get("candle_acc_trade_volume") or 0.0) for c in candles]
+    n = min(len(closes), len(volumes))
+    if n < 60:
+        return {
+            "symbol": symbol,
+            "ok": False,
+            "error": "not_enough_candles",
+            "trades": 0,
+            "win_rate_pct": 0.0,
+            "net_return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "avg_trade_return_pct": 0.0,
+            "backtest_score": -99.0,
+        }
+
+    eq = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    in_pos = False
+    entry_px = 0.0
+    entry_i = -1
+    trades = 0
+    wins = 0
+    sum_ret_pct = 0.0
+    fee_rate = max(0.0, float(fee_total_bps)) / 10000.0
+
+    for i in range(30, n):
+        px = float(closes[i])
+        if px <= 0:
+            continue
+        rsi = float(compute_rsi(closes[: i + 1], period=14))
+        volz = float(compute_volume_zscore(volumes[: i + 1], window=20))
+
+        if not in_pos:
+            if rsi >= float(rsi_min) and volz >= float(vol_min):
+                in_pos = True
+                entry_px = px
+                entry_i = i
+            continue
+
+        bars_held = max(0, i - entry_i)
+        exit_cond = (rsi < max(45.0, float(rsi_min) - 8.0)) or (bars_held >= int(hold_bars))
+        if not exit_cond:
+            continue
+
+        gross = (px - entry_px) / entry_px if entry_px > 0 else 0.0
+        net = gross - fee_rate
+        eq *= max(0.0, 1.0 + net)
+        peak = max(peak, eq)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - eq) / peak)
+        trades += 1
+        ret_pct = net * 100.0
+        sum_ret_pct += ret_pct
+        if net > 0:
+            wins += 1
+        in_pos = False
+        entry_px = 0.0
+        entry_i = -1
+
+    # Force close at last bar for open trade
+    if in_pos and entry_px > 0:
+        last_px = float(closes[n - 1])
+        gross = (last_px - entry_px) / entry_px if entry_px > 0 else 0.0
+        net = gross - fee_rate
+        eq *= max(0.0, 1.0 + net)
+        peak = max(peak, eq)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - eq) / peak)
+        trades += 1
+        ret_pct = net * 100.0
+        sum_ret_pct += ret_pct
+        if net > 0:
+            wins += 1
+
+    win_rate = (float(wins) / float(trades) * 100.0) if trades > 0 else 0.0
+    net_return_pct = (eq - 1.0) * 100.0
+    avg_trade = (sum_ret_pct / float(trades)) if trades > 0 else 0.0
+    # Reward net return/win-rate, penalize drawdown.
+    backtest_score = float(net_return_pct) + 0.10 * float(win_rate) - 0.70 * float(max_dd * 100.0)
+
+    return {
+        "symbol": symbol,
+        "ok": True,
+        "trades": int(trades),
+        "win_rate_pct": float(win_rate),
+        "net_return_pct": float(net_return_pct),
+        "max_drawdown_pct": float(max_dd * 100.0),
+        "avg_trade_return_pct": float(avg_trade),
+        "backtest_score": float(backtest_score),
+    }
+
+
 @dataclass(frozen=True)
 class WorkCycleResult:
     cycle_key: str
@@ -253,7 +381,8 @@ def run_agent_work_cycle(
     cycle_key = now_kst.strftime("%Y-%m-%d %H:%M:%S")
 
     rules = load_rules("rules.yaml")
-    symbols = list(rules.universe.symbols)
+    universe = resolve_dynamic_universe(rules_raw=rules_raw, fallback_symbols=list(rules.universe.symbols))
+    symbols = list(universe.symbols)
     default_symbol = symbols[0]
     tf_min = _timeframe_to_minutes(str((rules_raw.get("signal") or {}).get("timeframe_entry") or "15m"))
     candidates = _quant_candidate_rows(rules_raw=rules_raw, rules=rules, symbols=symbols, tf_min=tf_min)
@@ -298,6 +427,37 @@ def run_agent_work_cycle(
 
     # 2) quant_strategist prework
     top = candidates[0] if candidates else {"symbol": symbol, "score": 0.0, "snapshot": snapshot, "features": features}
+    signal_cfg = (rules_raw.get("signal") or {}) if isinstance(rules_raw, Mapping) else {}
+    rsi_min = _as_float(signal_cfg.get("rsi_min"), default=50.0)
+    vol_min = _as_float(signal_cfg.get("volume_zscore_min"), default=1.2)
+    fees_cfg = (rules_raw.get("fees") or {}) if isinstance(rules_raw, Mapping) else {}
+    fee_total_bps = _as_float(fees_cfg.get("fallback_bid_fee_bps"), default=5.0) + _as_float(
+        fees_cfg.get("fallback_ask_fee_bps"), default=5.0
+    )
+    backtests: list[dict[str, Any]] = []
+    for row in candidates[: min(8, len(candidates))]:
+        sym = str(row.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        bt = _quick_backtest_candidate(
+            symbol=sym,
+            tf_min=tf_min,
+            rsi_min=rsi_min,
+            vol_min=vol_min,
+            fee_total_bps=fee_total_bps,
+            hold_bars=24,
+            lookback_bars=500,
+        )
+        backtests.append(bt)
+    if backtests:
+        bt_rank = sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)
+        bt_best = bt_rank[0]
+        bt_best_symbol = str(bt_best.get("symbol") or "").strip()
+        if bt_best_symbol:
+            for row in candidates:
+                if str(row.get("symbol") or "").strip().upper() == bt_best_symbol.upper():
+                    top = row
+                    break
     default_target = _as_float(((rules_raw.get("governance") or {}).get("default_target_position_pct")), default=10.0)
     max_pos = float(rules.risk.max_position_pct_per_symbol)
     quote_ccy = _quote_currency(str(top.get("symbol") or symbol))
@@ -320,7 +480,7 @@ def run_agent_work_cycle(
         max(0.0, default_target if float(top.get("score") or 0.0) > 0 else 0.0),
     )
     quant_summary = (
-        f"후보 1순위 {top.get('symbol')} (score={float(top.get('score') or 0.0):.3f}), "
+        f"후보 1순위 {top.get('symbol')} (signal_score={float(top.get('score') or 0.0):.3f}), "
         f"권장 목표비중 {target:.1f}% (tier={capital_profile.tier_name}, equity={equity:.0f} KRW)"
     )
     quant_risks: list[str] = []
@@ -336,7 +496,19 @@ def run_agent_work_cycle(
         title="사전업무 리포트(Quant)",
         summary=quant_summary,
         findings={
+            "universe_selection": {
+                "source": universe.source,
+                "total_krw_markets": universe.total_krw_markets,
+                "ranked_count": universe.ranked_count,
+                "symbols": symbols[:20],
+                "top24h_turnover": universe.top24h_turnover[:10],
+            },
             "candidates": candidates[:5],
+            "backtest": {
+                "engine": "quick_rsi_vol_replay_v1",
+                "params": {"tf_min": tf_min, "rsi_min": rsi_min, "vol_min": vol_min, "fee_total_bps": fee_total_bps},
+                "ranked": sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)[:5],
+            },
             "suggested_plan": {"symbol": top.get("symbol"), "target_position_pct": target},
             "capital_profile": capital_profile.as_dict(),
         },

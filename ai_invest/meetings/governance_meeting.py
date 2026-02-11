@@ -23,6 +23,7 @@ from ai_invest.config.capital_policy import resolve_capital_policy
 from ai_invest.config.llm_router import LLMRoute, llm_route_for_agent
 from ai_invest.config.rules_loader import RulesConfig, load_rules
 from ai_invest.market_data.features import build_feature_snapshot_from_candles
+from ai_invest.market_data.universe_selector import resolve_dynamic_universe
 from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_market_snapshot
 from ai_invest.notifications.service import NotificationService
 from ai_invest.research.rss import fetch_crypto_headlines, summarize_headlines_text
@@ -1002,7 +1003,8 @@ def run_governance_meeting_now(
     times = get_meeting_times_kst(rules_raw)
     slot_key = force_slot_key or f"{now_kst.date().isoformat()} LIVE {now_kst.strftime('%H:%M:%S')}"
 
-    symbols = list(rules.universe.symbols)
+    universe = resolve_dynamic_universe(rules_raw=rules_raw, fallback_symbols=list(rules.universe.symbols))
+    symbols = list(universe.symbols)
 
     # Valid window (deterministic):
     # - scheduled slot: [slot_dt, next_slot_dt)
@@ -1033,6 +1035,8 @@ def run_governance_meeting_now(
     session_agenda = {
         "slot_key": slot_key,
         "symbols": symbols,
+        "universe_source": universe.source,
+        "universe_total_krw_markets": universe.total_krw_markets,
         "timeframe_entry": str((rules_raw.get("signal") or {}).get("timeframe_entry") or "15m"),
         "mode": agenda_mode,
     }
@@ -1194,6 +1198,12 @@ def run_governance_meeting_now(
         fact_pack["valid_from_kst"] = vf_kst.isoformat()
         fact_pack["valid_to_kst"] = vt_kst.isoformat()
         fact_pack["capital_profile"] = capital_profile.as_dict()
+        fact_pack["universe_selection"] = {
+            "source": universe.source,
+            "total_krw_markets": universe.total_krw_markets,
+            "ranked_count": universe.ranked_count,
+            "top24h_turnover": universe.top24h_turnover[:10],
+        }
 
         def _confidence_for(message_type: str) -> float | None:
             m = str(message_type or "")
