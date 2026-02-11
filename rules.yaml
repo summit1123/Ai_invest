@@ -36,6 +36,27 @@ governance:
   meeting_window_min: 5
   # 회의 결과로 기본 채택할 목표 비중(실행은 Safe Judge 게이트 통과 시에만)
   default_target_position_pct: 10.0
+  # 자본(에쿼티) 규모별 비중/상한/쿨다운 정책.
+  # - 회의 플랜(target_position_pct)과 실시간 실행 비중 모두 이 상한을 넘지 않도록 적용된다.
+  # - min_equity_krw 이상 조건 중 가장 큰 티어를 선택한다.
+  capital_policy:
+    enabled: true
+    tiers:
+      - name: "seed_small"
+        min_equity_krw: 0
+        max_target_position_pct: 6.0
+        max_position_pct_per_symbol: 12.0
+        cooldown_minutes_after_trigger: 240
+      - name: "core"
+        min_equity_krw: 3000000
+        max_target_position_pct: 10.0
+        max_position_pct_per_symbol: 18.0
+        cooldown_minutes_after_trigger: 180
+      - name: "expanded"
+        min_equity_krw: 10000000
+        max_target_position_pct: 12.0
+        max_position_pct_per_symbol: 20.0
+        cooldown_minutes_after_trigger: 120
 
 execution:
   order_style: "limit_post_only_first"

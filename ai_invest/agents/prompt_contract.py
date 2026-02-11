@@ -49,7 +49,7 @@ def governance_research_instructions() -> str:
             "불확실한 내용은 unknowns에 명시한다.",
         ],
         input_contract=[
-            "입력은 Fact Pack JSON 1개이며, allowed_symbols/evaluated/rules/ops_state/research_brief를 포함한다.",
+            "입력은 Fact Pack JSON 1개이며, allowed_symbols/evaluated/rules/ops_state/research_brief/capital_profile를 포함한다.",
             "입력 외 사실은 사용하지 않는다.",
         ],
         hard_rules=[
@@ -80,7 +80,7 @@ def governance_quant_instructions() -> str:
             "과매매 방지 조건(rebalance band, cooldown)을 포함한다.",
         ],
         input_contract=[
-            "입력의 allowed_symbols와 rules.risk/cost_guard 제약을 반드시 반영한다.",
+            "입력의 allowed_symbols와 rules.risk/cost_guard/capital_profile 제약을 반드시 반영한다.",
         ],
         hard_rules=[
             "allowed_symbols 밖의 심볼 선택 금지.",
@@ -108,7 +108,7 @@ def governance_risk_instructions() -> str:
             "하드 리스크 상황에서 veto 여부를 명확히 제시한다.",
         ],
         input_contract=[
-            "ops_state, rules.risk, rules.cost_guard, account_state를 우선 참조한다.",
+            "ops_state, rules.risk, rules.cost_guard, account_state, capital_profile를 우선 참조한다.",
         ],
         hard_rules=[
             "recon FAIL, pause 등 하드 리스크는 veto를 우선 고려.",
@@ -182,7 +182,7 @@ def governance_coordinator_instructions() -> str:
         ],
         input_contract=[
             "입력에는 fact_pack, round1, critiques가 포함된다.",
-            "allowed_symbols, rules.risk/cost_guard 제약을 준수한다.",
+            "allowed_symbols, rules.risk/cost_guard, capital_profile 제약을 준수한다.",
         ],
         hard_rules=[
             "ops_manager.veto=true 또는 risk_manager.veto=true면 buy=false 및 target_position_pct=0 우선 고려.",
@@ -318,4 +318,3 @@ def secretary_minutes_system_prompt() -> str:
         failsafe=["불확실한 내용은 '미확인'으로 표시."],
         style_rules=["과장 금지, 운영 관점으로 담담하게 작성."],
     )
-

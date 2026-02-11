@@ -95,6 +95,7 @@ def tpl_safe_decision(data: Mapping[str, Any]) -> str:
         f"- 게이트상태: regime_trade_allowed={_as_bool_ko(ctx.get('regime_trade_allowed'))}, risk_veto={_as_bool_ko(ctx.get('risk_veto'))}, ops_veto={_as_bool_ko(ctx.get('ops_veto'))}, recon={ctx.get('reconciliation_status')}\n"
         f"- 시장신호: market={ctx.get('market_signal')} ({_as_float(ctx.get('market_confidence'))})\n"
         f"- 적용플랜: slot={ctx.get('trade_plan_slot_key')}, target={_as_float(ctx.get('trade_plan_target_pct'))}%\n"
+        f"- 자본정책: tier={ctx.get('capital_tier')}, target_cap={_as_float(ctx.get('capital_target_cap_pct'))}%\n"
         f"- 운영자 확인: {_operator_hint_for_action(action)}\n"
     )
 

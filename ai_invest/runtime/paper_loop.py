@@ -7,11 +7,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 import yaml
+from zoneinfo import ZoneInfo
 
 from ai_invest.agents.market_agent import market_agent_opine
 from ai_invest.agents.ops_agent import ops_agent_opine
 from ai_invest.agents.regime_agent import regime_agent_opine
 from ai_invest.agents.risk_agent import risk_agent_opine
+from ai_invest.config.capital_policy import resolve_capital_policy
 from ai_invest.config.rules_loader import RulesConfig, load_rules
 from ai_invest.execution.paper_execution import PaperExecutor
 from ai_invest.judge.ai_judge import ai_judge_shadow_decide
@@ -31,6 +33,8 @@ from ai_invest.storage.postgres import (
     DbRun,
     PostgresRepo,
 )
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 def _utcnow() -> datetime:
@@ -170,11 +174,37 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         pos_value = float(current_qty) * float(snapshot.mid_price)
         equity = float(cash) + float(pos_value)
         current_pct = (pos_value / equity * 100.0) if equity > 0 else 0.0
+        capital_profile = resolve_capital_policy(
+            rules_raw=raw_rules,
+            equity_krw=float(equity),
+            default_target_position_pct=float((raw_rules.get("governance") or {}).get("default_target_position_pct") or 10.0)
+            if isinstance(raw_rules, dict)
+            else 10.0,
+            max_position_pct_per_symbol=float(rules.risk.max_position_pct_per_symbol),
+            cooldown_minutes_after_trigger=int(rules.risk.cooldown_minutes_after_trigger),
+        )
+        effective_target_cap = min(
+            float(capital_profile.max_target_position_pct),
+            float(capital_profile.max_position_pct_per_symbol),
+            float(rules.risk.max_position_pct_per_symbol),
+        )
+        daily_loss_pct = 0.0
+        try:
+            today_kst = _utcnow().astimezone(KST).date().isoformat()
+            latest_daily = (repo.fetch_pnl_daily(limit=1) or [None])[0]
+            if isinstance(latest_daily, dict) and str(latest_daily.get("day") or "") == today_kst:
+                realized = float(latest_daily.get("realized_pnl") or 0.0)
+                if realized < 0 and float(equity) > 0:
+                    daily_loss_pct = abs(float(realized)) / float(equity) * 100.0
+        except Exception:
+            daily_loss_pct = 0.0
         plan_target_pct = None
         try:
             plan_target_pct = float(plan.get("target_position_pct")) if plan and _trade_plan_is_active(plan) else None
         except Exception:
             plan_target_pct = None
+        if plan_target_pct is not None:
+            plan_target_pct = max(0.0, min(float(plan_target_pct), float(effective_target_cap)))
         quote_ts = _utcnow()
         repo.insert_market_quote(
             ts=quote_ts,
@@ -238,10 +268,11 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             ops=ops,
             context={
                 "account": {
-                    "daily_loss_pct": 0.0,
+                    "daily_loss_pct": float(daily_loss_pct),
                     "cash_krw": float(cash),
                     "equity_krw": float(equity),
                     "position_value_krw": float(pos_value),
+                    "capital_profile": capital_profile.as_dict(),
                 },
                 "risk_limits": {
                     "max_daily_loss_pct": float(rules.risk.max_daily_loss_pct),
@@ -252,6 +283,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "trade_plan": {
                     "slot_key": plan.get("slot_key") if plan else None,
                     "target_position_pct": plan_target_pct,
+                    "raw_target_position_pct": (plan.get("target_position_pct") if plan else None),
                     "valid_to_kst": plan.get("valid_to_kst") if plan else None,
                 },
             },
@@ -411,7 +443,9 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "reconciliation_status": ops_op.reconciliation_status,
                 "pause_state": ops.get("pause_state"),
                 "trade_plan_slot_key": plan.get("slot_key") if plan else None,
-                "trade_plan_target_pct": plan.get("target_position_pct") if plan else None,
+                "trade_plan_target_pct": plan_target_pct,
+                "capital_tier": capital_profile.tier_name,
+                "capital_target_cap_pct": effective_target_cap,
             },
         )
 

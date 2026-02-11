@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from ai_invest.agents.research_agent import research_agent_daily_brief
+from ai_invest.config.capital_policy import resolve_capital_policy
 from ai_invest.config.llm_router import llm_route_for_agent
 from ai_invest.config.rules_loader import RulesConfig, load_rules
 from ai_invest.market_data.features import build_feature_snapshot_from_candles
@@ -45,6 +46,12 @@ def _timeframe_to_minutes(tf: str) -> int:
     if tf.endswith("h"):
         return int(tf[:-1]) * 60
     return 15
+
+
+def _quote_currency(symbol: str) -> str:
+    if "-" not in str(symbol):
+        return "KRW"
+    return str(symbol).split("-", 1)[0].strip().upper() or "KRW"
 
 
 def _candidate_score(*, rsi: float, vol_z: float, spread_bps: float, rsi_min: float, vol_min: float, max_spread: float) -> float:
@@ -277,8 +284,29 @@ def run_agent_work_cycle(
     top = candidates[0] if candidates else {"symbol": symbol, "score": 0.0, "snapshot": snapshot, "features": features}
     default_target = _as_float(((rules_raw.get("governance") or {}).get("default_target_position_pct")), default=10.0)
     max_pos = float(rules.risk.max_position_pct_per_symbol)
-    target = min(max_pos, max(0.0, default_target if float(top.get("score") or 0.0) > 0 else 0.0))
-    quant_summary = f"후보 1순위 {top.get('symbol')} (score={float(top.get('score') or 0.0):.3f}), 권장 목표비중 {target:.1f}%"
+    quote_ccy = _quote_currency(str(top.get("symbol") or symbol))
+    cash = float(repo.fetch_cash_balance(currency=quote_ccy))
+    top_snapshot = (top.get("snapshot") or {}) if isinstance(top.get("snapshot"), Mapping) else {}
+    top_mid = _as_float(top_snapshot.get("mid_price"), default=0.0)
+    top_pos = repo.fetch_position(str(top.get("symbol") or symbol))
+    top_qty = float(top_pos.qty) if top_pos else 0.0
+    equity = float(cash) + float(top_qty) * float(top_mid)
+    capital_profile = resolve_capital_policy(
+        rules_raw=rules_raw,
+        equity_krw=equity,
+        default_target_position_pct=default_target,
+        max_position_pct_per_symbol=max_pos,
+        cooldown_minutes_after_trigger=int(rules.risk.cooldown_minutes_after_trigger),
+    )
+    target = min(
+        float(capital_profile.max_target_position_pct),
+        float(capital_profile.max_position_pct_per_symbol),
+        max(0.0, default_target if float(top.get("score") or 0.0) > 0 else 0.0),
+    )
+    quant_summary = (
+        f"후보 1순위 {top.get('symbol')} (score={float(top.get('score') or 0.0):.3f}), "
+        f"권장 목표비중 {target:.1f}% (tier={capital_profile.tier_name}, equity={equity:.0f} KRW)"
+    )
     quant_risks: list[str] = []
     if _as_float((top.get("snapshot") or {}).get("spread_bps"), default=0.0) > float(rules.cost_guard.max_spread_bps_entry):
         quant_risks.append("상위 후보의 스프레드가 제한보다 넓음")
@@ -291,12 +319,17 @@ def run_agent_work_cycle(
         team_scope="STRATEGY",
         title="사전업무 리포트(Quant)",
         summary=quant_summary,
-        findings={"candidates": candidates[:5], "suggested_plan": {"symbol": top.get("symbol"), "target_position_pct": target}},
+        findings={
+            "candidates": candidates[:5],
+            "suggested_plan": {"symbol": top.get("symbol"), "target_position_pct": target},
+            "capital_profile": capital_profile.as_dict(),
+        },
         risks={"watchlist": quant_risks},
         action_items={
             "next_actions": [
                 "회의에서 상위 후보의 비용/리스크 충돌 여부 검증",
                 "target_position_pct와 cooldown/rebalance_band 합의",
+                "자본 티어(capital_policy) 상한과 플랜 비중 일치 여부 확인",
             ]
         },
     )
@@ -363,4 +396,3 @@ def run_agent_work_cycle(
             "ops_manager": str(ops_id),
         },
     )
-

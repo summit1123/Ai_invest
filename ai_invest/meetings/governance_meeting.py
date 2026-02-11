@@ -19,6 +19,7 @@ from ai_invest.agents.prompt_contract import (
     governance_risk_instructions,
     governance_secretary_instructions,
 )
+from ai_invest.config.capital_policy import resolve_capital_policy
 from ai_invest.config.llm_router import LLMRoute, llm_route_for_agent
 from ai_invest.config.rules_loader import RulesConfig, load_rules
 from ai_invest.market_data.features import build_feature_snapshot_from_candles
@@ -507,8 +508,15 @@ def run_governance_protocol(
     evaluated = list(fact_pack.get("evaluated") or [])
     best = evaluated[0] if evaluated else {"symbol": (next(iter(allowed), "") or "KRW-BTC"), "score": 0.0, "features": {}, "snapshot": {}}
     best_symbol = str(best.get("symbol") or "").strip() or (next(iter(allowed), "") or "KRW-BTC")
-    max_pos = float(((fact_pack.get("rules") or {}).get("risk") or {}).get("max_position_pct_per_symbol") or 20.0)
-    default_target = float(((fact_pack.get("raw_rules_hint") or {}).get("governance") or {}).get("default_target_position_pct") or 10.0)
+    max_pos_base = float(((fact_pack.get("rules") or {}).get("risk") or {}).get("max_position_pct_per_symbol") or 20.0)
+    default_target_base = float(((fact_pack.get("raw_rules_hint") or {}).get("governance") or {}).get("default_target_position_pct") or 10.0)
+    cap_profile = fact_pack.get("capital_profile") if isinstance(fact_pack.get("capital_profile"), Mapping) else {}
+    cap_tier = str(cap_profile.get("tier_name") or "default")
+    cap_max_pos = _as_float(cap_profile.get("max_position_pct_per_symbol"), default=max_pos_base)
+    cap_max_target = _as_float(cap_profile.get("max_target_position_pct"), default=default_target_base)
+    cap_cooldown = int(_as_float(cap_profile.get("cooldown_minutes_after_trigger"), default=0.0))
+    max_pos = min(max_pos_base, cap_max_pos)
+    default_target = min(default_target_base, cap_max_target, max_pos)
 
     pause = bool(((fact_pack.get("ops_state") or {}).get("pause") or {}).get("paused") or False)
     recon_status = str(((fact_pack.get("ops_state") or {}).get("latest_reconciliation") or {}).get("status") or "OK").upper()
@@ -562,8 +570,11 @@ def run_governance_protocol(
             "ops/recon FAIL 또는 PAUSE 발생 시 청산 우선",
         ],
         rebalance_band_pct=2.0,
-        cooldown_minutes=int(((fact_pack.get("rules") or {}).get("risk") or {}).get("cooldown_minutes_after_trigger") or 180),
-        notes="deterministic 초안: 점수 상위 심볼을 기본 비중으로 채택",
+        cooldown_minutes=max(
+            int(((fact_pack.get("rules") or {}).get("risk") or {}).get("cooldown_minutes_after_trigger") or 180),
+            max(0, int(cap_cooldown)),
+        ),
+        notes=f"deterministic 초안: 점수 상위 심볼을 기본 비중으로 채택 (capital_tier={cap_tier})",
     )
 
     det_risk = RiskDraft(
@@ -571,8 +582,8 @@ def run_governance_protocol(
         max_position_pct=float(max_pos),
         max_loss_per_trade_pct=float(((fact_pack.get("rules") or {}).get("risk") or {}).get("max_risk_per_trade_pct") or 0.35),
         max_daily_loss_pct=float(((fact_pack.get("rules") or {}).get("risk") or {}).get("max_daily_loss_pct") or 1.5),
-        required_constraints=dict((fact_pack.get("rules") or {}).get("cost_guard") or {}),
-        notes="deterministic: 룰 상한을 그대로 적용",
+        required_constraints={**dict((fact_pack.get("rules") or {}).get("cost_guard") or {}), "capital_max_position_pct": float(max_pos)},
+        notes=f"deterministic: 룰 상한 + 자본 티어(capital_tier={cap_tier})를 적용",
     )
 
     det_ops = OpsDraft(
@@ -629,6 +640,7 @@ def run_governance_protocol(
         conflict_resolution=[
             "하드 룰: ops/risk veto가 있으면 BUY 차단",
             "비중: quant 초안과 risk 상한을 비교해 낮은 값을 채택",
+            f"자본 티어 상한 적용: tier={cap_tier}, max_target={default_target:.1f}%, max_pos={max_pos:.1f}%",
         ],
         notes="deterministic 최종: round 결과를 보수적으로 합성",
     )
@@ -1134,10 +1146,22 @@ def run_governance_meeting_now(
             quote_ccy = "KRW"
         cash = repo.fetch_cash_balance(currency=quote_ccy)
         pos = repo.fetch_position(best_symbol)
+        pos_value = (float(pos.qty) * float((evaluated[0] if evaluated else {}).get("snapshot", {}).get("mid_price") or 0.0)) if pos else 0.0
+        equity = float(cash) + float(pos_value)
+        capital_profile = resolve_capital_policy(
+            rules_raw=rules_raw,
+            equity_krw=equity,
+            default_target_position_pct=float(((rules_raw.get("governance") or {}).get("default_target_position_pct") or 10.0)),
+            max_position_pct_per_symbol=float(rules.risk.max_position_pct_per_symbol),
+            cooldown_minutes_after_trigger=int(rules.risk.cooldown_minutes_after_trigger),
+        )
         account_state = {
             "cash_krw": float(cash),
+            "equity_krw": float(equity),
+            "position_value_krw": float(pos_value),
             "current_qty": float(pos.qty) if pos else 0.0,
             "avg_entry_price": float(pos.avg_entry_price) if (pos and pos.avg_entry_price) else None,
+            "capital_profile": capital_profile.as_dict(),
         }
 
         fact_pack = _default_fact_pack(
@@ -1161,6 +1185,7 @@ def run_governance_meeting_now(
         }
         fact_pack["valid_from_kst"] = vf_kst.isoformat()
         fact_pack["valid_to_kst"] = vt_kst.isoformat()
+        fact_pack["capital_profile"] = capital_profile.as_dict()
 
         def _confidence_for(message_type: str) -> float | None:
             m = str(message_type or "")

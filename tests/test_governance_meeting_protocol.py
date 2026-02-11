@@ -56,3 +56,19 @@ def test_governance_protocol_enforces_flat_on_recon_fail(monkeypatch):
     assert float(out.final_plan.target_position_pct) == 0.0
     assert out.final_plan.allowed_actions.buy is False
 
+
+def test_governance_protocol_applies_capital_profile_cap(monkeypatch):
+    monkeypatch.setenv("GOVERNANCE_LLM_ENABLED", "0")
+    fact_pack = _base_fact_pack(recon_status="OK", paused=False)
+    fact_pack["capital_profile"] = {
+        "enabled": True,
+        "tier_name": "seed_small",
+        "equity_krw": 1_000_000.0,
+        "max_target_position_pct": 4.0,
+        "max_position_pct_per_symbol": 10.0,
+        "cooldown_minutes_after_trigger": 240,
+    }
+    out = run_governance_protocol(fact_pack=fact_pack, rules_raw={})
+
+    assert float(out.final_plan.target_position_pct) <= 4.0
+    assert int(out.final_plan.cooldown_minutes) >= 240
