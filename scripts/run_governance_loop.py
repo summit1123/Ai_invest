@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+
+load_dotenv()
+
 from ai_invest.meetings.governance_meeting import maybe_run_scheduled_governance_meeting  # noqa: E402
 from ai_invest.notifications.service import NotificationService  # noqa: E402
 from ai_invest.storage.postgres import PostgresRepo  # noqa: E402
@@ -25,7 +28,6 @@ def main() -> int:
     p.add_argument("--force", action="store_true", help="Ignore schedule window and create a meeting/plan now.")
     args = p.parse_args()
 
-    load_dotenv()
     rules_raw: dict[str, Any] = yaml.safe_load(Path("rules.yaml").read_text(encoding="utf-8"))
 
     repo = PostgresRepo()
@@ -50,4 +52,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

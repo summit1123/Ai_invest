@@ -9,6 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+
+load_dotenv()
+
 from ai_invest.runtime.paper_loop import run_paper_loop  # noqa: E402
 
 
@@ -18,7 +21,6 @@ def main() -> int:
     p.add_argument("--sleep-sec", type=float, default=0.0)
     args = p.parse_args()
 
-    load_dotenv()
     run_paper_loop(cycles=args.cycles, sleep_sec=args.sleep_sec)
     return 0
 

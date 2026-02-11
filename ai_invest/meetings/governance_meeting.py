@@ -1682,7 +1682,11 @@ def run_governance_meeting_now(
             final_symbol=outputs.final_plan.symbol,
         )
         activation_passed = bool(activation_gate.get("passed"))
-        activation_status = "ACTIVE" if activation_passed else "PROPOSED"
+        hold_only_plan = (
+            float(outputs.final_plan.target_position_pct) <= 0.0
+            or (not bool(outputs.final_plan.allowed_actions.buy))
+        )
+        activation_status = "ACTIVE" if activation_passed else ("ACTIVE_HOLD" if hold_only_plan else "PROPOSED")
 
         gate_checks = [x for x in list(activation_gate.get("checks") or []) if isinstance(x, Mapping)]
         gate_fail_lines = [
@@ -1816,8 +1820,10 @@ def run_governance_meeting_now(
 
         # Trade plan activation gate:
         # - pass: TRADE_PLAN_SET (runtime consumes)
-        # - fail: TRADE_PLAN_PROPOSED only (fail-closed)
-        plan_event_type = "TRADE_PLAN_SET" if activation_passed else "TRADE_PLAN_PROPOSED"
+        # - fail + hold-only: TRADE_PLAN_SET (safe no-buy plan can be applied)
+        # - fail + non-hold: TRADE_PLAN_PROPOSED only (fail-closed)
+        plan_set_allowed = bool(activation_passed or hold_only_plan)
+        plan_event_type = "TRADE_PLAN_SET" if plan_set_allowed else "TRADE_PLAN_PROPOSED"
         trade_plan_event_id = uuid.uuid4()
         repo.insert_event(
             DbEvent(
@@ -1831,7 +1837,7 @@ def run_governance_meeting_now(
                 payload=plan_payload,
             )
         )
-        if activation_passed:
+        if plan_set_allowed:
             try:
                 rationale_lines = [str(x).strip() for x in list(outputs.final_plan.rationale or []) if str(x).strip()]
                 notifier.notify_trade_plan_set(
@@ -1883,7 +1889,7 @@ def run_governance_meeting_now(
             DbEvent(
                 event_id=policy_event_id,
                 ts=ended_at,
-                event_type="GOVERNANCE_POLICY_SET" if activation_passed else "GOVERNANCE_POLICY_PROPOSED",
+                event_type="GOVERNANCE_POLICY_SET" if plan_set_allowed else "GOVERNANCE_POLICY_PROPOSED",
                 entity_type="policies",
                 entity_id=f"v{policy_version}",
                 run_id=None,

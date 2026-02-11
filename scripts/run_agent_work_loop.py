@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+
+load_dotenv()
+
 from ai_invest.storage.postgres import PostgresRepo  # noqa: E402
 from ai_invest.work.agent_work_loop import run_agent_work_cycle  # noqa: E402
 
@@ -44,7 +47,6 @@ def main() -> int:
     p.add_argument("--meeting-context", type=str, default="", help="optional context tag (e.g. slot_key)")
     args = p.parse_args()
 
-    load_dotenv()
     rules_raw: dict[str, Any] = yaml.safe_load(Path("rules.yaml").read_text(encoding="utf-8"))
     repo = PostgresRepo()
     agent_map = {
