@@ -148,10 +148,10 @@ def _weekly_trade_metrics(repo: PostgresRepo, *, ws: date, we: date) -> tuple[fl
     return pnl, win_rate, total
 
 
-def send_daily_review(*, repo: PostgresRepo, notifier: NotificationService, now_kst: datetime) -> bool:
+def send_daily_review(*, repo: PostgresRepo, notifier: NotificationService, now_kst: datetime, force: bool = False) -> bool:
     day = now_kst.date().isoformat()
     latest_payload = _latest_event_payload(repo, event_type="DAILY_REVIEW_SENT")
-    if str(latest_payload.get("day") or "") == day:
+    if (not force) and str(latest_payload.get("day") or "") == day:
         return False
 
     row = None
@@ -194,13 +194,13 @@ def send_daily_review(*, repo: PostgresRepo, notifier: NotificationService, now_
     return True
 
 
-def send_weekly_review(*, repo: PostgresRepo, notifier: NotificationService, now_kst: datetime) -> bool:
+def send_weekly_review(*, repo: PostgresRepo, notifier: NotificationService, now_kst: datetime, force: bool = False) -> bool:
     ws, we = _week_window(now_kst.date())
     week_start = ws.isoformat()
     week_label = f"{week_start}~{we.isoformat()}"
 
     latest_payload = _latest_event_payload(repo, event_type="WEEKLY_REVIEW_SENT")
-    if str(latest_payload.get("week_start") or "") == week_start:
+    if (not force) and str(latest_payload.get("week_start") or "") == week_start:
         return False
 
     weekly_pnl, win_rate, total = _weekly_trade_metrics(repo, ws=ws, we=we)
@@ -239,7 +239,14 @@ def send_weekly_review(*, repo: PostgresRepo, notifier: NotificationService, now
     return True
 
 
-def run_once(*, repo: PostgresRepo, notifier: NotificationService, rules_raw: dict[str, Any]) -> dict[str, bool]:
+def run_once(
+    *,
+    repo: PostgresRepo,
+    notifier: NotificationService,
+    rules_raw: dict[str, Any],
+    force_daily: bool = False,
+    force_weekly: bool = False,
+) -> dict[str, bool]:
     now = _now_kst()
     reporting = (rules_raw.get("reporting") or {}) if isinstance(rules_raw, dict) else {}
 
@@ -251,12 +258,12 @@ def run_once(*, repo: PostgresRepo, notifier: NotificationService, rules_raw: di
     weekly_time = str(reporting.get("weekly_review_time_kst") or "21:00")
 
     sent_daily = False
-    if should_send_daily_review(
+    if force_daily or should_send_daily_review(
         now_kst=now,
         daily_time_kst=daily_time,
         latest_sent_day=str(latest_daily.get("day") or "") or None,
     ):
-        sent_daily = send_daily_review(repo=repo, notifier=notifier, now_kst=now)
+        sent_daily = send_daily_review(repo=repo, notifier=notifier, now_kst=now, force=bool(force_daily))
 
     do_weekly, _ws, _we = should_send_weekly_review(
         now_kst=now,
@@ -264,7 +271,7 @@ def run_once(*, repo: PostgresRepo, notifier: NotificationService, rules_raw: di
         weekly_time_kst=weekly_time,
         latest_sent_week_start=str(latest_weekly.get("week_start") or "") or None,
     )
-    sent_weekly = send_weekly_review(repo=repo, notifier=notifier, now_kst=now) if do_weekly else False
+    sent_weekly = send_weekly_review(repo=repo, notifier=notifier, now_kst=now, force=bool(force_weekly)) if (force_weekly or do_weekly) else False
 
     return {"daily": bool(sent_daily), "weekly": bool(sent_weekly)}
 
@@ -273,6 +280,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Run review loop (daily/weekly report notifications).")
     p.add_argument("--sleep-sec", type=float, default=60.0)
     p.add_argument("--once", action="store_true")
+    p.add_argument("--force-daily", action="store_true", help="send daily review regardless of schedule")
+    p.add_argument("--force-weekly", action="store_true", help="send weekly review regardless of schedule")
     args = p.parse_args()
 
     load_dotenv()
@@ -281,7 +290,13 @@ def main() -> int:
     notifier = NotificationService(repo)
 
     if args.once:
-        out = run_once(repo=repo, notifier=notifier, rules_raw=rules_raw)
+        out = run_once(
+            repo=repo,
+            notifier=notifier,
+            rules_raw=rules_raw,
+            force_daily=bool(args.force_daily),
+            force_weekly=bool(args.force_weekly),
+        )
         print(f"[완료] review once: daily={out['daily']}, weekly={out['weekly']}")
         return 0
 
