@@ -1087,6 +1087,35 @@ class PostgresRepo:
             )
         return out
 
+    def fetch_latest_agent_daily_report(self, *, agent_name: str) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select report_id, report_date, agent_name, team_scope, title, summary, findings, risks, action_items, created_at
+                from agent_daily_reports
+                where agent_name=%s
+                order by created_at desc
+                limit 1
+                """,
+                (str(agent_name),),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        report_id, report_date, agent_name2, team_scope, title, summary, findings, risks, action_items, created_at = row
+        return {
+            "report_id": str(report_id),
+            "report_date": str(report_date),
+            "agent_name": agent_name2,
+            "team_scope": team_scope,
+            "title": title,
+            "summary": summary,
+            "findings": findings,
+            "risks": risks,
+            "action_items": action_items,
+            "created_at": created_at,
+        }
+
     def insert_strategy_review(self, review: DbStrategyReview) -> None:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
