@@ -15,6 +15,7 @@ import { RoomsPage } from './pages/RoomsPage'
 import { MeetingsPage } from './pages/MeetingsPage'
 import { MeetingDetailPage } from './pages/MeetingDetailPage'
 import { MeetingRoomPage } from './pages/MeetingRoomPage'
+import { PreworkPage } from './pages/PreworkPage'
 
 function NavItem(props: { to: string; label: string; hint: string }) {
   return (
@@ -61,6 +62,7 @@ export default function App() {
         </div>
         <nav className="navList">
           <NavItem to="/rooms" label="채널" hint="방/채널" />
+          <NavItem to="/prework" label="사전업무" hint="제출상태" />
           <NavItem to="/meeting-room" label="회의실" hint="라이브" />
           <NavItem to="/meetings" label="회의" hint="로그" />
         </nav>
@@ -86,6 +88,7 @@ export default function App() {
           <Route path="/review/weekly" element={<WeeklyReviewPage />} />
           <Route path="/finance" element={<FinancePage />} />
           <Route path="/rooms" element={<RoomsPage />} />
+          <Route path="/prework" element={<PreworkPage />} />
           <Route path="/meeting-room" element={<MeetingRoomPage />} />
           <Route path="/meetings" element={<MeetingsPage />} />
           <Route path="/meetings/:meetingId" element={<MeetingDetailPage />} />

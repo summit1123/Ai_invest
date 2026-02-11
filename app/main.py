@@ -18,6 +18,7 @@ from ai_invest.config.rules_loader import load_rules
 from ai_invest.meetings.governance_meeting import run_governance_meeting_now
 from ai_invest.notifications.service import NotificationService
 from ai_invest.storage.postgres import PostgresRepo
+from ai_invest.work.agent_work_loop import collect_latest_work_reports
 
 
 def utc_now_iso() -> str:
@@ -174,6 +175,22 @@ def agent_opinions(
 ) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok({"items": repo.fetch_agent_opinions(limit=limit, symbol=symbol, agent_name=agent_name)})
+
+
+@app.get("/api/v1/ui/work-reports/latest", tags=["에이전트"], summary="사전업무 리포트 최신 상태")
+def work_reports_latest(
+    max_age_minutes: int | None = Query(None, ge=1, le=24 * 60, description="리포트 최대 허용 나이(분), 비우면 rules 사용"),
+) -> dict[str, Any]:
+    repo = PostgresRepo()
+    rules_raw = yaml.safe_load(Path("rules.yaml").read_text(encoding="utf-8"))
+    default_age = int(((rules_raw.get("governance") or {}).get("prework_max_age_min") or 360) if isinstance(rules_raw, Mapping) else 360)
+    age = int(max_age_minutes if max_age_minutes is not None else default_age)
+    data = collect_latest_work_reports(
+        repo=repo,
+        agent_names=["research_agent", "quant_strategist", "risk_manager", "ops_manager"],
+        max_age_minutes=age,
+    )
+    return ok(data)
 
 
 @app.get("/api/v1/ui/meetings", tags=["회의"], summary="회의 세션 목록")
