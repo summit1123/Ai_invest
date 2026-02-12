@@ -115,6 +115,8 @@ governance:
   # 정책/플랜 활성화 게이트: 사전검증 미통과 시 ACTIVE 반영 금지(FAIL-CLOSED)
   activation_gate:
     enabled: true
+    # LIVE 분기 준비는 하되 기본은 비활성(현재는 PAPER/HOLD 자동운용)
+    live_execution_enabled: false
     require_symbol_match: true
     min_backtest_trades: 3
     min_win_rate_pct: 40.0

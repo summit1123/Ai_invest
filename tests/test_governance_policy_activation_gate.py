@@ -36,6 +36,7 @@ def test_policy_activation_gate_passes_when_thresholds_met():
     assert out["enabled"] is True
     assert out["passed"] is True
     assert out["reason_code"] == "POLICY_GATE_PASS"
+    assert out["decision"] == "LIVE"
 
 
 def test_policy_activation_gate_blocks_when_backtest_missing():
@@ -47,6 +48,7 @@ def test_policy_activation_gate_blocks_when_backtest_missing():
     assert out["enabled"] is True
     assert out["passed"] is False
     assert out["reason_code"] == "POLICY_GATE_BACKTEST_MISSING"
+    assert out["decision"] == "PAPER"
 
 
 def test_policy_activation_gate_blocks_when_score_below_threshold():
@@ -60,6 +62,7 @@ def test_policy_activation_gate_blocks_when_score_below_threshold():
     assert out["enabled"] is True
     assert out["passed"] is False
     assert out["reason_code"] == "POLICY_GATE_BLOCKED"
+    assert out["decision"] == "PAPER"
 
 
 def test_policy_activation_gate_returns_insufficient_data_in_paper_mode():
@@ -78,6 +81,7 @@ def test_policy_activation_gate_returns_insufficient_data_in_paper_mode():
     assert out["passed"] is False
     assert out["reason_code"] == "POLICY_GATE_INSUFFICIENT_DATA"
     assert out["paper_data_collection_mode"] is True
+    assert out["decision"] == "PAPER"
 
 
 def test_policy_activation_gate_relaxed_or_passes_in_paper_mode():
@@ -109,3 +113,4 @@ def test_policy_activation_gate_relaxed_or_passes_in_paper_mode():
     assert out["enabled"] is True
     assert out["passed"] is True
     assert out["reason_code"] == "POLICY_GATE_PASS"
+    assert out["decision"] == "LIVE"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -376,6 +377,76 @@ class FinalTradePlan(BaseModel):
     notes: str = Field(..., max_length=1200)
 
 
+class PlanIntent(BaseModel):
+    mode: str = Field("hold", pattern="^(accumulate|reduce|hold|market_neutral)$")
+    direction_bias: str = Field("long_only", pattern="^(long_only|short_only|both)$")
+    time_horizon: str = Field("intraday", pattern="^(intraday|1d|swing)$")
+
+
+class PositionPolicyRange(BaseModel):
+    target_position_pct_range: tuple[float, float] = Field(default=(0.0, 0.0))
+    rebalance_band_pct_range: tuple[float, float] = Field(default=(1.0, 2.0))
+    cooldown_minutes_range: tuple[int, int] = Field(default=(30, 120))
+    priority: str = Field("risk_sensitive", pattern="^(cost_sensitive|signal_sensitive|risk_sensitive)$")
+
+
+class PlanConfidence(BaseModel):
+    data_sufficiency: str = Field("low", pattern="^(low|medium|high)$")
+    backtest_trades: int = 0
+    backtest_window: str = "500 bars"
+    paper_only_recommended: bool = True
+
+
+class FinalTradePlanV2(BaseModel):
+    schema_version: str = Field(default="FinalTradePlanV2@2026-02-12")
+    symbol: str = Field(..., max_length=20)
+    intent: PlanIntent = Field(default_factory=PlanIntent)
+    position_policy: PositionPolicyRange = Field(default_factory=PositionPolicyRange)
+    allowed_actions: AllowedActions = Field(default_factory=AllowedActions)
+    valid_from_kst: str = Field(..., max_length=40)
+    valid_to_kst: str = Field(..., max_length=40)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    rationale: dict[str, str] = Field(default_factory=dict)
+    evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    conflict_resolution: list[dict[str, Any]] = Field(default_factory=list)
+    notes: str = Field(..., max_length=1200)
+    confidence: PlanConfidence = Field(default_factory=PlanConfidence)
+
+
+class ExecutionFinalNumbers(BaseModel):
+    target_position_pct: float = Field(0.0, ge=0.0, le=100.0)
+    rebalance_band_pct: float = Field(1.0, ge=0.0, le=50.0)
+    cooldown_minutes: int = Field(30, ge=0, le=10080)
+
+
+class ExecutionPlan(BaseModel):
+    schema_version: str = Field(default="ExecutionPlan@2026-02-12")
+    symbol: str = Field(..., max_length=20)
+    final_numbers: ExecutionFinalNumbers = Field(default_factory=ExecutionFinalNumbers)
+    gates: dict[str, Any] = Field(default_factory=dict)
+    sizing_rule: str = "min(max_target, signal_strength_scaled)"
+    rebalance_rule: str = "rebalance if abs(curr-target) > band"
+    execution_style: str = Field("post_only", pattern="^(post_only|ioc|limit_mid|market_last_resort)$")
+
+
+class TradePlanSetEnvelope(BaseModel):
+    schema_version: str = Field(default="TradePlanSet@2026-02-12")
+    slot_key: str
+    meeting_id: str
+    plan_version: str
+    inputs_hash: str
+    created_at_kst: str
+    activation_status: str
+    activation_gate: dict[str, Any]
+    final_trade_plan: dict[str, Any]
+    final_trade_plan_v2: dict[str, Any]
+    execution_plan: dict[str, Any]
+    allocator_result: dict[str, Any]
+    cost_model: dict[str, Any]
+    paper_live_policy: dict[str, Any]
+
+
 @dataclass(frozen=True)
 class AgentRunMeta:
     used_llm: bool
@@ -469,6 +540,248 @@ def _extract_quant_backtest_for_symbol(*, fact_pack: Mapping[str, Any], symbol: 
     return rows[0]
 
 
+def _stable_hash(obj: Any) -> str:
+    try:
+        raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    except Exception:
+        raw = str(obj).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _bounded_pair(lo: float, hi: float, *, min_v: float, max_v: float) -> tuple[float, float]:
+    lo2 = max(float(min_v), min(float(max_v), float(lo)))
+    hi2 = max(float(min_v), min(float(max_v), float(hi)))
+    if lo2 > hi2:
+        lo2, hi2 = hi2, lo2
+    return float(lo2), float(hi2)
+
+
+def _bounded_pair_int(lo: int, hi: int, *, min_v: int, max_v: int) -> tuple[int, int]:
+    lo2 = max(int(min_v), min(int(max_v), int(lo)))
+    hi2 = max(int(min_v), min(int(max_v), int(hi)))
+    if lo2 > hi2:
+        lo2, hi2 = hi2, lo2
+    return int(lo2), int(hi2)
+
+
+def _activation_decision_from_gate(
+    *,
+    activation_gate: Mapping[str, Any],
+    hard_plan_block: bool,
+) -> str:
+    if bool(hard_plan_block):
+        return "HOLD"
+    reason = str(activation_gate.get("reason_code") or "")
+    if reason == "POLICY_GATE_PASS":
+        return "LIVE"
+    if reason in {"POLICY_GATE_INSUFFICIENT_DATA", "POLICY_GATE_BLOCKED", "POLICY_GATE_BACKTEST_MISSING"}:
+        return "PAPER"
+    return "HOLD"
+
+
+def _execution_style_from_rules(*, rules_raw: Mapping[str, Any]) -> str:
+    ex = (rules_raw.get("execution") or {}) if isinstance(rules_raw, Mapping) else {}
+    style = str(ex.get("order_style") or "").strip().lower()
+    if "post_only" in style:
+        return "post_only"
+    if "ioc" in style:
+        return "ioc"
+    if "mid" in style:
+        return "limit_mid"
+    if bool(ex.get("fallback_to_market")):
+        return "market_last_resort"
+    return "post_only"
+
+
+def _to_final_trade_plan_v2(
+    *,
+    final_plan: FinalTradePlan,
+    rules_raw: Mapping[str, Any],
+    fact_pack: Mapping[str, Any],
+    activation_gate: Mapping[str, Any],
+) -> FinalTradePlanV2:
+    target = float(final_plan.target_position_pct)
+    if bool(final_plan.allowed_actions.buy):
+        tgt_lo, tgt_hi = _bounded_pair(target * 0.7, max(target, target * 1.3), min_v=0.0, max_v=100.0)
+    else:
+        tgt_lo, tgt_hi = (0.0, 0.0)
+    rb = float(final_plan.rebalance_band_pct)
+    rb_lo, rb_hi = _bounded_pair(rb * 0.7, rb * 1.3, min_v=0.0, max_v=50.0)
+    cd = int(final_plan.cooldown_minutes)
+    cd_lo, cd_hi = _bounded_pair_int(int(cd * 0.5), int(cd * 1.5), min_v=0, max_v=10080)
+
+    side = str(((rules_raw.get("universe") or {}).get("trade_side") or "long_only")).strip().lower()
+    direction_bias = "long_only" if side in {"long_only", "long"} else ("short_only" if side in {"short_only", "short"} else "both")
+    if not bool(final_plan.allowed_actions.buy) and bool(final_plan.allowed_actions.sell):
+        mode = "reduce"
+    elif float(target) <= 0.0:
+        mode = "hold"
+    elif bool(final_plan.allowed_actions.buy):
+        mode = "accumulate"
+    else:
+        mode = "hold"
+
+    max_spread = _as_float(
+        (final_plan.constraints or {}).get("max_spread_bps"),
+        default=_as_float(
+            (final_plan.constraints or {}).get("max_spread_bps_entry"),
+            default=_as_float(((rules_raw.get("cost_guard") or {}).get("max_spread_bps_entry")), default=8.0),
+        ),
+    )
+    max_atr = _as_float(
+        (final_plan.constraints or {}).get("max_atr_pct"),
+        default=_as_float(((rules_raw.get("regime") or {}).get("volatility_block_atr_pct")), default=2.5),
+    )
+    min_edge = _as_float(
+        (final_plan.constraints or {}).get("min_expected_edge_bps"),
+        default=_as_float(((rules_raw.get("cost_guard") or {}).get("min_expected_edge_bps")), default=28.0),
+    )
+    uv = (rules_raw.get("universe") or {}) if isinstance(rules_raw, Mapping) else {}
+    dyn = (uv.get("dynamic") or {}) if isinstance(uv, Mapping) else {}
+    if bool(dyn.get("enabled")) and list(dyn.get("include_symbols") or []):
+        universe_mode = "hybrid"
+    elif bool(dyn.get("enabled")):
+        universe_mode = "dynamic_top_turnover"
+    else:
+        universe_mode = "fixed_allowed_symbols"
+    min_turnover = _as_float(dyn.get("min_24h_turnover_krw"), default=0.0)
+
+    prio = "signal_sensitive"
+    if not bool(final_plan.allowed_actions.buy):
+        prio = "risk_sensitive"
+    elif float(max_spread) <= 3.0:
+        prio = "cost_sensitive"
+
+    bt = _extract_quant_backtest_for_symbol(fact_pack=fact_pack, symbol=str(final_plan.symbol))
+    bt_trades = int(_as_float((bt or {}).get("trades"), default=0.0))
+    suff = "high" if bt_trades >= 30 else ("medium" if bt_trades >= 10 else "low")
+    decision = str(activation_gate.get("decision") or "PAPER").upper()
+    paper_only_recommended = decision != "LIVE"
+
+    refs: list[dict[str, Any]] = []
+    for raw_ref in list(final_plan.evidence_refs or [])[:20]:
+        ref = str(raw_ref or "").strip()
+        if not ref:
+            continue
+        ref_type = "link" if ref.startswith("http") else "note"
+        refs.append({"ref_type": ref_type, "ref_id": ref})
+
+    conflicts: list[dict[str, Any]] = []
+    for idx, raw_conflict in enumerate(list(final_plan.conflict_resolution or [])[:20], start=1):
+        c = str(raw_conflict or "").strip()
+        if not c:
+            continue
+        conflicts.append({"topic": f"conflict_{idx}", "positions": [], "resolution": c})
+
+    return FinalTradePlanV2(
+        symbol=str(final_plan.symbol),
+        intent=PlanIntent(mode=mode, direction_bias=direction_bias, time_horizon="intraday"),
+        position_policy=PositionPolicyRange(
+            target_position_pct_range=(tgt_lo, tgt_hi),
+            rebalance_band_pct_range=(rb_lo, rb_hi),
+            cooldown_minutes_range=(cd_lo, cd_hi),
+            priority=prio,
+        ),
+        allowed_actions=final_plan.allowed_actions,
+        valid_from_kst=str(final_plan.valid_from_kst),
+        valid_to_kst=str(final_plan.valid_to_kst),
+        constraints={
+            "max_spread_bps": float(max_spread),
+            "min_expected_edge_bps": float(min_edge),
+            "max_atr_pct": float(max_atr),
+            "min_liquidity_turnover_24h_krw": float(min_turnover),
+            "universe_mode": universe_mode,
+            "allow_symbols_override": [],
+        },
+        rationale=dict(final_plan.rationale or {}),
+        evidence_refs=refs,
+        open_questions=list(final_plan.open_questions or []),
+        conflict_resolution=conflicts,
+        notes=str(final_plan.notes or ""),
+        confidence=PlanConfidence(
+            data_sufficiency=suff,
+            backtest_trades=bt_trades,
+            backtest_window="500 bars",
+            paper_only_recommended=bool(paper_only_recommended),
+        ),
+    )
+
+
+def _build_execution_plan(
+    *,
+    final_plan: FinalTradePlan,
+    plan_v2: FinalTradePlanV2,
+    rules: RulesConfig,
+    rules_raw: Mapping[str, Any],
+    capital_profile: Mapping[str, Any],
+    risk_max_position_pct: float,
+    activation_decision: str,
+    live_execution_enabled: bool,
+    max_trades_per_day: int = 6,
+) -> ExecutionPlan:
+    rng = plan_v2.position_policy
+    tgt_lo, tgt_hi = _bounded_pair(
+        float(rng.target_position_pct_range[0]),
+        float(rng.target_position_pct_range[1]),
+        min_v=0.0,
+        max_v=100.0,
+    )
+    rb_lo, rb_hi = _bounded_pair(
+        float(rng.rebalance_band_pct_range[0]),
+        float(rng.rebalance_band_pct_range[1]),
+        min_v=0.0,
+        max_v=50.0,
+    )
+    cd_lo, cd_hi = _bounded_pair_int(
+        int(rng.cooldown_minutes_range[0]),
+        int(rng.cooldown_minutes_range[1]),
+        min_v=0,
+        max_v=10080,
+    )
+
+    capital_cap = _as_float(capital_profile.get("max_target_position_pct"), default=100.0)
+    hard_cap = min(float(capital_cap), float(rules.risk.max_position_pct_per_symbol), float(risk_max_position_pct))
+    chosen_target = min(float(tgt_hi), float(hard_cap))
+    chosen_target = max(0.0, float(chosen_target))
+    if chosen_target < float(tgt_lo) and float(tgt_lo) <= float(hard_cap):
+        chosen_target = float(tgt_lo)
+    if str(activation_decision).upper() == "HOLD" or not bool(final_plan.allowed_actions.buy):
+        chosen_target = 0.0
+
+    chosen_rebalance = min(max(float(final_plan.rebalance_band_pct), float(rb_lo)), float(rb_hi))
+    chosen_cooldown = min(max(int(final_plan.cooldown_minutes), int(cd_lo)), int(cd_hi))
+
+    max_spread = _as_float(
+        (plan_v2.constraints or {}).get("max_spread_bps"),
+        default=float(rules.cost_guard.max_spread_bps_entry),
+    )
+    min_edge = _as_float(
+        (plan_v2.constraints or {}).get("min_expected_edge_bps"),
+        default=float(rules.cost_guard.min_expected_edge_bps),
+    )
+    decision = str(activation_decision or "PAPER").upper()
+    return ExecutionPlan(
+        symbol=str(final_plan.symbol),
+        final_numbers=ExecutionFinalNumbers(
+            target_position_pct=float(chosen_target),
+            rebalance_band_pct=float(chosen_rebalance),
+            cooldown_minutes=int(chosen_cooldown),
+        ),
+        gates={
+            "spread_bps_max": float(max_spread),
+            "min_edge_bps": float(min_edge),
+            "max_daily_loss_pct": float(rules.risk.max_daily_loss_pct),
+            "max_trades_per_day": int(max(0, int(max_trades_per_day))),
+            "regime_trade_allowed": True,
+            "paper_only": bool(decision != "LIVE" or not live_execution_enabled),
+            "activation_decision": decision,
+        },
+        sizing_rule="min(plan_cap_target, signal_target)",
+        rebalance_rule="rebalance if abs(curr-target) > band",
+        execution_style=_execution_style_from_rules(rules_raw=rules_raw),
+    )
+
+
 def evaluate_policy_activation_gate(
     *,
     rules_raw: Mapping[str, Any],
@@ -491,6 +804,7 @@ def evaluate_policy_activation_gate(
             "checks": [{"name": "gate_disabled", "passed": True, "actual": "disabled", "required": "disabled"}],
             "selected_backtest": None,
             "reason_code": "POLICY_GATE_DISABLED",
+            "decision": "PAPER",
         }
 
     min_trades = int(_as_float(gate_cfg.get("min_backtest_trades"), default=3.0))
@@ -516,6 +830,7 @@ def evaluate_policy_activation_gate(
             "checks": [{"name": "backtest_presence", "passed": False, "actual": "missing", "required": "present"}],
             "selected_backtest": None,
             "reason_code": "POLICY_GATE_BACKTEST_MISSING",
+            "decision": "PAPER",
         }
 
     bt_symbol = str(bt.get("symbol") or "").strip().upper()
@@ -554,6 +869,7 @@ def evaluate_policy_activation_gate(
             "selected_backtest": dict(bt),
             "reason_code": "POLICY_GATE_INSUFFICIENT_DATA",
             "paper_data_collection_mode": True,
+            "decision": "PAPER",
         }
 
     checks = [
@@ -628,6 +944,7 @@ def evaluate_policy_activation_gate(
         "selected_backtest": dict(bt),
         "reason_code": "POLICY_GATE_PASS" if passed else "POLICY_GATE_BLOCKED",
         "paper_data_collection_mode": bool(is_paper and data_collection_enabled),
+        "decision": "LIVE" if bool(passed) else "PAPER",
     }
 
 
@@ -1772,8 +2089,12 @@ def run_governance_meeting_now(
             fact_pack=fact_pack,
             final_symbol=outputs.final_plan.symbol,
         )
+        activation_gate = dict(activation_gate)
         activation_passed = bool(activation_gate.get("passed"))
         gate_reason_code = str(activation_gate.get("reason_code") or "")
+        gov_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+        gate_cfg = (gov_cfg.get("activation_gate") or {}) if isinstance(gov_cfg, Mapping) else {}
+        live_execution_enabled = bool(gate_cfg.get("live_execution_enabled", False))
         paper_mode_cfg = (rules_raw.get("paper_mode") or {}) if isinstance(rules_raw, Mapping) else {}
         data_collection_cfg = (
             (paper_mode_cfg.get("data_collection") or {}) if isinstance(paper_mode_cfg, Mapping) else {}
@@ -1781,6 +2102,17 @@ def run_governance_meeting_now(
         force_plan_buy_allowed = bool(data_collection_cfg.get("force_plan_buy_allowed", True))
         force_plan_target_pct = float(_as_float(data_collection_cfg.get("force_plan_target_pct"), default=5.0))
         hard_plan_block = bool(outputs.ops.veto) or bool(outputs.risk.veto) or (not bool(outputs.ops.trade_window_allowed))
+        activation_decision = _activation_decision_from_gate(
+            activation_gate=activation_gate,
+            hard_plan_block=hard_plan_block,
+        )
+        activation_decision_effective = str(activation_decision)
+        if str(activation_decision).upper() == "LIVE" and not bool(live_execution_enabled):
+            activation_decision_effective = "PAPER"
+        activation_gate["decision"] = str(activation_decision)
+        activation_gate["decision_effective"] = str(activation_decision_effective)
+        activation_gate["live_execution_enabled"] = bool(live_execution_enabled)
+        activation_gate["hard_plan_block"] = bool(hard_plan_block)
         paper_data_collection_applied = bool(
             activation_gate.get("paper_data_collection_mode")
             and gate_reason_code == "POLICY_GATE_INSUFFICIENT_DATA"
@@ -1808,12 +2140,18 @@ def run_governance_meeting_now(
             activation_gate["paper_data_collection_target_pct"] = float(resolved_target_position_pct)
             activation_gate["paper_data_collection_buy_allowed"] = bool(resolved_allowed_actions["buy"])
 
+        if str(activation_decision_effective).upper() == "HOLD":
+            resolved_allowed_actions["buy"] = False
+            resolved_allowed_actions["sell"] = False
+            resolved_target_position_pct = 0.0
+
         hold_only_plan = (float(resolved_target_position_pct) <= 0.0) or (not bool(resolved_allowed_actions.get("buy")))
-        activation_status = (
-            "ACTIVE"
-            if activation_passed
-            else ("ACTIVE_DATA_COLLECTION" if paper_data_collection_applied else ("ACTIVE_HOLD" if hold_only_plan else "PROPOSED"))
-        )
+        if str(activation_decision_effective).upper() == "HOLD":
+            activation_status = "ACTIVE_HOLD"
+        elif str(activation_decision_effective).upper() == "PAPER":
+            activation_status = "ACTIVE_DATA_COLLECTION" if paper_data_collection_applied else "ACTIVE_PAPER"
+        else:
+            activation_status = "ACTIVE"
 
         gate_checks = [x for x in list(activation_gate.get("checks") or []) if isinstance(x, Mapping)]
         gate_fail_lines = [
@@ -1823,7 +2161,8 @@ def run_governance_meeting_now(
         ]
         gate_msg = (
             f"정책 활성화 게이트: {activation_status} "
-            f"(reason={activation_gate.get('reason_code')}, symbol={outputs.final_plan.symbol})"
+            f"(decision={activation_gate.get('decision')}, effective={activation_gate.get('decision_effective')}, "
+            f"reason={activation_gate.get('reason_code')}, symbol={outputs.final_plan.symbol})"
         )
         if gate_fail_lines:
             gate_msg += "\n" + "\n".join(gate_fail_lines[:8])
@@ -1875,24 +2214,108 @@ def run_governance_meeting_now(
                 ),
                 1200,
             )
+        resolved_final_plan = outputs.final_plan.model_copy(
+            update={
+                "target_position_pct": float(resolved_target_position_pct),
+                "allowed_actions": AllowedActions(
+                    buy=bool(resolved_allowed_actions.get("buy")),
+                    sell=bool(resolved_allowed_actions.get("sell")),
+                ),
+            }
+        )
+        final_plan_v2 = _to_final_trade_plan_v2(
+            final_plan=resolved_final_plan,
+            rules_raw=rules_raw,
+            fact_pack=fact_pack,
+            activation_gate=activation_gate,
+        )
+        execution_plan = _build_execution_plan(
+            final_plan=resolved_final_plan,
+            plan_v2=final_plan_v2,
+            rules=rules,
+            rules_raw=rules_raw,
+            capital_profile=capital_profile.as_dict(),
+            risk_max_position_pct=float(outputs.risk.max_position_pct),
+            activation_decision=str(activation_decision_effective),
+            live_execution_enabled=bool(live_execution_enabled),
+        )
+        fee_total_bps = float(
+            _as_float(((rules_raw.get("fees") or {}).get("fallback_bid_fee_bps")), default=5.0)
+            + _as_float(((rules_raw.get("fees") or {}).get("fallback_ask_fee_bps")), default=5.0)
+        )
+        bt_cfg = (rules_raw.get("quant_backtest") or {}) if isinstance(rules_raw, Mapping) else {}
+        cost_model = {
+            "fee_total_bps": float(fee_total_bps),
+            "base_slippage_bps": float(_as_float(bt_cfg.get("base_slippage_bps"), default=1.0)),
+            "spread_penalty_mult": float(_as_float(bt_cfg.get("spread_penalty_mult"), default=0.30)),
+            "low_liquidity_penalty_bps": float(_as_float(bt_cfg.get("low_liquidity_penalty_bps"), default=1.2)),
+        }
+        gate_cfg_raw = (gov_cfg.get("activation_gate") or {}) if isinstance(gov_cfg, Mapping) else {}
+        paper_live_policy = {
+            "live_allowed": bool(str(activation_decision_effective).upper() == "LIVE" and live_execution_enabled),
+            "promotion_rules": [
+                f"min_backtest_trades>={int(_as_float(gate_cfg_raw.get('min_backtest_trades'), default=3.0))}",
+                f"min_win_rate_pct>={float(_as_float(gate_cfg_raw.get('min_win_rate_pct'), default=40.0)):.1f}",
+                f"min_backtest_score>={float(_as_float(gate_cfg_raw.get('min_backtest_score'), default=0.0)):.1f}",
+            ],
+            "demotion_rules": [
+                "ops_veto=true -> HOLD",
+                "risk_veto=true -> HOLD",
+                "reconciliation_status=FAIL -> HOLD",
+                "daily_loss_limit_hit -> HOLD",
+            ],
+        }
+        allocator_result = {
+            "tier_name": str(capital_profile.tier_name),
+            "equity_krw": float(account_state.get("equity_krw") or 0.0),
+            "limits": {
+                "max_target_position_pct": float(capital_profile.max_target_position_pct),
+                "max_position_pct_per_symbol": float(capital_profile.max_position_pct_per_symbol),
+            },
+            "chosen_target_pct": float(execution_plan.final_numbers.target_position_pct),
+            "reason": (
+                f"decision={activation_decision_effective}, "
+                f"cap_target={float(capital_profile.max_target_position_pct):.1f}, "
+                f"risk_max={float(outputs.risk.max_position_pct):.1f}"
+            ),
+        }
+        inputs_hash = _stable_hash(
+            {
+                "slot_key": slot_key,
+                "symbol": str(resolved_final_plan.symbol),
+                "allowed_symbols": list(fact_pack.get("allowed_symbols") or []),
+                "evaluated_top": list(fact_pack.get("evaluated") or [])[:6],
+                "prework_status": dict(fact_pack.get("prework_status") or {}),
+                "activation_checks": gate_checks,
+            }
+        )
         plan_payload = {
             "slot_key": slot_key,
             "meeting_id": str(meeting_id),
-            "symbol": outputs.final_plan.symbol,
-            "target_position_pct": float(resolved_target_position_pct),
-            "valid_from_kst": outputs.final_plan.valid_from_kst,
-            "valid_to_kst": outputs.final_plan.valid_to_kst,
-            "constraints": outputs.final_plan.constraints,
+            "symbol": resolved_final_plan.symbol,
+            "target_position_pct": float(execution_plan.final_numbers.target_position_pct),
+            "valid_from_kst": resolved_final_plan.valid_from_kst,
+            "valid_to_kst": resolved_final_plan.valid_to_kst,
+            "constraints": resolved_final_plan.constraints,
             "notes": plan_notes,
             "allowed_actions": dict(resolved_allowed_actions),
-            "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
-            "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
-            "rationale": outputs.final_plan.rationale,
-            "conflict_resolution": outputs.final_plan.conflict_resolution,
-            "evidence_refs": outputs.final_plan.evidence_refs,
-            "open_questions": outputs.final_plan.open_questions,
+            "rebalance_band_pct": float(execution_plan.final_numbers.rebalance_band_pct),
+            "cooldown_minutes": int(execution_plan.final_numbers.cooldown_minutes),
+            "rationale": resolved_final_plan.rationale,
+            "conflict_resolution": resolved_final_plan.conflict_resolution,
+            "evidence_refs": resolved_final_plan.evidence_refs,
+            "open_questions": resolved_final_plan.open_questions,
             "activation_status": activation_status,
             "activation_gate": activation_gate,
+            "plan_version": "v2.0.0+governance",
+            "inputs_hash": str(inputs_hash),
+            "created_at_kst": _now_kst().isoformat(),
+            "final_trade_plan": resolved_final_plan.model_dump(),
+            "final_trade_plan_v2": final_plan_v2.model_dump(),
+            "execution_plan": execution_plan.model_dump(),
+            "allocator_result": allocator_result,
+            "cost_model": cost_model,
+            "paper_live_policy": paper_live_policy,
         }
 
         repo.update_meeting_session(
@@ -1901,7 +2324,9 @@ def run_governance_meeting_now(
             ended_at=ended_at,
             summary=outputs.secretary_minutes,
             decisions={
-                "trade_plan": outputs.final_plan.model_dump(),
+                "trade_plan": resolved_final_plan.model_dump(),
+                "trade_plan_v2": final_plan_v2.model_dump(),
+                "execution_plan": execution_plan.model_dump(),
                 "plan_payload": plan_payload,
                 "activation_status": activation_status,
                 "activation_gate": activation_gate,
@@ -1964,11 +2389,10 @@ def run_governance_meeting_now(
             pass
 
         # Trade plan activation gate:
-        # - pass: TRADE_PLAN_SET (runtime consumes)
-        # - fail + hold-only: TRADE_PLAN_SET (safe no-buy plan can be applied)
-        # - fail + data collection mode: TRADE_PLAN_SET (paper-only sample accumulation)
-        # - fail + non-hold: TRADE_PLAN_PROPOSED only (fail-closed)
-        plan_set_allowed = bool(activation_passed or hold_only_plan or paper_data_collection_applied)
+        # decision 기반 실행 모드:
+        # - LIVE/PAPER/HOLD 모두 계획은 기록하고 런타임에서 분기한다.
+        # - 알 수 없는 decision일 때만 fail-closed로 PROPOSED 처리.
+        plan_set_allowed = str(activation_decision_effective).upper() in {"LIVE", "PAPER", "HOLD"}
         plan_event_type = "TRADE_PLAN_SET" if plan_set_allowed else "TRADE_PLAN_PROPOSED"
         trade_plan_event_id = uuid.uuid4()
         repo.insert_event(
@@ -1995,9 +2419,9 @@ def run_governance_meeting_now(
                     valid_from_kst=outputs.final_plan.valid_from_kst,
                     valid_to_kst=outputs.final_plan.valid_to_kst,
                     allowed_actions=dict(plan_payload.get("allowed_actions") or {}),
-                    rebalance_band_pct=float(outputs.final_plan.rebalance_band_pct),
-                    cooldown_minutes=int(outputs.final_plan.cooldown_minutes),
-                    constraints=outputs.final_plan.constraints,
+                    rebalance_band_pct=float(plan_payload.get("rebalance_band_pct") or 0.0),
+                    cooldown_minutes=int(_as_float(plan_payload.get("cooldown_minutes"), default=0.0)),
+                    constraints=dict(plan_payload.get("constraints") or {}),
                     rationale_summary=" | ".join(rationale_lines[:3]),
                 )
             except Exception:
