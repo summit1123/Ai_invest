@@ -228,6 +228,32 @@ export type TradePlanPayloadV2 = {
   activation_gate?: {
     decision?: 'LIVE' | 'PAPER' | 'HOLD'
     decision_effective?: 'LIVE' | 'PAPER' | 'HOLD'
+    hold_mode?: 'HOLD_STATIC' | 'HOLD_CONDITIONAL'
+    conditional_activation?: {
+      enabled?: boolean
+      auto_promote_to?: 'PAPER'
+      conditions?: {
+        min_alpha?: number
+        max_spread_bps?: number
+        min_vol_z?: number
+        min_atr_pct?: number
+        sustain_seconds?: number
+        min_pass_conditions?: number
+      }
+      promotion?: {
+        target_position_pct_cap?: number
+        cooldown_after_promotion_minutes?: number
+        promotion_ttl_minutes?: number
+      }
+    }
+    cap_runtime?: {
+      last_eval_at?: string | null
+      consecutive_passes?: number
+      required_passes?: number
+      promoted_at?: string | null
+      promote_expires_at?: string | null
+    }
+    cap_promoted?: boolean
     reason_code?: string
     [key: string]: unknown
   }
