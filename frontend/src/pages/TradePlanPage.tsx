@@ -53,6 +53,11 @@ export function TradePlanPage() {
   const executionPlan = (p?.execution_plan as any) ?? {}
   const executionNumbers = (executionPlan?.final_numbers as any) ?? {}
   const activationDecision = String(activationGate?.decision_effective ?? activationGate?.decision ?? '-')
+  const holdMode = String(activationGate?.hold_mode ?? '-')
+  const capCfg = (activationGate?.conditional_activation as any) ?? {}
+  const capCond = (capCfg?.conditions as any) ?? {}
+  const capPromotion = (capCfg?.promotion as any) ?? {}
+  const capRuntime = (activationGate?.cap_runtime as any) ?? {}
 
   return (
     <div className="page">
@@ -91,6 +96,9 @@ export function TradePlanPage() {
                   activation decision: <span className="mono">{activationDecision}</span>
                 </div>
                 <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                  hold_mode: <span className="mono">{holdMode}</span>
+                </div>
+                <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
                   valid_to: <span className="mono">{String(p?.valid_to_kst ?? p?.valid_to ?? '')}</span>
                 </div>
                 <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>
@@ -102,6 +110,34 @@ export function TradePlanPage() {
                 </div>
                 <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>
                   notes: <span className="mono">{String(p?.notes ?? '')}</span>
+                </div>
+                <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>
+                  CAP enabled: <span className="mono">{String(Boolean(capCfg?.enabled))}</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  promoted: <span className="mono">{String(Boolean(activationGate?.cap_promoted))}</span>
+                </div>
+                <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                  CAP 조건: <span className="mono">alpha≥{String(capCond?.min_alpha ?? '-')}</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  <span className="mono">spread≤{String(capCond?.max_spread_bps ?? '-')}</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  <span className="mono">vol_z≥{String(capCond?.min_vol_z ?? '-')}</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  <span className="mono">atr≥{String(capCond?.min_atr_pct ?? '-')}</span>
+                </div>
+                <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                  CAP 지속: <span className="mono">{String(capCond?.sustain_seconds ?? '-')}s</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  승격 cap: <span className="mono">{String(capPromotion?.target_position_pct_cap ?? '-')}%</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  TTL: <span className="mono">{String(capPromotion?.promotion_ttl_minutes ?? '-')}m</span>
+                </div>
+                <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                  CAP 런타임: <span className="mono">{String(capRuntime?.consecutive_passes ?? 0)}</span>
+                  /
+                  <span className="mono">{String(capRuntime?.required_passes ?? '-')}</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  expires: <span className="mono">{String(capRuntime?.promote_expires_at ?? '-')}</span>
                 </div>
               </div>
 
