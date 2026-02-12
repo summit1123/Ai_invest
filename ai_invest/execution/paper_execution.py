@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from zoneinfo import ZoneInfo
@@ -97,6 +97,9 @@ class PaperExecutor:
         snapshot: MarketSnapshot,
         rules: RulesConfig,
         target_position_pct: float | None = None,
+        strategy_tag: str | None = None,
+        exit_reason: str | None = None,
+        cooldown_minutes: int | None = None,
     ) -> PaperExecutionResult | None:
         action = action.upper()
         if action not in {"BUY", "SELL"}:
@@ -332,6 +335,7 @@ class PaperExecutor:
                 opened_at = (pos.meta or {}).get("opened_at") or fill_ts.isoformat()
             prev_fees = float((pos.meta or {}).get("fees_paid_krw") or 0.0) if pos else 0.0
             fees_paid = prev_fees + fee
+            effective_tag = str((strategy_tag or pos_meta.get("strategy_tag") or "MOM")).strip().upper() or "MOM"
             self._repo.upsert_position(
                 DbPosition(
                     symbol=symbol,
@@ -343,6 +347,12 @@ class PaperExecutor:
                     take_profit=None,
                     meta={
                         "opened_at": opened_at,
+                        "entry_ts": opened_at,
+                        "entry_price": float(new_avg),
+                        "hwm_price": float(fill_price),
+                        "strategy_tag": effective_tag,
+                        "cooldown_until": None,
+                        "last_exit_reason": None,
                         "fees_paid_krw": fees_paid,
                         "trade_id": str(trade_id),
                         "entry_decision_id": str(entry_decision_id) if entry_decision_id else str(decision_id),
@@ -412,7 +422,14 @@ class PaperExecutor:
                     unrealized_pnl=None,
                     stop_price=None,
                     take_profit=None,
-                    meta={},
+                    meta={
+                        "cooldown_until": (
+                            (fill_ts + timedelta(minutes=max(0, int(cooldown_minutes or 0)))).isoformat()
+                            if int(cooldown_minutes or 0) > 0
+                            else None
+                        ),
+                        "last_exit_reason": str(exit_reason or "SELL_SIGNAL").strip().upper(),
+                    },
                 )
             )
             closed_trade = PaperClosedTrade(
