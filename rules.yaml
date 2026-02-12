@@ -49,6 +49,47 @@ quant_backtest:
   low_liquidity_penalty_bps: 1.2
   fill_ratio: 0.92
 
+strategy:
+  alpha_score:
+    enabled: true
+    entry_alpha: 0.65
+    strong_alpha: 0.80
+    cooldown_override_alpha: 0.90
+    cooldown_override_enabled: true
+    base_target_pct: 3.0
+    max_target_pct: 5.0
+    atr_ref_pct: 1.3
+    vol_scale_min: 0.5
+    vol_scale_max: 1.2
+    ema_fast: 20
+    ema_slow: 60
+    ret_short_mins: 15
+    ret_long_mins: 60
+    lookback_minutes: 240
+    rev_rsi_prev_max: 32
+    rev_rsi_now_min: 50
+    rev_ret_15m_max: -0.008
+    rev_vol_z_min: 1.3
+    exit_rsi: 45
+    stop_atr_mult: 1.1
+    trail_atr_mult: 0.9
+    time_stop_mom_minutes: 240
+    time_stop_rev_minutes: 120
+    cooldown_minutes: 30
+    atr_block_pct: 2.5
+    daily_loss_entry_block_ratio: 0.8
+
+paper_mode:
+  data_collection:
+    enabled: true
+    min_trades_for_strict_gate: 30
+    relaxed_min_win_rate_pct: 25.0
+    relaxed_min_backtest_score: -1.5
+    relaxed_min_profit_factor: 1.05
+    relaxed_min_expectancy_pct: 0.0
+    force_plan_buy_allowed: true
+    force_plan_target_pct: 5.0
+
 governance:
   # 정기 회의(하루 3회, 8시간 간격 권장). 실시간 트리거(수익/손절/비용/레짐/운영)는 즉시 Safe Judge로 처리하고,
   # 회의는 "종목/비중/허용조건(Trade Plan)"과 "룰 패치 제안"을 갱신하는 거버넌스 용도.
