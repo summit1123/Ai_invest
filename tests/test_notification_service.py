@@ -204,6 +204,33 @@ class NotificationServiceTests(unittest.TestCase):
         self.assertEqual(row.get("template_id"), "tpl_finance_monthly_review")
         self.assertEqual(row.get("status"), "PENDING")
 
+    def test_notify_engineering_change_announced_pending_when_send_disabled(self) -> None:
+        repo = _FakeRepo()
+        svc = NotificationService(
+            repo,  # type: ignore[arg-type]
+            ctx=NotificationContext(
+                send_telegram=False,
+                notify_safe_enabled=True,
+                notify_safe_hold=True,
+                notify_safe_change_only=True,
+                dedupe_within_sec=60,
+            ),
+        )
+        with patch("ai_invest.notifications.service.telegram_client.chat_id_engineering", return_value="-100123"):
+            svc.notify_engineering_change_announced(
+                event_id=uuid.uuid4(),
+                change_id="tpv2-1",
+                summary_lines=["A", "B", "C"],
+                activation_mode="PAPER/HOLD",
+                rollback_hint="revert",
+            )
+
+        self.assertEqual(len(repo.rows), 1)
+        row = repo.rows[0]
+        self.assertEqual(row.get("template_id"), "tpl_engineering_change_announced")
+        self.assertEqual(row.get("status"), "PENDING")
+        self.assertIn("tpv2-1", str((row.get("payload") or {}).get("event")))
+
 
 if __name__ == "__main__":
     unittest.main()

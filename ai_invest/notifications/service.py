@@ -828,3 +828,52 @@ class NotificationService:
                 "rationale_summary": rationale_summary or "",
             },
         )
+
+    def notify_engineering_change_announced(
+        self,
+        *,
+        event_id: uuid.UUID,
+        change_id: str,
+        summary_lines: list[str],
+        activation_mode: str,
+        rollback_hint: str,
+    ) -> None:
+        chat_id = ""
+        error_msg = ""
+        try:
+            chat_id = telegram_client.chat_id_engineering()
+        except Exception as exc:  # pragma: no cover
+            error_msg = str(exc)
+            try:
+                chat_id = telegram_client.chat_id_meeting()
+            except Exception as exc2:  # pragma: no cover
+                error_msg = f"{error_msg}; fallback={exc2}"
+                self._repo.insert_notification_delivery(
+                    delivery_id=uuid.uuid4(),
+                    event_id=event_id,
+                    channel="TELEGRAM",
+                    template_id="tpl_engineering_change_announced",
+                    severity="NORMAL",
+                    status="FAILED",
+                    attempt_count=0,
+                    last_error=f"telegram config error: {error_msg}",
+                    dedupe_key=None,
+                    payload={"event": {"change_id": change_id}},
+                    sent_at=None,
+                )
+                return
+
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_engineering_change_announced",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=f"ENG:CHANGE:{change_id}",
+            payload={
+                **_ts_payload(),
+                "change_id": str(change_id),
+                "summary_lines": [str(x) for x in list(summary_lines or [])[:3]],
+                "activation_mode": str(activation_mode or "PAPER/HOLD"),
+                "rollback_hint": str(rollback_hint or "git revert <commit_sha> 후 오케스트레이터 재시작"),
+            },
+        )

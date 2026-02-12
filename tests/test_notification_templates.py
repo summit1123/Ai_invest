@@ -99,6 +99,21 @@ class NotificationTemplateTests(unittest.TestCase):
         self.assertIn("gpt-5.2-pro", text)
         self.assertIn("2026-02", text)
 
+    def test_engineering_change_template(self) -> None:
+        text = render(
+            "tpl_engineering_change_announced",
+            {
+                "ts_kst": "2026-02-12T11:00:00+09:00",
+                "change_id": "tpv2-20260212-1",
+                "activation_mode": "PAPER/HOLD",
+                "summary_lines": ["게이트 decision 분리", "execution_plan 추가", "역호환 유지"],
+                "rollback_hint": "git revert <sha> 후 재시작",
+            },
+        )
+        self.assertIn("개선 반영 공지", text)
+        self.assertIn("tpv2-20260212-1", text)
+        self.assertIn("PAPER/HOLD", text)
+
 
 if __name__ == "__main__":
     unittest.main()

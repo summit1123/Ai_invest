@@ -288,6 +288,25 @@ def tpl_trade_plan_set(data: Mapping[str, Any]) -> str:
     )
 
 
+def tpl_engineering_change_announced(data: Mapping[str, Any]) -> str:
+    lines = data.get("summary_lines")
+    summary: list[str] = []
+    if isinstance(lines, list):
+        for x in lines[:3]:
+            s = str(x or "").strip()
+            if s:
+                summary.append(f"- {s}")
+    summary_txt = "\n".join(summary) if summary else "- (요약 없음)"
+    return (
+        "[엔지니어링] 개선 반영 공지\n"
+        f"- 시각(KST): {data.get('ts_kst')}\n"
+        f"- change_id: {data.get('change_id')}\n"
+        f"- 활성 모드: {data.get('activation_mode')}\n"
+        f"- 변경 요약:\n{summary_txt}\n"
+        f"- 롤백 안내: {data.get('rollback_hint')}\n"
+    )
+
+
 TEMPLATES = {
     "tpl_pause_critical": tpl_pause_critical,
     "tpl_recon_fail": tpl_recon_fail,
@@ -305,6 +324,7 @@ TEMPLATES = {
     "tpl_meeting_action_items": tpl_meeting_action_items,
     "tpl_weekly_priority": tpl_weekly_priority,
     "tpl_trade_plan_set": tpl_trade_plan_set,
+    "tpl_engineering_change_announced": tpl_engineering_change_announced,
 }
 
 
