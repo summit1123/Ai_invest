@@ -49,6 +49,31 @@ def compute_rsi(closes: Sequence[float], *, period: int = 14) -> float:
     return float(max(0.0, min(100.0, rsi)))
 
 
+def compute_ema(values: Sequence[float], *, period: int) -> float:
+    if period <= 0 or not values:
+        return 0.0
+    arr = [float(x) for x in values if isinstance(x, (int, float))]
+    if not arr:
+        return 0.0
+    alpha = 2.0 / (float(period) + 1.0)
+    ema = arr[0]
+    for v in arr[1:]:
+        ema = (alpha * v) + ((1.0 - alpha) * ema)
+    return float(ema)
+
+
+def compute_return(values: Sequence[float], *, bars: int) -> float:
+    if bars <= 0:
+        return 0.0
+    if len(values) <= bars:
+        return 0.0
+    now = float(values[-1])
+    prev = float(values[-(bars + 1)])
+    if prev <= 0:
+        return 0.0
+    return float((now / prev) - 1.0)
+
+
 def compute_atr_pct(
     highs: Sequence[float],
     lows: Sequence[float],
@@ -101,3 +126,33 @@ def build_feature_snapshot_from_candles(
         missing_rate_1m=float(missing_rate_1m),
     )
 
+
+def build_alpha_features_from_1m_candles(
+    *,
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    volumes: Sequence[float],
+    ema_fast: int = 20,
+    ema_slow: int = 60,
+    ret_short_bars: int = 15,
+    ret_long_bars: int = 60,
+) -> dict[str, float]:
+    rsi_14 = compute_rsi(closes, period=14)
+    rsi_prev = compute_rsi(closes[:-1], period=14) if len(closes) >= 16 else 50.0
+    atr_pct = compute_atr_pct(highs, lows, closes, period=14)
+    vol_z = compute_volume_zscore(volumes, window=20)
+    ema20 = compute_ema(closes, period=max(1, int(ema_fast)))
+    ema60 = compute_ema(closes, period=max(1, int(ema_slow)))
+    ret_15m = compute_return(closes, bars=max(1, int(ret_short_bars)))
+    ret_60m = compute_return(closes, bars=max(1, int(ret_long_bars)))
+    return {
+        "rsi_14": float(rsi_14),
+        "rsi_14_prev": float(rsi_prev),
+        "vol_zscore": float(vol_z),
+        "atr_pct": float(atr_pct),
+        "ret_15m": float(ret_15m),
+        "ret_60m": float(ret_60m),
+        "ema20": float(ema20),
+        "ema60": float(ema60),
+    }
