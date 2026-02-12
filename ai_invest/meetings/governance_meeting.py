@@ -281,17 +281,51 @@ def _slot_key_for_dt(slot_dt: datetime) -> str:
     return f"{slot_dt.date().isoformat()} {slot_dt.strftime('%H:%M')}"
 
 
+def _slot_dt_from_key_kst(slot_key: str) -> datetime | None:
+    parts = str(slot_key or "").strip().split()
+    if len(parts) < 2:
+        return None
+    date_part = str(parts[0]).strip()
+    time_part = str(parts[1]).strip()
+    if len(time_part) < 5 or ":" not in time_part:
+        return None
+    time_hhmm = time_part[:5]
+    try:
+        dt = datetime.strptime(f"{date_part} {time_hhmm}", "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+    return dt.replace(tzinfo=KST)
+
+
+def _normalize_meeting_times(times: Sequence[str], *, on_the_hour_only: bool) -> list[str]:
+    normalized: list[str] = []
+    for raw in list(times or []):
+        try:
+            hh, mm = _parse_hhmm(str(raw))
+        except Exception:
+            continue
+        if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59):
+            continue
+        if on_the_hour_only and int(mm) != 0:
+            continue
+        normalized.append(f"{int(hh):02d}:{int(mm):02d}")
+    # Keep deterministic order: earliest slot first and no duplicates.
+    return sorted(set(normalized), key=lambda x: _parse_hhmm(x))
+
+
 def default_meeting_times_kst() -> list[str]:
-    # 정기 회의: 하루 3회(8시간 간격) 권장
-    # 24:00은 다음날 00:00과 동일하므로 00:00/08:00/16:00으로 표현한다.
-    return ["00:00", "08:00", "16:00"]
+    # 정기 회의 기본값: 매시 정각.
+    return [f"{h:02d}:00" for h in range(24)]
 
 
 def get_meeting_times_kst(rules_raw: Mapping[str, Any]) -> list[str]:
     gov = rules_raw.get("governance") if isinstance(rules_raw, Mapping) else None
     times = (gov or {}).get("daily_meeting_times_kst") if isinstance(gov, Mapping) else None
-    if isinstance(times, list) and all(isinstance(x, str) and ":" in x for x in times):
-        return [x.strip() for x in times]
+    on_the_hour_only = bool((gov or {}).get("meeting_on_the_hour_only", True)) if isinstance(gov, Mapping) else True
+    if isinstance(times, list):
+        norm = _normalize_meeting_times([str(x) for x in times], on_the_hour_only=on_the_hour_only)
+        if norm:
+            return norm
     return default_meeting_times_kst()
 
 
@@ -1118,8 +1152,29 @@ def evaluate_policy_activation_gate(
     }
 
 
-def _build_agent_tasks(*, slot_key: str, outputs: GovernanceOutputs) -> list[dict[str, Any]]:
-    due_ts = (_now_kst() + timedelta(hours=8)).isoformat()
+def _next_prep_slot_dt_kst(*, slot_key: str, times: Sequence[str]) -> datetime:
+    slot_dt = _slot_dt_from_key_kst(slot_key)
+    if slot_dt is not None:
+        hhmm = slot_dt.strftime("%H:%M")
+        if hhmm in set(times):
+            try:
+                return next_slot_kst(slot_dt, times=times, current=hhmm)
+            except Exception:
+                pass
+    now_kst = _now_kst()
+    return now_kst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+
+def _build_agent_tasks(
+    *,
+    slot_key: str,
+    outputs: GovernanceOutputs,
+    rules_raw: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    times = get_meeting_times_kst(rules_raw)
+    next_slot_dt = _next_prep_slot_dt_kst(slot_key=slot_key, times=times)
+    prep_slot_key = _slot_key_for_dt(next_slot_dt)
+    due_ts = next_slot_dt.isoformat()
     symbol = str(outputs.final_plan.symbol)
     return [
         {
@@ -1131,7 +1186,11 @@ def _build_agent_tasks(*, slot_key: str, outputs: GovernanceOutputs) -> list[dic
             "due_ts_kst": due_ts,
             "description": f"{symbol} 포함 주요 이슈/리스크 브리프 갱신",
             "slot_key": slot_key,
-            "payload": {"symbol": symbol, "focus": "catalyst+risk"},
+            "payload": {
+                "symbol": symbol,
+                "focus": "catalyst+risk",
+                "prep_for_slot_key": prep_slot_key,
+            },
         },
         {
             "task_id": str(uuid.uuid4()),
@@ -1146,6 +1205,7 @@ def _build_agent_tasks(*, slot_key: str, outputs: GovernanceOutputs) -> list[dic
                 "symbol_hint": symbol,
                 "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
                 "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
+                "prep_for_slot_key": prep_slot_key,
             },
         },
         {
@@ -1160,6 +1220,7 @@ def _build_agent_tasks(*, slot_key: str, outputs: GovernanceOutputs) -> list[dic
             "payload": {
                 "max_position_pct": float(outputs.risk.max_position_pct),
                 "max_daily_loss_pct": float(outputs.risk.max_daily_loss_pct),
+                "prep_for_slot_key": prep_slot_key,
             },
         },
         {
@@ -1171,7 +1232,114 @@ def _build_agent_tasks(*, slot_key: str, outputs: GovernanceOutputs) -> list[dic
             "due_ts_kst": due_ts,
             "description": "정합성/지연/알림 실패 모니터링 및 리포트",
             "slot_key": slot_key,
-            "payload": {"required_ops_gates": list(outputs.ops.required_ops_gates)},
+            "payload": {
+                "required_ops_gates": list(outputs.ops.required_ops_gates),
+                "prep_for_slot_key": prep_slot_key,
+            },
+        },
+    ]
+
+
+def _build_execution_playbook(
+    *,
+    slot_key: str,
+    outputs: GovernanceOutputs,
+    activation_status: str,
+    resolved_target_position_pct: float,
+    resolved_allowed_actions: Mapping[str, Any],
+) -> dict[str, Any]:
+    buy_allowed = bool(resolved_allowed_actions.get("buy"))
+    sell_allowed = bool(resolved_allowed_actions.get("sell"))
+    entry_triggers = [str(x) for x in list(outputs.quant.entry_triggers or []) if str(x).strip()][:8]
+    exit_triggers = [str(x) for x in list(outputs.quant.exit_triggers or []) if str(x).strip()][:8]
+    risk_constraints = dict(outputs.risk.required_constraints or {})
+    ops_gates = [str(x) for x in list(outputs.ops.required_ops_gates or []) if str(x).strip()][:8]
+
+    if not entry_triggers:
+        entry_triggers = [
+            "스프레드/슬리피지 가드 통과",
+            "recon=OK 및 pause=false",
+            "alpha 및 레짐 조건 유지",
+        ]
+    if not exit_triggers:
+        exit_triggers = [
+            "alpha 약화 또는 모멘텀 둔화",
+            "리스크 한도/운영 게이트 위반",
+            "시간 만료(valid_to_kst) 또는 정책 HOLD 전환",
+        ]
+
+    return {
+        "slot_key": str(slot_key),
+        "activation_status": str(activation_status),
+        "position_plan": {
+            "symbol": str(outputs.final_plan.symbol),
+            "target_position_pct": float(resolved_target_position_pct),
+            "buy_allowed": bool(buy_allowed),
+            "sell_allowed": bool(sell_allowed),
+            "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
+            "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
+        },
+        "entry_plan": {
+            "when_to_buy": entry_triggers,
+            "safety_checks": [
+                "ops.veto=false / risk.veto=false",
+                "spread_bps <= max_spread_bps_entry",
+                "reconciliation_status=OK",
+            ],
+        },
+        "position_management": {
+            "while_holding_checks": [
+                "매 주기마다 spread/volatility/ops 상태 점검",
+                "리밸런싱 밴드 초과 시만 비중 조정",
+                "데일리 손실 접근 시 신규진입 중단",
+            ],
+            "ops_required_gates": ops_gates,
+            "risk_constraints": risk_constraints,
+        },
+        "exit_plan": {
+            "when_to_sell_or_reduce": exit_triggers,
+            "fail_closed_conditions": [
+                "ops.reconciliation_status=FAIL",
+                "risk.veto=true 또는 일손실 제한 도달",
+                "거버넌스 활성결정이 HOLD로 전환",
+            ],
+        },
+        "next_review_focus": [
+            "이번 슬롯의 진입/청산 트리거 적중 여부",
+            "체결품질(슬리피지/미체결)과 기대수익 대비 비용",
+            "다음 슬롯에서 심볼/비중/쿨다운 수정 필요성",
+        ],
+    }
+
+
+def _build_playbook_action_items(
+    *,
+    today_kst: str,
+    playbook: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    position_plan = playbook.get("position_plan") if isinstance(playbook, Mapping) else {}
+    symbol = str((position_plan or {}).get("symbol") or "")
+    target = _as_float((position_plan or {}).get("target_position_pct"), default=0.0)
+    return [
+        {
+            "owner": "quant_strategist",
+            "action": f"{symbol} 진입/청산 트리거 로그 점검 및 target {target:.1f}% 적정성 검토",
+            "due_date": str(today_kst),
+        },
+        {
+            "owner": "risk_manager",
+            "action": "보유 중 축소/청산 조건(손실/변동성/레짐) 충족 여부 점검",
+            "due_date": str(today_kst),
+        },
+        {
+            "owner": "ops_manager",
+            "action": "체결지연/슬리피지/정합성 게이트 위반 여부 모니터링",
+            "due_date": str(today_kst),
+        },
+        {
+            "owner": "research_agent",
+            "action": f"{symbol} 뉴스/이슈 변화가 플랜 가정에 미치는 영향 업데이트",
+            "due_date": str(today_kst),
         },
     ]
 
@@ -2031,13 +2199,18 @@ def run_governance_meeting_now(
     # - scheduled slot: [slot_dt, next_slot_dt)
     # - live/ad-hoc: [now, now+8h)
     hit_slot: str | None = None
+    forced_slot_dt: datetime | None = None
     if force_slot_key:
-        parts = str(force_slot_key).split()
-        if len(parts) >= 2 and ":" in parts[1]:
-            hit_slot = parts[1].strip()
+        forced_slot_dt = _slot_dt_from_key_kst(force_slot_key)
+        if forced_slot_dt is not None:
+            hit_slot = forced_slot_dt.strftime("%H:%M")
+        else:
+            parts = str(force_slot_key).split()
+            if len(parts) >= 2 and ":" in parts[1]:
+                hit_slot = parts[1].strip()
 
     if hit_slot and hit_slot in set(times):
-        vf_kst = _slot_dt_for_today_kst(now_kst, hit_slot)
+        vf_kst = forced_slot_dt if forced_slot_dt is not None else _slot_dt_for_today_kst(now_kst, hit_slot)
         try:
             vt_kst = next_slot_kst(vf_kst, times=times, current=hit_slot)
         except Exception:
@@ -2388,11 +2561,14 @@ def run_governance_meeting_now(
             f"[{slot_key}] Trade Plan({activation_status}): "
             f"{outputs.final_plan.symbol} target={float(resolved_target_position_pct):.1f}%"
         )
-        action_items = [
-            {"owner": "research_agent", "action": "주요 뉴스 원문 확인 및 영향 업데이트", "due_date": str(now_kst.date())},
-            {"owner": "ops_manager", "action": "recon/pause/알림 누락 여부 점검", "due_date": str(now_kst.date())},
-            {"owner": "quant_strategist", "action": "과매매 방지(cooldown/rebalance band) 파라미터 점검", "due_date": str(now_kst.date())},
-        ]
+        execution_playbook = _build_execution_playbook(
+            slot_key=slot_key,
+            outputs=outputs,
+            activation_status=activation_status,
+            resolved_target_position_pct=float(resolved_target_position_pct),
+            resolved_allowed_actions=resolved_allowed_actions,
+        )
+        action_items = _build_playbook_action_items(today_kst=str(now_kst.date()), playbook=execution_playbook)
         if not activation_passed:
             action_items.append(
                 {
@@ -2520,6 +2696,7 @@ def run_governance_meeting_now(
             "allocator_result": allocator_result,
             "cost_model": cost_model,
             "paper_live_policy": paper_live_policy,
+            "execution_playbook": execution_playbook,
         }
 
         repo.update_meeting_session(
@@ -2596,7 +2773,19 @@ def run_governance_meeting_now(
         # decision 기반 실행 모드:
         # - LIVE/PAPER/HOLD 모두 계획은 기록하고 런타임에서 분기한다.
         # - 알 수 없는 decision일 때만 fail-closed로 PROPOSED 처리.
-        plan_set_allowed = str(activation_decision_effective).upper() in {"LIVE", "PAPER", "HOLD"}
+        now_kst_for_plan = _now_kst()
+        plan_window_active = bool(vf_kst <= now_kst_for_plan < vt_kst)
+        plan_set_allowed = (
+            str(activation_decision_effective).upper() in {"LIVE", "PAPER", "HOLD"}
+            and plan_window_active
+        )
+        if not plan_window_active:
+            activation_gate = dict(activation_gate)
+            activation_gate["plan_window_active"] = False
+            activation_gate["plan_window_now_kst"] = now_kst_for_plan.isoformat()
+            activation_gate["plan_window_valid_from_kst"] = vf_kst.isoformat()
+            activation_gate["plan_window_valid_to_kst"] = vt_kst.isoformat()
+            plan_payload["activation_gate"] = activation_gate
         plan_event_type = "TRADE_PLAN_SET" if plan_set_allowed else "TRADE_PLAN_PROPOSED"
         trade_plan_event_id = uuid.uuid4()
         repo.insert_event(
@@ -2673,7 +2862,7 @@ def run_governance_meeting_now(
                 payload=policy_payload,
             )
         )
-        assigned_tasks = _build_agent_tasks(slot_key=slot_key, outputs=outputs)
+        assigned_tasks = _build_agent_tasks(slot_key=slot_key, outputs=outputs, rules_raw=rules_raw)
         for task in assigned_tasks:
             repo.insert_event(
                 DbEvent(
@@ -2797,8 +2986,9 @@ def maybe_run_scheduled_governance_meeting(
 
     now_date = now_kst.date()
     for slot_dt in sorted(slot_candidates):
-        delta_min = abs((now_kst - slot_dt).total_seconds()) / 60.0
-        if delta_min > float(window_min):
+        # Run only after scheduled slot (no early starts), with a small late tolerance window.
+        delta_min = (now_kst - slot_dt).total_seconds() / 60.0
+        if delta_min < 0.0 or delta_min > float(window_min):
             continue
         slot_key = _slot_key_for_dt(slot_dt)
         if not repo.meeting_slot_exists(slot_key=slot_key):
