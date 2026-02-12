@@ -724,6 +724,29 @@ def _activation_decision_from_gate(
     return "HOLD"
 
 
+def _hard_plan_block_from_fact_pack(*, fact_pack: Mapping[str, Any]) -> tuple[bool, list[str]]:
+    """Compute hard plan block from deterministic runtime-ops state only.
+
+    Governance meeting output(LLM/round outputs) can be conservative by design.
+    We keep hard HOLD fail-closed for true operational blockers only:
+    - pause_state == true
+    - reconciliation_status == FAIL
+    """
+
+    ops_state = fact_pack.get("ops_state") if isinstance(fact_pack, Mapping) else {}
+    ops_state = ops_state if isinstance(ops_state, Mapping) else {}
+    pause = (ops_state.get("pause") or {}) if isinstance(ops_state.get("pause"), Mapping) else {}
+    recon = (ops_state.get("latest_reconciliation") or {}) if isinstance(ops_state.get("latest_reconciliation"), Mapping) else {}
+
+    reasons: list[str] = []
+    if bool(pause.get("paused")):
+        reasons.append("pause_state=true")
+    if str(recon.get("status") or "OK").strip().upper() == "FAIL":
+        reasons.append("reconciliation_status=FAIL")
+
+    return bool(reasons), reasons
+
+
 def _execution_style_from_rules(*, rules_raw: Mapping[str, Any]) -> str:
     ex = (rules_raw.get("execution") or {}) if isinstance(rules_raw, Mapping) else {}
     style = str(ex.get("order_style") or "").strip().lower()
@@ -2248,7 +2271,15 @@ def run_governance_meeting_now(
         )
         force_plan_buy_allowed = bool(data_collection_cfg.get("force_plan_buy_allowed", True))
         force_plan_target_pct = float(_as_float(data_collection_cfg.get("force_plan_target_pct"), default=5.0))
-        hard_plan_block = bool(outputs.ops.veto) or bool(outputs.risk.veto) or (not bool(outputs.ops.trade_window_allowed))
+        hard_plan_block, hard_plan_block_reasons = _hard_plan_block_from_fact_pack(fact_pack=fact_pack)
+        soft_plan_block_reasons: list[str] = []
+        if bool(outputs.ops.veto):
+            soft_plan_block_reasons.append("ops.veto=true")
+        if bool(outputs.risk.veto):
+            soft_plan_block_reasons.append("risk.veto=true")
+        if not bool(outputs.ops.trade_window_allowed):
+            soft_plan_block_reasons.append("ops.trade_window_allowed=false")
+        soft_plan_block = bool(soft_plan_block_reasons)
         activation_decision = _activation_decision_from_gate(
             activation_gate=activation_gate,
             hard_plan_block=hard_plan_block,
@@ -2278,6 +2309,9 @@ def run_governance_meeting_now(
         activation_gate["decision_effective"] = str(activation_decision_effective)
         activation_gate["live_execution_enabled"] = bool(live_execution_enabled)
         activation_gate["hard_plan_block"] = bool(hard_plan_block)
+        activation_gate["hard_plan_block_reasons"] = list(hard_plan_block_reasons)
+        activation_gate["soft_plan_block"] = bool(soft_plan_block)
+        activation_gate["soft_plan_block_reasons"] = list(soft_plan_block_reasons)
         activation_gate["hold_mode"] = str(hold_mode)
         activation_gate["conditional_activation"] = dict(conditional_activation_cfg)
         activation_gate["cap_runtime"] = dict(cap_runtime_seed)
