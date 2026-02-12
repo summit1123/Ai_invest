@@ -229,6 +229,35 @@ class SafeJudgeTests(unittest.TestCase):
         self.assertEqual(decision_buy.action, "HOLD")
         self.assertEqual(decision_buy.selected_reasons, [ReasonCode.RG_TRADE_PLAN_FLAT.value])
 
+    def test_cap_promoted_paper_override_allows_buy_with_effective_target(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": True, "sell": True},
+            "target_position_pct": 0.0,
+            "execution_plan": {"final_numbers": {"target_position_pct": 3.0}},
+            "activation_gate": {
+                "decision": "HOLD",
+                "decision_effective": "PAPER",
+                "hold_mode": "HOLD_CONDITIONAL",
+                "cap_promoted": True,
+                "cap_runtime": {"consecutive_passes": 12, "required_passes": 12},
+            },
+        }
+        payload["context"]["position"] = {"current_position_pct": 0.0}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "BUY", "confidence": 0.68, "signal_target_pct": 2.0},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "BUY")
+        self.assertAlmostEqual(float(decision.effective_target_pct or 0.0), 2.0, places=6)
+        self.assertEqual(str(decision.gates.get("trade_plan_hold_mode")), "HOLD_CONDITIONAL")
+        self.assertEqual(bool(decision.gates.get("trade_plan_cap_promoted")), True)
+
     def test_target_reached_uses_effective_target(self) -> None:
         payload = base_payload()
         payload["context"]["trade_plan"] = {"allowed_actions": {"buy": True, "sell": True}, "target_position_pct": 5.0}
