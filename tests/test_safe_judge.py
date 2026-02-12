@@ -146,6 +146,55 @@ class SafeJudgeTests(unittest.TestCase):
         self.assertEqual(decision.action, "HOLD")
         self.assertEqual(decision.selected_reasons, [ReasonCode.RG_SIGNAL_CONFLICT.value])
 
+    def test_effective_target_uses_min_of_plan_and_signal(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {"allowed_actions": {"buy": True, "sell": True}, "target_position_pct": 5.0}
+        payload["context"]["position"] = {"current_position_pct": 1.0}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "BUY", "confidence": 0.72, "signal_target_pct": 3.0},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "BUY")
+        self.assertAlmostEqual(float(decision.effective_target_pct or 0.0), 3.0, places=6)
+        self.assertAlmostEqual(float(decision.gates.get("effective_target_pct") or 0.0), 3.0, places=6)
+
+    def test_signal_target_zero_blocks_buy_even_if_plan_positive(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {"allowed_actions": {"buy": True, "sell": True}, "target_position_pct": 5.0}
+        payload["context"]["position"] = {"current_position_pct": 0.0}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "BUY", "confidence": 0.72, "signal_target_pct": 0.0},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_TRADE_PLAN_FLAT.value])
+
+    def test_target_reached_uses_effective_target(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {"allowed_actions": {"buy": True, "sell": True}, "target_position_pct": 5.0}
+        payload["context"]["position"] = {"current_position_pct": 3.1}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "BUY", "confidence": 0.72, "signal_target_pct": 3.0},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_TRADE_PLAN_TARGET_REACHED.value])
+
     def test_multiple_reasons_are_capped_to_three(self) -> None:
         # Construct a scenario where HOLD reasons would pile up if not capped.
         payload = base_payload()
