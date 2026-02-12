@@ -73,6 +73,17 @@ def _opt_bool(payload: Mapping[str, Any], path: str) -> bool | None:
     return None
 
 
+def _opt_str(payload: Mapping[str, Any], path: str) -> str | None:
+    try:
+        value = _dot_get(payload, path)
+    except Exception:
+        return None
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
 @dataclass(frozen=True)
 class SafeJudgeDecision:
     action: str  # BUY / SELL / HOLD / PAUSE
@@ -110,8 +121,11 @@ def safe_judge_decide(
 
     # Optional context fields (paper/live sizing, trade plan).
     trade_plan_target_pct = _opt_float(payload, "context.trade_plan.target_position_pct")
+    trade_plan_execution_target_pct = _opt_float(payload, "context.trade_plan.execution_plan.final_numbers.target_position_pct")
     trade_plan_buy_allowed = _opt_bool(payload, "context.trade_plan.allowed_actions.buy")
     trade_plan_sell_allowed = _opt_bool(payload, "context.trade_plan.allowed_actions.sell")
+    trade_plan_activation_decision = _opt_str(payload, "context.trade_plan.activation_gate.decision")
+    trade_plan_activation_decision_effective = _opt_str(payload, "context.trade_plan.activation_gate.decision_effective")
     current_position_pct = _opt_float(payload, "context.position.current_position_pct")
     cash_krw = _opt_float(payload, "context.account.cash_krw")
     market_signal_target_pct = None
@@ -122,12 +136,15 @@ def safe_judge_decide(
             market_signal_target_pct = None
 
     effective_target_pct: float | None
-    if trade_plan_target_pct is None:
+    plan_target_for_execution = (
+        trade_plan_execution_target_pct if trade_plan_execution_target_pct is not None else trade_plan_target_pct
+    )
+    if plan_target_for_execution is None:
         effective_target_pct = market_signal_target_pct
     elif market_signal_target_pct is None:
-        effective_target_pct = trade_plan_target_pct
+        effective_target_pct = plan_target_for_execution
     else:
-        effective_target_pct = min(float(trade_plan_target_pct), float(market_signal_target_pct))
+        effective_target_pct = min(float(plan_target_for_execution), float(market_signal_target_pct))
 
     gates: dict[str, Any] = {
         "symbol": symbol,
@@ -139,8 +156,11 @@ def safe_judge_decide(
         "spread_bps": spread_bps,
         "max_spread_bps_entry": rules.cost_guard.max_spread_bps_entry,
         "trade_plan_target_pct": trade_plan_target_pct,
+        "trade_plan_execution_target_pct": trade_plan_execution_target_pct,
         "trade_plan_buy_allowed": trade_plan_buy_allowed,
         "trade_plan_sell_allowed": trade_plan_sell_allowed,
+        "trade_plan_activation_decision": trade_plan_activation_decision,
+        "trade_plan_activation_decision_effective": trade_plan_activation_decision_effective,
         "signal_target_pct": market_signal_target_pct,
         "effective_target_pct": effective_target_pct,
         "current_position_pct": current_position_pct,
@@ -209,6 +229,11 @@ def safe_judge_decide(
         elif action == "SELL" and trade_plan_sell_allowed is False:
             action = "HOLD"
             reasons = [ReasonCode.RG_SIGNAL_CONFLICT]
+
+        plan_decision = str(trade_plan_activation_decision_effective or trade_plan_activation_decision or "").upper()
+        if plan_decision == "HOLD" and action in {"BUY", "SELL"}:
+            action = "HOLD"
+            reasons = [ReasonCode.RG_TRADE_PLAN_FLAT]
 
         # Trade Plan gating (position sizing guard): if plan says "flat" or already at target, do not buy.
         if action == "BUY" and effective_target_pct is not None:

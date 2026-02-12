@@ -179,6 +179,56 @@ class SafeJudgeTests(unittest.TestCase):
         self.assertEqual(decision.action, "HOLD")
         self.assertEqual(decision.selected_reasons, [ReasonCode.RG_TRADE_PLAN_FLAT.value])
 
+    def test_execution_plan_target_takes_precedence_over_legacy_target(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": True, "sell": True},
+            "target_position_pct": 5.0,
+            "execution_plan": {"final_numbers": {"target_position_pct": 2.5}},
+        }
+        payload["context"]["position"] = {"current_position_pct": 1.0}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "BUY", "confidence": 0.72, "signal_target_pct": 3.0},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "BUY")
+        self.assertAlmostEqual(float(decision.effective_target_pct or 0.0), 2.5, places=6)
+
+    def test_activation_gate_hold_blocks_sell_and_buy(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": True, "sell": True},
+            "target_position_pct": 4.0,
+            "activation_gate": {"decision": "HOLD", "decision_effective": "HOLD"},
+        }
+
+        decision_sell = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "SELL", "confidence": 0.66},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision_sell.action, "HOLD")
+        self.assertEqual(decision_sell.selected_reasons, [ReasonCode.RG_TRADE_PLAN_FLAT.value])
+
+        decision_buy = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "BUY", "confidence": 0.66, "signal_target_pct": 2.0},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision_buy.action, "HOLD")
+        self.assertEqual(decision_buy.selected_reasons, [ReasonCode.RG_TRADE_PLAN_FLAT.value])
+
     def test_target_reached_uses_effective_target(self) -> None:
         payload = base_payload()
         payload["context"]["trade_plan"] = {"allowed_actions": {"buy": True, "sell": True}, "target_position_pct": 5.0}
