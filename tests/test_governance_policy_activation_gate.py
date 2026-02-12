@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from ai_invest.meetings.governance_meeting import evaluate_policy_activation_gate
+from ai_invest.meetings.governance_meeting import (
+    _activation_decision_from_gate,
+    _hard_plan_block_from_fact_pack,
+    evaluate_policy_activation_gate,
+)
 
 
 def _fact_pack_with_backtest() -> dict:
@@ -114,3 +118,50 @@ def test_policy_activation_gate_relaxed_or_passes_in_paper_mode():
     assert out["passed"] is True
     assert out["reason_code"] == "POLICY_GATE_PASS"
     assert out["decision"] == "LIVE"
+
+
+def test_activation_decision_paper_when_insufficient_data_without_hard_block():
+    gate = {"reason_code": "POLICY_GATE_INSUFFICIENT_DATA"}
+    out = _activation_decision_from_gate(activation_gate=gate, hard_plan_block=False)
+    assert out == "PAPER"
+
+
+def test_activation_decision_hold_when_hard_block_even_if_insufficient_data():
+    gate = {"reason_code": "POLICY_GATE_INSUFFICIENT_DATA"}
+    out = _activation_decision_from_gate(activation_gate=gate, hard_plan_block=True)
+    assert out == "HOLD"
+
+
+def test_hard_plan_block_from_fact_pack_only_for_pause_or_recon_fail():
+    blocked, reasons = _hard_plan_block_from_fact_pack(
+        fact_pack={
+            "ops_state": {
+                "pause": {"paused": True},
+                "latest_reconciliation": {"status": "OK"},
+            }
+        }
+    )
+    assert blocked is True
+    assert "pause_state=true" in reasons
+
+    blocked2, reasons2 = _hard_plan_block_from_fact_pack(
+        fact_pack={
+            "ops_state": {
+                "pause": {"paused": False},
+                "latest_reconciliation": {"status": "FAIL"},
+            }
+        }
+    )
+    assert blocked2 is True
+    assert "reconciliation_status=FAIL" in reasons2
+
+    blocked3, reasons3 = _hard_plan_block_from_fact_pack(
+        fact_pack={
+            "ops_state": {
+                "pause": {"paused": False},
+                "latest_reconciliation": {"status": "OK"},
+            }
+        }
+    )
+    assert blocked3 is False
+    assert reasons3 == []
