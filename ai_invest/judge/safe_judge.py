@@ -126,6 +126,12 @@ def safe_judge_decide(
     trade_plan_sell_allowed = _opt_bool(payload, "context.trade_plan.allowed_actions.sell")
     trade_plan_activation_decision = _opt_str(payload, "context.trade_plan.activation_gate.decision")
     trade_plan_activation_decision_effective = _opt_str(payload, "context.trade_plan.activation_gate.decision_effective")
+    trade_plan_hold_mode = _opt_str(payload, "context.trade_plan.activation_gate.hold_mode")
+    trade_plan_cap_promoted = _opt_bool(payload, "context.trade_plan.activation_gate.cap_promoted")
+    try:
+        trade_plan_cap_runtime = _dot_get(payload, "context.trade_plan.activation_gate.cap_runtime")
+    except Exception:
+        trade_plan_cap_runtime = None
     current_position_pct = _opt_float(payload, "context.position.current_position_pct")
     cash_krw = _opt_float(payload, "context.account.cash_krw")
     market_signal_target_pct = None
@@ -161,6 +167,9 @@ def safe_judge_decide(
         "trade_plan_sell_allowed": trade_plan_sell_allowed,
         "trade_plan_activation_decision": trade_plan_activation_decision,
         "trade_plan_activation_decision_effective": trade_plan_activation_decision_effective,
+        "trade_plan_hold_mode": trade_plan_hold_mode,
+        "trade_plan_cap_promoted": trade_plan_cap_promoted,
+        "trade_plan_cap_runtime": trade_plan_cap_runtime if isinstance(trade_plan_cap_runtime, Mapping) else None,
         "signal_target_pct": market_signal_target_pct,
         "effective_target_pct": effective_target_pct,
         "current_position_pct": current_position_pct,
