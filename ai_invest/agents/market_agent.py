@@ -240,7 +240,19 @@ def market_agent_opine(
             reason={"cooldown_until": state.cooldown_until.isoformat() if state.cooldown_until else None},
         )
 
-    if alpha.alpha >= float(cfg.entry_alpha):
+    fees_cfg = (rules.raw.get("fees") or {}) if isinstance(rules.raw, Mapping) else {}
+    fee_total_bps = _as_float(fees_cfg.get("fallback_bid_fee_bps"), default=5.0) + _as_float(
+        fees_cfg.get("fallback_ask_fee_bps"),
+        default=5.0,
+    )
+    entry_alpha_effective = float(cfg.entry_alpha) + (
+        float(cfg.entry_alpha_spread_k) * max(0.0, float(spread_bps)) / 10.0
+    ) + (
+        float(cfg.entry_alpha_fee_k) * max(0.0, float(fee_total_bps)) / 10.0
+    )
+    entry_alpha_effective = max(float(cfg.entry_alpha), min(0.95, float(entry_alpha_effective)))
+
+    if alpha.alpha >= float(entry_alpha_effective):
         conf = min(0.95, 0.50 + alpha.alpha * 0.45)
         return MarketOpinion(
             signal="LONG",
@@ -262,6 +274,10 @@ def market_agent_opine(
                 "rev_s": alpha.rev_s,
                 "signal_target_pct": alpha.signal_target_pct,
                 "strategy_tag": alpha.strategy_tag_candidate,
+                "entry_alpha": float(cfg.entry_alpha),
+                "entry_alpha_effective": float(entry_alpha_effective),
+                "spread_bps": float(spread_bps),
+                "fee_total_bps": float(fee_total_bps),
             },
         )
 
@@ -279,5 +295,11 @@ def market_agent_opine(
         entry_allowed=False,
         exit_reason=None,
         reason_codes=[ReasonCode.RG_EDGE_TOO_LOW.value],
-        reason={"alpha": alpha.alpha, "entry_alpha": cfg.entry_alpha},
+        reason={
+            "alpha": alpha.alpha,
+            "entry_alpha": float(cfg.entry_alpha),
+            "entry_alpha_effective": float(entry_alpha_effective),
+            "spread_bps": float(spread_bps),
+            "fee_total_bps": float(fee_total_bps),
+        },
     )
