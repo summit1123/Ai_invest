@@ -289,15 +289,18 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             float(rules.risk.max_position_pct_per_symbol),
         )
         daily_loss_pct = 0.0
+        daily_trades_count = 0
         try:
             today_kst = _utcnow().astimezone(KST).date().isoformat()
             latest_daily = (repo.fetch_pnl_daily(limit=1) or [None])[0]
             if isinstance(latest_daily, dict) and str(latest_daily.get("day") or "") == today_kst:
                 realized = float(latest_daily.get("realized_pnl") or 0.0)
+                daily_trades_count = int(float(latest_daily.get("trades_count") or 0.0))
                 if realized < 0 and float(equity) > 0:
                     daily_loss_pct = abs(float(realized)) / float(equity) * 100.0
         except Exception:
             daily_loss_pct = 0.0
+            daily_trades_count = 0
         plan_target_pct = None
         raw_plan_target_pct = None
         plan_activation_gate: dict[str, Any] = {}
@@ -412,6 +415,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             context={
                 "account": {
                     "daily_loss_pct": float(daily_loss_pct),
+                    "daily_trades_count": int(daily_trades_count),
                     "cash_krw": float(cash),
                     "equity_krw": float(equity),
                     "position_value_krw": float(pos_value),
@@ -724,7 +728,14 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         safe = safe_judge_decide(
             payload,
             rules=rules,
-            market={"signal": market.signal, "confidence": market.confidence, "signal_target_pct": market.signal_target_pct},
+            market={
+                "signal": market.signal,
+                "confidence": market.confidence,
+                "signal_target_pct": market.signal_target_pct,
+                "alpha": market.alpha,
+                "mom_s": market.mom_s,
+                "rev_s": market.rev_s,
+            },
             regime={"trade_allowed": regime.trade_allowed},
             risk={"veto": risk.veto},
             ops={"veto": ops_op.veto},
