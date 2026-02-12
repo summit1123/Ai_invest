@@ -118,6 +118,7 @@ def safe_judge_decide(
     rate_limit_alert = _as_bool(payload, "ops.rate_limit_alert")
     pause_state = _as_bool(payload, "ops.pause_state")
     daily_loss_pct = _as_float(payload, "context.account.daily_loss_pct")
+    daily_trades_count = _opt_float(payload, "context.account.daily_trades_count")
 
     # Optional context fields (paper/live sizing, trade plan).
     trade_plan_target_pct = _opt_float(payload, "context.trade_plan.target_position_pct")
@@ -158,6 +159,7 @@ def safe_judge_decide(
         "reconciliation_status": recon_status,
         "rate_limit_alert": rate_limit_alert,
         "daily_loss_pct": daily_loss_pct,
+        "daily_trades_count": int(daily_trades_count) if daily_trades_count is not None else None,
         "max_daily_loss_pct": rules.risk.max_daily_loss_pct,
         "spread_bps": spread_bps,
         "max_spread_bps_entry": rules.cost_guard.max_spread_bps_entry,
@@ -224,6 +226,11 @@ def safe_judge_decide(
     else:
         # Soft decision: follow market if present, else HOLD.
         market_signal = str((market or {}).get("signal", "HOLD")).upper()
+        market_alpha = None
+        try:
+            market_alpha = float((market or {}).get("alpha"))
+        except Exception:
+            market_alpha = None
         if market_signal in {"BUY", "LONG"}:
             action = "BUY"
         elif market_signal in {"SELL", "SHORT"}:
@@ -257,6 +264,80 @@ def safe_judge_decide(
         if action == "BUY" and cash_krw is not None and float(cash_krw) < float(rules.execution.min_order_krw):
             action = "HOLD"
             reasons = [ReasonCode.RG_MIN_ORDER_NOT_MET]
+
+        # Always-On Micro Mode:
+        # - When governance plan is HOLD, allow a tiny pilot BUY only under strict conditions.
+        # - Purpose: keep market feedback loop alive without meaningful risk.
+        micro_cfg = (rules.raw.get("governance") or {}) if isinstance(rules.raw, Mapping) else {}
+        micro_cfg = (micro_cfg.get("micro_mode") or {}) if isinstance(micro_cfg, Mapping) else {}
+        micro_enabled = bool(micro_cfg.get("enabled", False))
+        micro_max_position_pct = float(micro_cfg.get("max_position_pct") or 3.0)
+        micro_max_spread_bps = float(micro_cfg.get("max_spread_bps") or 1.0)
+        micro_min_alpha = float(micro_cfg.get("min_alpha") or 0.7)
+        micro_max_daily_loss_pct = float(micro_cfg.get("max_daily_loss_pct") or 0.5)
+        micro_max_trades_per_day = int(micro_cfg.get("max_trades_per_day") or 5)
+        micro_plan_hold_only = bool(micro_cfg.get("plan_hold_only", True))
+        micro_allow_plan_led_entry = bool(micro_cfg.get("allow_plan_led_entry", False))
+        micro_require_market_long = bool(micro_cfg.get("require_market_long", True))
+
+        gates["micro_mode_enabled"] = bool(micro_enabled)
+        gates["micro_mode"] = {
+            "max_position_pct": float(micro_max_position_pct),
+            "max_spread_bps": float(micro_max_spread_bps),
+            "min_alpha": float(micro_min_alpha),
+            "max_daily_loss_pct": float(micro_max_daily_loss_pct),
+            "max_trades_per_day": int(micro_max_trades_per_day),
+            "plan_hold_only": bool(micro_plan_hold_only),
+            "allow_plan_led_entry": bool(micro_allow_plan_led_entry),
+            "require_market_long": bool(micro_require_market_long),
+        }
+
+        plan_decision_effective = str(trade_plan_activation_decision_effective or "").upper()
+        plan_decision_base = str(trade_plan_activation_decision or "").upper()
+        plan_hold_mode_value = str(trade_plan_hold_mode or "").upper()
+        # HOLD plan can appear either as explicit HOLD decision or as HOLD_* mode with PAPER decision_effective.
+        plan_is_hold = bool(
+            plan_decision_effective == "HOLD"
+            or plan_decision_base == "HOLD"
+            or plan_hold_mode_value.startswith("HOLD")
+        )
+        plan_allows_buy = bool(trade_plan_buy_allowed is not False)
+        market_long_ok = bool(market_signal in {"BUY", "LONG"})
+        signal_target_ok = bool(market_signal_target_pct is not None and float(market_signal_target_pct) > 0.0)
+        plan_led_ok = bool(micro_allow_plan_led_entry and plan_target_for_execution is not None and float(plan_target_for_execution) > 0.0)
+        trigger_ok = bool((market_long_ok and signal_target_ok) or plan_led_ok)
+        if micro_require_market_long:
+            trigger_ok = bool(market_long_ok and signal_target_ok)
+
+        micro_allowed_context = (
+            bool(micro_enabled)
+            and action == "HOLD"
+            and bool(plan_allows_buy)
+            and (plan_is_hold if micro_plan_hold_only else True)
+            and bool(trigger_ok)
+        )
+        micro_pass = (
+            micro_allowed_context
+            and (market_alpha is not None and float(market_alpha) >= float(micro_min_alpha))
+            and float(spread_bps) <= float(micro_max_spread_bps)
+            and float(daily_loss_pct) <= float(micro_max_daily_loss_pct)
+            and (
+                daily_trades_count is None
+                or int(float(daily_trades_count)) < int(micro_max_trades_per_day)
+            )
+            and (current_position_pct is None or float(current_position_pct) < float(micro_max_position_pct) - 0.1)
+        )
+        gates["micro_mode_passed"] = bool(micro_pass)
+
+        if micro_pass:
+            action = "BUY"
+            base_target = float(market_signal_target_pct or 0.0)
+            if plan_led_ok and plan_target_for_execution is not None:
+                base_target = max(float(base_target), float(plan_target_for_execution))
+            micro_target = min(float(micro_max_position_pct), float(base_target))
+            effective_target_pct = float(max(0.0, micro_target))
+            gates["effective_target_pct"] = float(effective_target_pct)
+            reasons = [ReasonCode.RG_CAP_PROMOTED]
 
     selected_reason_codes = [c.value for c in validate_reason_codes(reasons, max_items=3)]
 
