@@ -171,9 +171,9 @@ def main() -> int:
     workers_cfg = rules.get("workers") or {}
     legacy_work_interval = float(args.work_interval_sec)
     default_research = float((workers_cfg.get("research_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 3600)))
-    default_quant = float((workers_cfg.get("quant_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 1800)))
-    default_risk = float((workers_cfg.get("risk_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 300)))
-    default_ops = float((workers_cfg.get("ops_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 60)))
+    default_quant = float((workers_cfg.get("quant_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 3600)))
+    default_risk = float((workers_cfg.get("risk_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 3600)))
+    default_ops = float((workers_cfg.get("ops_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 3600)))
     research_interval = float(args.research_interval_sec if args.research_interval_sec > 0 else default_research)
     quant_interval = float(args.quant_interval_sec if args.quant_interval_sec > 0 else default_quant)
     risk_interval = float(args.risk_interval_sec if args.risk_interval_sec > 0 else default_risk)
