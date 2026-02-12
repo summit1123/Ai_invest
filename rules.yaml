@@ -36,9 +36,9 @@ scheduling:
 # 독립 워커 실행 주기(초)
 workers:
   research_interval_sec: 3600
-  quant_interval_sec: 1800
-  risk_interval_sec: 300
-  ops_interval_sec: 60
+  quant_interval_sec: 3600
+  risk_interval_sec: 3600
+  ops_interval_sec: 3600
 
 # Quant 사전검증(경량 리플레이) 가정값
 quant_backtest:
