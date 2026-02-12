@@ -231,10 +231,36 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         except Exception:
             daily_loss_pct = 0.0
         plan_target_pct = None
+        raw_plan_target_pct = None
+        plan_activation_gate: dict[str, Any] = {}
+        plan_activation_decision: str | None = None
+        plan_activation_decision_effective: str | None = None
+        plan_execution_plan: dict[str, Any] = {}
         try:
-            plan_target_pct = float(plan.get("target_position_pct")) if plan and _trade_plan_is_active(plan) else None
+            if plan and _trade_plan_is_active(plan):
+                if isinstance(plan.get("activation_gate"), dict):
+                    plan_activation_gate = dict(plan.get("activation_gate") or {})
+                plan_activation_decision = str(plan_activation_gate.get("decision") or "").strip().upper() or None
+                plan_activation_decision_effective = (
+                    str(plan_activation_gate.get("decision_effective") or "").strip().upper() or None
+                )
+                if isinstance(plan.get("execution_plan"), dict):
+                    plan_execution_plan = dict(plan.get("execution_plan") or {})
+                execution_target = None
+                if isinstance(plan_execution_plan.get("final_numbers"), dict):
+                    execution_target = (plan_execution_plan.get("final_numbers") or {}).get("target_position_pct")
+                raw_plan_target_pct = (
+                    float(execution_target)
+                    if execution_target is not None
+                    else float(plan.get("target_position_pct"))
+                )
+                plan_target_pct = float(raw_plan_target_pct)
+                if str(plan_activation_decision_effective or plan_activation_decision or "").upper() == "HOLD":
+                    plan_target_pct = 0.0
+                    raw_plan_target_pct = 0.0
         except Exception:
             plan_target_pct = None
+            raw_plan_target_pct = None
         if plan_target_pct is not None:
             plan_target_pct = max(0.0, min(float(plan_target_pct), float(effective_target_cap)))
         quote_ts = _utcnow()
@@ -337,13 +363,15 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "trade_plan": {
                     "slot_key": plan.get("slot_key") if plan else None,
                     "target_position_pct": plan_target_pct,
-                    "raw_target_position_pct": (plan.get("target_position_pct") if plan else None),
+                    "raw_target_position_pct": (raw_plan_target_pct if raw_plan_target_pct is not None else (plan.get("target_position_pct") if plan else None)),
                     "valid_to_kst": plan.get("valid_to_kst") if plan else None,
                     "allowed_actions": (
                         plan.get("allowed_actions")
                         if (plan and isinstance(plan.get("allowed_actions"), dict))
                         else {}
                     ),
+                    "activation_gate": dict(plan_activation_gate or {}),
+                    "execution_plan": dict(plan_execution_plan or {}),
                 },
             },
         )
