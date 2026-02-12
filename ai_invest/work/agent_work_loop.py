@@ -11,10 +11,11 @@ from ai_invest.agents.research_agent import research_agent_daily_brief
 from ai_invest.config.capital_policy import resolve_capital_policy
 from ai_invest.config.llm_router import llm_route_for_agent
 from ai_invest.config.rules_loader import RulesConfig, load_rules
-from ai_invest.market_data.features import build_feature_snapshot_from_candles, compute_rsi, compute_volume_zscore
+from ai_invest.market_data.features import build_alpha_features_from_1m_candles
 from ai_invest.market_data.universe_selector import resolve_dynamic_universe
 from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_market_snapshot
 from ai_invest.research.rss import fetch_crypto_headlines
+from ai_invest.strategy.alpha_score import compute_alpha_score, load_alpha_score_config
 from ai_invest.storage.postgres import DbAgentDailyReport, DbEvent, PostgresRepo
 
 KST = ZoneInfo("Asia/Seoul")
@@ -175,14 +176,24 @@ def _store_report(
     return report_id
 
 
-def _build_features(*, symbol: str, tf_min: int) -> tuple[dict[str, float], dict[str, float]]:
+def _build_features(*, symbol: str, lookback_minutes: int, alpha_cfg) -> tuple[dict[str, float], dict[str, float]]:
     snap = fetch_market_snapshot(symbol)
-    candles = fetch_candles_minutes(symbol, unit=tf_min, count=200)
+    candles = fetch_candles_minutes(symbol, unit=1, count=max(120, int(lookback_minutes)))
     highs = [float(c["high_price"]) for c in candles]
     lows = [float(c["low_price"]) for c in candles]
     closes = [float(c["trade_price"]) for c in candles]
     volumes = [float(c["candle_acc_trade_volume"]) for c in candles]
-    feat = build_feature_snapshot_from_candles(highs=highs, lows=lows, closes=closes, volumes=volumes)
+    alpha_features = build_alpha_features_from_1m_candles(
+        highs=highs,
+        lows=lows,
+        closes=closes,
+        volumes=volumes,
+        ema_fast=int(alpha_cfg.ema_fast),
+        ema_slow=int(alpha_cfg.ema_slow),
+        ret_short_bars=int(alpha_cfg.ret_short_mins),
+        ret_long_bars=int(alpha_cfg.ret_long_mins),
+    )
+    alpha_res = compute_alpha_score(features=alpha_features, cfg=alpha_cfg)
     snapshot = {
         "last_price": float(snap.last_price),
         "best_bid": float(snap.best_bid),
@@ -190,33 +201,48 @@ def _build_features(*, symbol: str, tf_min: int) -> tuple[dict[str, float], dict
         "mid_price": float(snap.mid_price),
         "spread_bps": float(snap.spread_bps),
     }
-    features = {
-        "atr_pct": float(feat.atr_pct),
-        "rsi_14": float(feat.rsi_14),
-        "vol_zscore": float(feat.vol_zscore),
-    }
+    features = dict(alpha_features)
+    features.update(
+        {
+            "mom_s": float(alpha_res.mom_s),
+            "rev_s": float(alpha_res.rev_s),
+            "alpha": float(alpha_res.alpha),
+            "signal_target_pct": float(alpha_res.signal_target_pct),
+            "strength": float(alpha_res.strength),
+            "vol_scale": float(alpha_res.vol_scale),
+            "strategy_tag_candidate": str(alpha_res.strategy_tag_candidate),
+        }
+    )
     return snapshot, features
 
 
-def _quant_candidate_rows(*, rules_raw: Mapping[str, Any], rules: RulesConfig, symbols: Sequence[str], tf_min: int) -> list[dict[str, Any]]:
-    signal_cfg = (rules_raw.get("signal") or {}) if isinstance(rules_raw, Mapping) else {}
-    cost_cfg = (rules_raw.get("cost_guard") or {}) if isinstance(rules_raw, Mapping) else {}
+def _candidate_score_alpha(*, alpha: float, spread_bps: float, max_spread_bps: float) -> float:
+    score = float(alpha)
+    if spread_bps > max_spread_bps:
+        score -= (spread_bps - max_spread_bps) / 100.0
+    return float(score)
 
-    rsi_min = _as_float(signal_cfg.get("rsi_min"), default=50.0)
-    vol_min = _as_float(signal_cfg.get("volume_zscore_min"), default=1.2)
+
+def _quant_candidate_rows(
+    *,
+    rules_raw: Mapping[str, Any],
+    rules: RulesConfig,
+    symbols: Sequence[str],
+    lookback_minutes: int,
+    alpha_cfg,
+) -> list[dict[str, Any]]:
+    cost_cfg = (rules_raw.get("cost_guard") or {}) if isinstance(rules_raw, Mapping) else {}
     max_spread = _as_float(cost_cfg.get("max_spread_bps_entry"), default=float(rules.cost_guard.max_spread_bps_entry))
 
     out: list[dict[str, Any]] = []
     for sym in list(symbols):
         try:
-            snapshot, features = _build_features(symbol=sym, tf_min=tf_min)
-            score = _candidate_score(
-                rsi=_as_float(features.get("rsi_14")),
-                vol_z=_as_float(features.get("vol_zscore")),
-                spread_bps=_as_float(snapshot.get("spread_bps")),
-                rsi_min=rsi_min,
-                vol_min=vol_min,
-                max_spread=max_spread,
+            snapshot, features = _build_features(symbol=sym, lookback_minutes=int(lookback_minutes), alpha_cfg=alpha_cfg)
+            alpha = _as_float(features.get("alpha"), default=0.0)
+            score = _candidate_score_alpha(
+                alpha=float(alpha),
+                spread_bps=_as_float(snapshot.get("spread_bps"), default=0.0),
+                max_spread_bps=max_spread,
             )
             out.append(
                 {
@@ -243,27 +269,18 @@ def _quant_candidate_rows(*, rules_raw: Mapping[str, Any], rules: RulesConfig, s
 def _quick_backtest_candidate(
     *,
     symbol: str,
-    tf_min: int,
-    rsi_min: float,
-    vol_min: float,
+    alpha_cfg,
     fee_total_bps: float,
     base_slippage_bps: float = 1.0,
     spread_penalty_mult: float = 0.30,
     low_liquidity_penalty_bps: float = 1.2,
     fill_ratio: float = 1.0,
-    hold_bars: int = 24,
     lookback_bars: int = 500,
 ) -> dict[str, Any]:
-    """Lightweight rule replay for quant prework.
-
-    This is intentionally simple/fast (v1.5):
-    - entry: RSI>=rsi_min and vol_z>=vol_min
-    - exit : RSI < max(45, rsi_min-8) or hold_bars timeout
-    - costs: fee + slippage + spread-like candle-range penalty + liquidity penalty
-    """
+    """Lightweight replay aligned with AlphaScore entry/exit/cooldown."""
 
     try:
-        candles = fetch_candles_minutes(symbol, unit=tf_min, count=max(80, int(lookback_bars)))
+        candles = fetch_candles_minutes(symbol, unit=1, count=max(120, int(lookback_bars)))
     except Exception as exc:
         return {
             "symbol": symbol,
@@ -274,6 +291,8 @@ def _quick_backtest_candidate(
             "net_return_pct": 0.0,
             "max_drawdown_pct": 0.0,
             "avg_trade_return_pct": 0.0,
+            "profit_factor": 0.0,
+            "expectancy_after_cost_pct": 0.0,
             "backtest_score": -99.0,
         }
 
@@ -282,7 +301,7 @@ def _quick_backtest_candidate(
     closes = [float(c.get("trade_price") or 0.0) for c in candles]
     volumes = [float(c.get("candle_acc_trade_volume") or 0.0) for c in candles]
     n = min(len(highs), len(lows), len(closes), len(volumes))
-    if n < 60:
+    if n < 120:
         return {
             "symbol": symbol,
             "ok": False,
@@ -292,6 +311,8 @@ def _quick_backtest_candidate(
             "net_return_pct": 0.0,
             "max_drawdown_pct": 0.0,
             "avg_trade_return_pct": 0.0,
+            "profit_factor": 0.0,
+            "expectancy_after_cost_pct": 0.0,
             "backtest_score": -99.0,
         }
 
@@ -301,35 +322,73 @@ def _quick_backtest_candidate(
     in_pos = False
     entry_px = 0.0
     entry_i = -1
+    hwm = 0.0
+    strategy_tag = "MOM"
+    cooldown_until_i = -1
     trades = 0
     wins = 0
     sum_ret_pct = 0.0
+    sum_win = 0.0
+    sum_loss_abs = 0.0
     fee_rate = max(0.0, float(fee_total_bps)) / 10000.0
     fill_ratio_n = max(0.2, min(1.0, float(fill_ratio)))
+    lookback = max(80, int(alpha_cfg.lookback_minutes))
+    warmup = max(80, int(alpha_cfg.ema_slow) + 5, int(alpha_cfg.ret_long_mins) + 1)
+    cooldown_bars = max(0, int(alpha_cfg.cooldown_minutes))
 
-    for i in range(30, n):
+    for i in range(warmup, n):
         px = float(closes[i])
         if px <= 0:
             continue
-        rsi = float(compute_rsi(closes[: i + 1], period=14))
-        volz = float(compute_volume_zscore(volumes[: i + 1], window=20))
+        start = max(0, i - lookback + 1)
+        f = build_alpha_features_from_1m_candles(
+            highs=highs[start : i + 1],
+            lows=lows[start : i + 1],
+            closes=closes[start : i + 1],
+            volumes=volumes[start : i + 1],
+            ema_fast=int(alpha_cfg.ema_fast),
+            ema_slow=int(alpha_cfg.ema_slow),
+            ret_short_bars=int(alpha_cfg.ret_short_mins),
+            ret_long_bars=int(alpha_cfg.ret_long_mins),
+        )
+        a = compute_alpha_score(features=f, cfg=alpha_cfg)
+        atr_pct = _as_float(f.get("atr_pct"), default=0.0)
+        rsi = _as_float(f.get("rsi_14"), default=50.0)
+        ema20 = _as_float(f.get("ema20"), default=0.0)
+        ema60 = _as_float(f.get("ema60"), default=0.0)
+        volz = _as_float(f.get("vol_zscore"), default=0.0)
 
         if not in_pos:
-            if rsi >= float(rsi_min) and volz >= float(vol_min):
+            if i < cooldown_until_i:
+                continue
+            if float(a.alpha) >= float(alpha_cfg.entry_alpha):
                 in_pos = True
                 entry_px = px
                 entry_i = i
+                hwm = px
+                strategy_tag = str(a.strategy_tag_candidate)
             continue
 
-        bars_held = max(0, i - entry_i)
-        exit_cond = (rsi < max(45.0, float(rsi_min) - 8.0)) or (bars_held >= int(hold_bars))
+        hwm = max(hwm, px)
+        stop_pct = float(alpha_cfg.stop_atr_mult) * (atr_pct / 100.0)
+        trail_pct = float(alpha_cfg.trail_atr_mult) * (atr_pct / 100.0)
+        hold_minutes = max(0, i - entry_i)
+        time_limit = int(alpha_cfg.time_stop_rev_minutes) if str(strategy_tag).upper() == "REV" else int(alpha_cfg.time_stop_mom_minutes)
+        exit_cond = False
+        if stop_pct > 0 and px <= entry_px * (1.0 - stop_pct):
+            exit_cond = True
+        elif trail_pct > 0 and px <= hwm * (1.0 - trail_pct):
+            exit_cond = True
+        elif rsi <= float(alpha_cfg.exit_rsi) or (ema20 > 0 and ema60 > 0 and ema20 < ema60):
+            exit_cond = True
+        elif hold_minutes >= time_limit:
+            exit_cond = True
         if not exit_cond:
             continue
 
         gross = (px - entry_px) / entry_px if entry_px > 0 else 0.0
-        # Candle range as spread proxy (in bps)
         range_pct = ((float(highs[i]) - float(lows[i])) / px * 100.0) if px > 0 else 0.0
-        spread_like_bps = max(0.0, float(range_pct) * 100.0)  # 1% range -> 100 bps proxy
+        spread_like_bps = max(0.0, float(range_pct) * 100.0)
         liq_pen = max(0.0, -float(volz)) * float(low_liquidity_penalty_bps)
         slippage_total_bps = (float(base_slippage_bps) * 2.0) + (float(spread_penalty_mult) * spread_like_bps) + liq_pen
         total_cost_rate = fee_rate + (slippage_total_bps / 10000.0)
@@ -343,15 +402,20 @@ def _quick_backtest_candidate(
         sum_ret_pct += ret_pct
         if net > 0:
             wins += 1
+            sum_win += ret_pct
+        else:
+            sum_loss_abs += abs(ret_pct)
         in_pos = False
         entry_px = 0.0
         entry_i = -1
+        hwm = 0.0
+        cooldown_until_i = i + cooldown_bars
 
-    # Force close at last bar for open trade
     if in_pos and entry_px > 0:
-        last_px = float(closes[n - 1])
+        last_i = n - 1
+        last_px = float(closes[last_i])
         gross = (last_px - entry_px) / entry_px if entry_px > 0 else 0.0
-        range_pct = ((float(highs[n - 1]) - float(lows[n - 1])) / last_px * 100.0) if last_px > 0 else 0.0
+        range_pct = ((float(highs[last_i]) - float(lows[last_i])) / last_px * 100.0) if last_px > 0 else 0.0
         spread_like_bps = max(0.0, float(range_pct) * 100.0)
         net = (gross * fill_ratio_n) - (fee_rate + ((float(base_slippage_bps) * 2.0 + float(spread_penalty_mult) * spread_like_bps) / 10000.0))
         eq *= max(0.0, 1.0 + net)
@@ -363,11 +427,15 @@ def _quick_backtest_candidate(
         sum_ret_pct += ret_pct
         if net > 0:
             wins += 1
+            sum_win += ret_pct
+        else:
+            sum_loss_abs += abs(ret_pct)
 
     win_rate = (float(wins) / float(trades) * 100.0) if trades > 0 else 0.0
     net_return_pct = (eq - 1.0) * 100.0
     avg_trade = (sum_ret_pct / float(trades)) if trades > 0 else 0.0
-    # Reward net return/win-rate, penalize drawdown.
+    expectancy = float(avg_trade)
+    profit_factor = (float(sum_win) / float(sum_loss_abs)) if sum_loss_abs > 0 else (999.0 if sum_win > 0 else 0.0)
     backtest_score = float(net_return_pct) + 0.10 * float(win_rate) - 0.70 * float(max_dd * 100.0)
 
     return {
@@ -378,6 +446,8 @@ def _quick_backtest_candidate(
         "net_return_pct": float(net_return_pct),
         "max_drawdown_pct": float(max_dd * 100.0),
         "avg_trade_return_pct": float(avg_trade),
+        "profit_factor": float(profit_factor),
+        "expectancy_after_cost_pct": float(expectancy),
         "backtest_score": float(backtest_score),
         "assumptions": {
             "fee_total_bps": float(fee_total_bps),
@@ -385,6 +455,7 @@ def _quick_backtest_candidate(
             "spread_penalty_mult": float(spread_penalty_mult),
             "low_liquidity_penalty_bps": float(low_liquidity_penalty_bps),
             "fill_ratio": float(fill_ratio_n),
+            "entry_alpha": float(alpha_cfg.entry_alpha),
         },
     }
 
@@ -419,19 +490,33 @@ def run_agent_work_cycle(
         raise ValueError("selected_agents is empty")
 
     rules = load_rules("rules.yaml")
+    alpha_cfg = load_alpha_score_config(rules_raw=rules_raw)
     universe = resolve_dynamic_universe(rules_raw=rules_raw, fallback_symbols=list(rules.universe.symbols))
-    symbols = list(universe.symbols) or list(rules.universe.symbols)
+    allowed_symbols = [str(s).strip().upper() for s in list(rules.universe.symbols)]
+    dynamic_symbols = [str(s).strip().upper() for s in list(universe.symbols or []) if str(s).strip()]
+    excluded_symbols = [s for s in dynamic_symbols if s not in set(allowed_symbols)]
+    symbols = [s for s in dynamic_symbols if s in set(allowed_symbols)] or list(allowed_symbols)
     default_symbol = symbols[0]
-    tf_min = _timeframe_to_minutes(str((rules_raw.get("signal") or {}).get("timeframe_entry") or "15m"))
+    lookback_minutes = max(120, int(alpha_cfg.lookback_minutes))
 
     need_market_ctx = bool({"research_agent", "quant_strategist"} & selected)
-    candidates: list[dict[str, Any]] = _quant_candidate_rows(rules_raw=rules_raw, rules=rules, symbols=symbols, tf_min=tf_min) if need_market_ctx else []
+    candidates: list[dict[str, Any]] = (
+        _quant_candidate_rows(
+            rules_raw=rules_raw,
+            rules=rules,
+            symbols=symbols,
+            lookback_minutes=lookback_minutes,
+            alpha_cfg=alpha_cfg,
+        )
+        if need_market_ctx
+        else []
+    )
     top = candidates[0] if candidates else {"symbol": default_symbol, "score": 0.0, "snapshot": {}, "features": {}}
     symbol = str(top.get("symbol") or default_symbol)
     snapshot = (top.get("snapshot") or {}) if isinstance(top.get("snapshot"), Mapping) else {}
     features = (top.get("features") or {}) if isinstance(top.get("features"), Mapping) else {}
     if need_market_ctx and (not snapshot or not features):
-        snapshot, features = _build_features(symbol=symbol, tf_min=tf_min)
+        snapshot, features = _build_features(symbol=symbol, lookback_minutes=lookback_minutes, alpha_cfg=alpha_cfg)
 
     # Shared state
     pause = repo.fetch_pause_state()
@@ -501,9 +586,6 @@ def run_agent_work_cycle(
     if "quant_strategist" in selected:
         quant_tasks = repo.fetch_ready_agent_tasks(agent_name="quant_strategist", limit=10)
         top = candidates[0] if candidates else {"symbol": symbol, "score": 0.0, "snapshot": snapshot, "features": features}
-        signal_cfg = (rules_raw.get("signal") or {}) if isinstance(rules_raw, Mapping) else {}
-        rsi_min = _as_float(signal_cfg.get("rsi_min"), default=50.0)
-        vol_min = _as_float(signal_cfg.get("volume_zscore_min"), default=1.2)
         fees_cfg = (rules_raw.get("fees") or {}) if isinstance(rules_raw, Mapping) else {}
         fee_total_bps = _as_float(fees_cfg.get("fallback_bid_fee_bps"), default=5.0) + _as_float(
             fees_cfg.get("fallback_ask_fee_bps"), default=5.0
@@ -513,7 +595,6 @@ def run_agent_work_cycle(
         spread_penalty_mult = _as_float(bt_cfg.get("spread_penalty_mult"), default=0.30)
         low_liquidity_penalty_bps = _as_float(bt_cfg.get("low_liquidity_penalty_bps"), default=1.2)
         fill_ratio = _as_float(bt_cfg.get("fill_ratio"), default=0.92)
-        hold_bars = int(_as_float(bt_cfg.get("hold_bars"), default=24))
         lookback_bars = int(_as_float(bt_cfg.get("lookback_bars"), default=500))
         backtests: list[dict[str, Any]] = []
         for row in candidates[: min(8, len(candidates))]:
@@ -522,15 +603,12 @@ def run_agent_work_cycle(
                 continue
             bt = _quick_backtest_candidate(
                 symbol=sym,
-                tf_min=tf_min,
-                rsi_min=rsi_min,
-                vol_min=vol_min,
+                alpha_cfg=alpha_cfg,
                 fee_total_bps=fee_total_bps,
                 base_slippage_bps=base_slippage_bps,
                 spread_penalty_mult=spread_penalty_mult,
                 low_liquidity_penalty_bps=low_liquidity_penalty_bps,
                 fill_ratio=fill_ratio,
-                hold_bars=hold_bars,
                 lookback_bars=lookback_bars,
             )
             backtests.append(bt)
@@ -586,21 +664,21 @@ def run_agent_work_cycle(
                     "total_krw_markets": universe.total_krw_markets,
                     "ranked_count": universe.ranked_count,
                     "symbols": symbols[:20],
+                    "excluded_not_allowed": excluded_symbols[:50],
                     "top24h_turnover": universe.top24h_turnover[:10],
                 },
                 "candidates": candidates[:8],
                 "backtest": {
-                    "engine": "quick_rsi_vol_replay_v1_5",
+                    "engine": "quick_alpha_score_replay_v1_0",
                     "params": {
-                        "tf_min": tf_min,
-                        "rsi_min": rsi_min,
-                        "vol_min": vol_min,
+                        "tf_min": 1,
+                        "entry_alpha": alpha_cfg.entry_alpha,
+                        "cooldown_minutes": alpha_cfg.cooldown_minutes,
                         "fee_total_bps": fee_total_bps,
                         "base_slippage_bps": base_slippage_bps,
                         "spread_penalty_mult": spread_penalty_mult,
                         "low_liquidity_penalty_bps": low_liquidity_penalty_bps,
                         "fill_ratio": fill_ratio,
-                        "hold_bars": hold_bars,
                         "lookback_bars": lookback_bars,
                     },
                     "ranked": sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)[:8],
