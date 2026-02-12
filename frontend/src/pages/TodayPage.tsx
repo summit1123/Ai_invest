@@ -17,6 +17,20 @@ function actionPillClass(action: string): string {
   return 'pill'
 }
 
+function signedPctText(v: number | null | undefined): string {
+  if (v == null || Number.isNaN(v)) return '-'
+  const n = Number(v)
+  const s = n > 0 ? '+' : ''
+  return `${s}${fmtNumber(n, 2)}%`
+}
+
+function signedKrwText(v: number | null | undefined): string {
+  if (v == null || Number.isNaN(v)) return '-'
+  const n = Number(v)
+  const s = n > 0 ? '+' : ''
+  return `${s}${fmtNumber(n, 0)}`
+}
+
 export function TodayPage() {
   const q = useQuery({
     queryKey: ['today-overview'],
@@ -103,6 +117,34 @@ export function TodayPage() {
             <span style={{ opacity: 0.35 }}> · </span>
             노출비중: <span className="mono">{fmtNumber(portfolio?.exposure_pct, 1)}%</span>
           </div>
+          <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+            미실현 손익: <span className="mono">{signedKrwText(portfolio?.total_unrealized_pnl_krw)}</span>
+            <span style={{ opacity: 0.35 }}> · </span>
+            수익률: <span className="mono">{signedPctText(portfolio?.total_unrealized_pnl_pct_on_entry)}</span>
+          </div>
+          {Array.isArray(portfolio?.positions) && portfolio.positions.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              {portfolio.positions.map((pos) => (
+                <div key={pos.symbol} style={{ fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
+                  <div>
+                    <span style={{ fontWeight: 700 }}>{pos.symbol}</span>
+                    <span style={{ opacity: 0.35 }}> · </span>
+                    수량 <span className="mono">{fmtNumber(pos.qty, 6)}</span>
+                  </div>
+                  <div className="muted">
+                    매수 <span className="mono">{fmtNumber(pos.avg_entry_price, 0)}</span>
+                    <span style={{ opacity: 0.35 }}> → </span>
+                    현재 <span className="mono">{fmtNumber(pos.mark_price, 0)}</span>
+                  </div>
+                  <div className="muted">
+                    손익 <span className="mono">{signedKrwText(pos.unrealized_pnl_krw)}</span>
+                    <span style={{ opacity: 0.35 }}> · </span>
+                    <span className="mono">{signedPctText(pos.unrealized_pnl_pct)}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
 
         <div className="card">
