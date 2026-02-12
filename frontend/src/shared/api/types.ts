@@ -202,6 +202,43 @@ export type GovernanceStatusView = {
   completed_tasks: TimelineEvent[]
 }
 
+export type ExecutionPlanView = {
+  schema_version?: string
+  symbol?: string
+  final_numbers?: {
+    target_position_pct?: number
+    rebalance_band_pct?: number
+    cooldown_minutes?: number
+  }
+  gates?: Record<string, unknown>
+  sizing_rule?: string
+  rebalance_rule?: string
+  execution_style?: string
+}
+
+export type TradePlanPayloadV2 = {
+  slot_key?: string
+  meeting_id?: string
+  symbol?: string
+  target_position_pct?: number
+  valid_from_kst?: string
+  valid_to_kst?: string
+  allowed_actions?: { buy?: boolean; sell?: boolean }
+  activation_status?: string
+  activation_gate?: {
+    decision?: 'LIVE' | 'PAPER' | 'HOLD'
+    decision_effective?: 'LIVE' | 'PAPER' | 'HOLD'
+    reason_code?: string
+    [key: string]: unknown
+  }
+  final_trade_plan_v2?: Record<string, unknown>
+  execution_plan?: ExecutionPlanView
+  allocator_result?: Record<string, unknown>
+  cost_model?: Record<string, unknown>
+  paper_live_policy?: Record<string, unknown>
+  [key: string]: unknown
+}
+
 export type AgentOpinionView = {
   opinion_id: string
   ts: string

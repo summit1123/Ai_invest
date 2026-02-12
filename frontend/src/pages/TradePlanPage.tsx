@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { apiGet } from '../shared/api/client'
 import { fmtTsKst } from '../shared/format'
+import type { TradePlanPayloadV2 } from '../shared/api/types'
 
 type TradePlanEvent = {
   event_id: string
@@ -47,7 +48,11 @@ export function TradePlanPage() {
   }
 
   const ev = q.data?.event ?? null
-  const p = (ev?.payload as any) ?? null
+  const p = (ev?.payload as TradePlanPayloadV2 | null) ?? null
+  const activationGate = (p?.activation_gate as any) ?? {}
+  const executionPlan = (p?.execution_plan as any) ?? {}
+  const executionNumbers = (executionPlan?.final_numbers as any) ?? {}
+  const activationDecision = String(activationGate?.decision_effective ?? activationGate?.decision ?? '-')
 
   return (
     <div className="page">
@@ -83,7 +88,17 @@ export function TradePlanPage() {
                   target_position_pct: <span className="mono">{String(p?.target_position_pct ?? '')}</span>
                 </div>
                 <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                  activation decision: <span className="mono">{activationDecision}</span>
+                </div>
+                <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
                   valid_to: <span className="mono">{String(p?.valid_to_kst ?? p?.valid_to ?? '')}</span>
+                </div>
+                <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>
+                  execution target: <span className="mono">{String(executionNumbers?.target_position_pct ?? '-')}</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  band: <span className="mono">{String(executionNumbers?.rebalance_band_pct ?? '-')}</span>
+                  <span style={{ opacity: 0.35 }}> · </span>
+                  cooldown: <span className="mono">{String(executionNumbers?.cooldown_minutes ?? '-')}</span>
                 </div>
                 <div className="muted" style={{ fontSize: 12, marginTop: 10 }}>
                   notes: <span className="mono">{String(p?.notes ?? '')}</span>
@@ -104,4 +119,3 @@ export function TradePlanPage() {
     </div>
   )
 }
-
