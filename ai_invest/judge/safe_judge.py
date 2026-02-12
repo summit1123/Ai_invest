@@ -78,6 +78,7 @@ class SafeJudgeDecision:
     action: str  # BUY / SELL / HOLD / PAUSE
     score: float | None
     confidence: float | None
+    effective_target_pct: float | None
     gates: dict[str, Any]
     selected_reasons: list[str]
     rejected_reasons: list[str]
@@ -113,6 +114,20 @@ def safe_judge_decide(
     trade_plan_sell_allowed = _opt_bool(payload, "context.trade_plan.allowed_actions.sell")
     current_position_pct = _opt_float(payload, "context.position.current_position_pct")
     cash_krw = _opt_float(payload, "context.account.cash_krw")
+    market_signal_target_pct = None
+    if market is not None:
+        try:
+            market_signal_target_pct = float((market or {}).get("signal_target_pct"))
+        except Exception:
+            market_signal_target_pct = None
+
+    effective_target_pct: float | None
+    if trade_plan_target_pct is None:
+        effective_target_pct = market_signal_target_pct
+    elif market_signal_target_pct is None:
+        effective_target_pct = trade_plan_target_pct
+    else:
+        effective_target_pct = min(float(trade_plan_target_pct), float(market_signal_target_pct))
 
     gates: dict[str, Any] = {
         "symbol": symbol,
@@ -126,6 +141,8 @@ def safe_judge_decide(
         "trade_plan_target_pct": trade_plan_target_pct,
         "trade_plan_buy_allowed": trade_plan_buy_allowed,
         "trade_plan_sell_allowed": trade_plan_sell_allowed,
+        "signal_target_pct": market_signal_target_pct,
+        "effective_target_pct": effective_target_pct,
         "current_position_pct": current_position_pct,
         "cash_krw": cash_krw,
     }
@@ -194,11 +211,11 @@ def safe_judge_decide(
             reasons = [ReasonCode.RG_SIGNAL_CONFLICT]
 
         # Trade Plan gating (position sizing guard): if plan says "flat" or already at target, do not buy.
-        if action == "BUY" and trade_plan_target_pct is not None:
-            if float(trade_plan_target_pct) <= 0:
+        if action == "BUY" and effective_target_pct is not None:
+            if float(effective_target_pct) <= 0:
                 action = "HOLD"
                 reasons = [ReasonCode.RG_TRADE_PLAN_FLAT]
-            elif current_position_pct is not None and float(current_position_pct) >= float(trade_plan_target_pct) - 0.25:
+            elif current_position_pct is not None and float(current_position_pct) >= float(effective_target_pct) - 0.25:
                 action = "HOLD"
                 reasons = [ReasonCode.RG_TRADE_PLAN_TARGET_REACHED]
 
@@ -226,6 +243,7 @@ def safe_judge_decide(
         action=action,
         score=score,
         confidence=confidence,
+        effective_target_pct=effective_target_pct,
         gates=gates,
         selected_reasons=selected_reason_codes,
         rejected_reasons=[],
