@@ -49,15 +49,22 @@ export type TodayOverview = {
     position_value_krw: number
     equity_krw: number
     exposure_pct: number
+    total_entry_value_krw?: number
+    total_unrealized_pnl_krw?: number
+    total_unrealized_pnl_pct_on_entry?: number
+    total_unrealized_pnl_pct_on_equity?: number
     positions_count: number
     positions: {
       symbol: string
       qty: number
       avg_entry_price: number | null
+      entry_value_krw?: number | null
       mark_price: number
       mid_price: number | null
       value_krw: number
       unrealized_pnl_krw: number | null
+      unrealized_pnl_pct?: number | null
+      pnl_direction?: 'PLUS' | 'MINUS' | 'FLAT' | string | null
       ts_updated: string | null
       quote_ts: string | null
     }[]
