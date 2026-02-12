@@ -232,7 +232,7 @@ def strategy_reviews(
 @app.get("/api/v1/ui/trade-plan/latest", tags=["거버넌스"], summary="최신 Trade Plan(종목/비중)")
 def latest_trade_plan() -> dict[str, Any]:
     repo = PostgresRepo()
-    ev = repo.fetch_latest_event(event_type="TRADE_PLAN_SET")
+    ev = repo.fetch_latest_trade_plan_event(prefer_active=True)
     return ok({"event": ev})
 
 
@@ -244,7 +244,7 @@ def governance_status(
     repo = PostgresRepo()
     policy_active = repo.fetch_latest_event(event_type="GOVERNANCE_POLICY_SET")
     policy_proposed = repo.fetch_latest_event(event_type="GOVERNANCE_POLICY_PROPOSED")
-    plan_active = repo.fetch_latest_event(event_type="TRADE_PLAN_SET")
+    plan_active = repo.fetch_latest_trade_plan_event(prefer_active=True)
     plan_proposed = repo.fetch_latest_event(event_type="TRADE_PLAN_PROPOSED")
     plan_blocked = repo.fetch_latest_event(event_type="TRADE_PLAN_BLOCKED")
 
