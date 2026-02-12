@@ -74,6 +74,16 @@ class AlphaScoreConfig:
     cooldown_minutes: int
     atr_block_pct: float
     daily_loss_entry_block_ratio: float
+    # Mom score weights (normalized internally).
+    mom_weight_rsi: float
+    mom_weight_vol: float
+    mom_weight_ret: float
+    mom_weight_trend: float
+    # Reduce REV dominance when higher-timeframe trend is weak.
+    rev_penalty_when_trend_weak: float
+    # Dynamic entry alpha adjustment coefficients (cost-aware).
+    entry_alpha_spread_k: float
+    entry_alpha_fee_k: float
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,13 @@ def load_alpha_score_config(*, rules_raw: Mapping[str, Any]) -> AlphaScoreConfig
             default=_as_float(regime.get("volatility_block_atr_pct"), default=2.5),
         ),
         daily_loss_entry_block_ratio=_as_float(cfg.get("daily_loss_entry_block_ratio"), default=0.8),
+        mom_weight_rsi=_as_float(cfg.get("mom_weight_rsi"), default=0.20),
+        mom_weight_vol=_as_float(cfg.get("mom_weight_vol"), default=0.15),
+        mom_weight_ret=_as_float(cfg.get("mom_weight_ret"), default=0.40),
+        mom_weight_trend=_as_float(cfg.get("mom_weight_trend"), default=0.25),
+        rev_penalty_when_trend_weak=_as_float(cfg.get("rev_penalty_when_trend_weak"), default=0.80),
+        entry_alpha_spread_k=_as_float(cfg.get("entry_alpha_spread_k"), default=0.03),
+        entry_alpha_fee_k=_as_float(cfg.get("entry_alpha_fee_k"), default=0.05),
     )
 
 
@@ -140,16 +157,23 @@ def compute_alpha_score(*, features: Mapping[str, Any], cfg: AlphaScoreConfig) -
     s_vol = clamp((vol_z - 1.0) / 0.8, 0.0, 1.0)
     s_ret = clamp(ret_60m / 0.015, 0.0, 1.0)
     s_trend = 1.0 if ema20 > ema60 else 0.0
-    mom_s = clamp((0.35 * s_rsi) + (0.35 * s_vol) + (0.20 * s_ret) + (0.10 * s_trend), 0.0, 1.0)
+    # Momentum score: prioritize directional components (ret/trend), keep RSI/vol as support.
+    w_rsi = max(0.0, float(cfg.mom_weight_rsi))
+    w_vol = max(0.0, float(cfg.mom_weight_vol))
+    w_ret = max(0.0, float(cfg.mom_weight_ret))
+    w_trend = max(0.0, float(cfg.mom_weight_trend))
+    w_sum = max(1e-9, w_rsi + w_vol + w_ret + w_trend)
+    mom_s = clamp(((w_rsi * s_rsi) + (w_vol * s_vol) + (w_ret * s_ret) + (w_trend * s_trend)) / w_sum, 0.0, 1.0)
 
-    rev_ok = (
-        (rsi_prev <= float(cfg.rev_rsi_prev_max))
-        and (rsi >= float(cfg.rev_rsi_now_min))
-        and (ret_15m <= float(cfg.rev_ret_15m_max))
-        and (vol_z >= float(cfg.rev_vol_z_min))
-    )
-    rev_s = 1.0 if rev_ok else 0.0
-    alpha = max(mom_s, rev_s)
+    # Reversal score: 0/1 -> 0~1 (0.25-step) to avoid cliff-like jumps.
+    c_prev = 1.0 if (rsi_prev <= float(cfg.rev_rsi_prev_max)) else 0.0
+    c_now = 1.0 if (rsi >= float(cfg.rev_rsi_now_min)) else 0.0
+    c_ret = 1.0 if (ret_15m <= float(cfg.rev_ret_15m_max)) else 0.0
+    c_vol = 1.0 if (vol_z >= float(cfg.rev_vol_z_min)) else 0.0
+    rev_s = 0.25 * (c_prev + c_now + c_ret + c_vol)
+    trend_weak = bool((ema20 <= ema60) or (ret_60m < 0.0))
+    rev_adj = rev_s * (float(cfg.rev_penalty_when_trend_weak) if trend_weak else 1.0)
+    alpha = max(mom_s, rev_adj)
     den = max(1e-9, 1.0 - float(cfg.entry_alpha))
     strength = clamp((alpha - float(cfg.entry_alpha)) / den, 0.0, 1.0)
     if atr_pct <= 0:
@@ -158,7 +182,7 @@ def compute_alpha_score(*, features: Mapping[str, Any], cfg: AlphaScoreConfig) -
         vol_scale = clamp(float(cfg.atr_ref_pct) / float(atr_pct), float(cfg.vol_scale_min), float(cfg.vol_scale_max))
     raw_target = float(cfg.base_target_pct) + (float(cfg.max_target_pct) - float(cfg.base_target_pct)) * float(strength)
     signal_target = clamp(raw_target * vol_scale, 0.0, float(cfg.max_target_pct))
-    tag = "REV" if rev_s >= mom_s and rev_s > 0 else "MOM"
+    tag = "REV" if rev_adj >= mom_s and rev_adj > 0 else "MOM"
     return AlphaScoreResult(
         mom_s=float(mom_s),
         rev_s=float(rev_s),
@@ -168,4 +192,3 @@ def compute_alpha_score(*, features: Mapping[str, Any], cfg: AlphaScoreConfig) -
         signal_target_pct=float(signal_target),
         strategy_tag_candidate=str(tag),
     )
-
