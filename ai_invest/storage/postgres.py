@@ -32,6 +32,29 @@ def json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
+def _parse_iso_dt(value: Any) -> datetime | None:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_trade_plan_payload_active(payload: Mapping[str, Any], *, now_utc: datetime) -> bool:
+    vf = _parse_iso_dt(payload.get("valid_from_kst") or payload.get("valid_from"))
+    vt = _parse_iso_dt(payload.get("valid_to_kst") or payload.get("valid_to"))
+    if vf is not None and now_utc < vf.astimezone(timezone.utc):
+        return False
+    if vt is not None and now_utc >= vt.astimezone(timezone.utc):
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class DbEvent:
     event_id: uuid.UUID
@@ -658,6 +681,8 @@ class PostgresRepo:
 
         positions: list[dict[str, Any]] = []
         position_value = 0.0
+        total_entry_value = 0.0
+        total_unrealized_pnl = 0.0
         for symbol, qty, avg_entry_price, ts_updated, mid_price, quote_ts in rows:
             qty_f = float(qty or 0.0)
             avg_f = float(avg_entry_price) if avg_entry_price is not None else None
@@ -666,15 +691,34 @@ class PostgresRepo:
             value = float(qty_f) * float(mark)
             position_value += value
             unrealized = ((float(mark) - float(avg_f)) * float(qty_f)) if avg_f is not None else None
+            entry_value = (float(qty_f) * float(avg_f)) if avg_f is not None else None
+            if entry_value is not None:
+                total_entry_value += float(entry_value)
+            if unrealized is not None:
+                total_unrealized_pnl += float(unrealized)
+            pnl_pct = None
+            if avg_f is not None and float(avg_f) > 0:
+                pnl_pct = (float(mark) / float(avg_f) - 1.0) * 100.0
+            if unrealized is None:
+                pnl_direction = "FLAT"
+            elif unrealized > 0:
+                pnl_direction = "PLUS"
+            elif unrealized < 0:
+                pnl_direction = "MINUS"
+            else:
+                pnl_direction = "FLAT"
             positions.append(
                 {
                     "symbol": str(symbol),
                     "qty": qty_f,
                     "avg_entry_price": avg_f,
+                    "entry_value_krw": float(entry_value) if entry_value is not None else None,
                     "mark_price": float(mark),
                     "mid_price": mid_f,
                     "value_krw": float(value),
                     "unrealized_pnl_krw": unrealized,
+                    "unrealized_pnl_pct": float(pnl_pct) if pnl_pct is not None else None,
+                    "pnl_direction": pnl_direction,
                     "ts_updated": ts_updated,
                     "quote_ts": quote_ts,
                 }
@@ -682,12 +726,22 @@ class PostgresRepo:
 
         equity = float(cash) + float(position_value)
         exposure_pct = (float(position_value) / float(equity) * 100.0) if float(equity) > 0 else 0.0
+        total_unrealized_pct_on_entry = (
+            (float(total_unrealized_pnl) / float(total_entry_value) * 100.0) if float(total_entry_value) > 0 else 0.0
+        )
+        total_unrealized_pct_on_equity = (
+            (float(total_unrealized_pnl) / float(equity) * 100.0) if float(equity) > 0 else 0.0
+        )
         return {
             "quote_currency": ccy,
             "cash_krw": float(cash),
             "position_value_krw": float(position_value),
             "equity_krw": float(equity),
             "exposure_pct": float(exposure_pct),
+            "total_entry_value_krw": float(total_entry_value),
+            "total_unrealized_pnl_krw": float(total_unrealized_pnl),
+            "total_unrealized_pnl_pct_on_entry": float(total_unrealized_pct_on_entry),
+            "total_unrealized_pnl_pct_on_equity": float(total_unrealized_pct_on_equity),
             "positions_count": len(positions),
             "positions": positions,
         }
@@ -1477,8 +1531,45 @@ class PostgresRepo:
             "payload": payload,
         }
 
-    def fetch_latest_trade_plan(self) -> dict[str, Any] | None:
-        ev = self.fetch_latest_event(event_type="TRADE_PLAN_SET")
+    def fetch_latest_trade_plan_event(self, *, prefer_active: bool = True, lookback_limit: int = 300) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select event_id, ts, event_type, entity_type, entity_id, run_id, rule_version_id, payload
+                from events
+                where event_type='TRADE_PLAN_SET'
+                order by ts desc
+                limit %s
+                """,
+                (int(max(1, lookback_limit)),),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return None
+
+        latest_any: dict[str, Any] | None = None
+        now_utc = datetime.now(timezone.utc)
+        for event_id, ts, event_type, entity_type, entity_id, run_id, rule_version_id, payload in rows:
+            if not isinstance(payload, Mapping):
+                continue
+            ev = {
+                "event_id": str(event_id),
+                "ts": ts,
+                "event_type": event_type,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "run_id": str(run_id) if run_id else None,
+                "rule_version_id": str(rule_version_id) if rule_version_id else None,
+                "payload": payload,
+            }
+            if latest_any is None:
+                latest_any = ev
+            if bool(prefer_active) and _is_trade_plan_payload_active(payload, now_utc=now_utc):
+                return ev
+        return latest_any
+
+    def fetch_latest_trade_plan(self, *, prefer_active: bool = True, lookback_limit: int = 300) -> dict[str, Any] | None:
+        ev = self.fetch_latest_trade_plan_event(prefer_active=prefer_active, lookback_limit=lookback_limit)
         if not ev:
             return None
         payload = ev.get("payload")
