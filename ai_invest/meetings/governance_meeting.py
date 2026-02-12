@@ -410,17 +410,24 @@ def _build_policy_payload(
     outputs: GovernanceOutputs,
     fact_pack: Mapping[str, Any],
     activation_gate: Mapping[str, Any],
+    activation_status: str | None = None,
+    resolved_plan: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     universe_sel = fact_pack.get("universe_selection") if isinstance(fact_pack.get("universe_selection"), Mapping) else {}
     prework = fact_pack.get("prework_reports") if isinstance(fact_pack.get("prework_reports"), Mapping) else {}
     quant = prework.get("quant_strategist") if isinstance(prework.get("quant_strategist"), Mapping) else {}
     quant_findings = quant.get("findings") if isinstance(quant.get("findings"), Mapping) else {}
     backtest = quant_findings.get("backtest") if isinstance(quant_findings.get("backtest"), Mapping) else {}
+    plan_map = dict(resolved_plan or {})
+    plan_symbol = str(plan_map.get("symbol") or outputs.final_plan.symbol)
+    plan_target = _as_float(plan_map.get("target_position_pct"), default=float(outputs.final_plan.target_position_pct))
+    plan_cooldown = int(_as_float(plan_map.get("cooldown_minutes"), default=float(outputs.final_plan.cooldown_minutes)))
+    plan_rebalance = _as_float(plan_map.get("rebalance_band_pct"), default=float(outputs.final_plan.rebalance_band_pct))
     return {
         "policy_version": int(policy_version),
         "slot_key": str(slot_key),
         "updated_at_kst": _now_kst().isoformat(),
-        "activation_status": "ACTIVE" if bool(activation_gate.get("passed")) else "PROPOSED",
+        "activation_status": str(activation_status or ("ACTIVE" if bool(activation_gate.get("passed")) else "PROPOSED")),
         "activation_gate": dict(activation_gate or {}),
         "quant": {
             "universe_selection": dict(universe_sel or {}),
@@ -437,10 +444,10 @@ def _build_policy_payload(
             "trade_window_allowed": bool(outputs.ops.trade_window_allowed),
         },
         "plan": {
-            "symbol": outputs.final_plan.symbol,
-            "target_position_pct": float(outputs.final_plan.target_position_pct),
-            "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
-            "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
+            "symbol": plan_symbol,
+            "target_position_pct": float(plan_target),
+            "cooldown_minutes": int(plan_cooldown),
+            "rebalance_band_pct": float(plan_rebalance),
         },
     }
 
@@ -470,6 +477,12 @@ def evaluate_policy_activation_gate(
 ) -> dict[str, Any]:
     gov = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
     gate_cfg = (gov.get("activation_gate") or {}) if isinstance(gov, Mapping) else {}
+    paper_mode_cfg = (rules_raw.get("paper_mode") or {}) if isinstance(rules_raw, Mapping) else {}
+    data_collection_cfg = (
+        (paper_mode_cfg.get("data_collection") or {}) if isinstance(paper_mode_cfg, Mapping) else {}
+    )
+    is_paper = str(((rules_raw.get("universe") or {}).get("mode") or "paper")).strip().lower() == "paper"
+    data_collection_enabled = bool(data_collection_cfg.get("enabled", False))
     enabled = bool(gate_cfg.get("enabled", True))
     if not enabled:
         return {
@@ -485,6 +498,15 @@ def evaluate_policy_activation_gate(
     min_backtest_score = float(_as_float(gate_cfg.get("min_backtest_score"), default=0.0))
     max_drawdown_pct = float(_as_float(gate_cfg.get("max_drawdown_pct"), default=25.0))
     require_symbol_match = bool(gate_cfg.get("require_symbol_match", True))
+    strict_min_trades = int(_as_float(data_collection_cfg.get("min_trades_for_strict_gate"), default=30.0))
+    relaxed_min_win = float(
+        _as_float(data_collection_cfg.get("relaxed_min_win_rate_pct"), default=min_win_rate_pct)
+    )
+    relaxed_min_score = float(
+        _as_float(data_collection_cfg.get("relaxed_min_backtest_score"), default=min_backtest_score)
+    )
+    relaxed_min_pf = float(_as_float(data_collection_cfg.get("relaxed_min_profit_factor"), default=1.05))
+    relaxed_min_expectancy = float(_as_float(data_collection_cfg.get("relaxed_min_expectancy_pct"), default=0.0))
 
     bt = _extract_quant_backtest_for_symbol(fact_pack=fact_pack, symbol=final_symbol)
     if bt is None:
@@ -498,6 +520,42 @@ def evaluate_policy_activation_gate(
 
     bt_symbol = str(bt.get("symbol") or "").strip().upper()
     final_symbol_u = str(final_symbol or "").strip().upper()
+    trades_actual = int(_as_float(bt.get("trades"), default=0.0))
+    win_rate_actual = float(_as_float(bt.get("win_rate_pct"), default=0.0))
+    backtest_score_actual = float(_as_float(bt.get("backtest_score"), default=-999.0))
+    mdd_actual = float(_as_float(bt.get("max_drawdown_pct"), default=999.0))
+    pf_actual = float(_as_float(bt.get("profit_factor"), default=0.0))
+    expectancy_actual = float(
+        _as_float(bt.get("expectancy_after_cost_pct"), default=_as_float(bt.get("avg_trade_return_pct"), default=0.0))
+    )
+    min_trades_effective = min_trades
+    if is_paper and data_collection_enabled:
+        min_trades_effective = max(min_trades, strict_min_trades)
+
+    if is_paper and data_collection_enabled and trades_actual < int(strict_min_trades):
+        checks = [
+            {
+                "name": "symbol_match",
+                "passed": (not require_symbol_match) or (bt_symbol == final_symbol_u),
+                "actual": bt_symbol,
+                "required": final_symbol_u if require_symbol_match else "any",
+            },
+            {
+                "name": "trades_for_strict_gate",
+                "passed": False,
+                "actual": trades_actual,
+                "required": int(strict_min_trades),
+            },
+        ]
+        return {
+            "enabled": True,
+            "passed": False,
+            "checks": checks,
+            "selected_backtest": dict(bt),
+            "reason_code": "POLICY_GATE_INSUFFICIENT_DATA",
+            "paper_data_collection_mode": True,
+        }
+
     checks = [
         {
             "name": "symbol_match",
@@ -507,29 +565,61 @@ def evaluate_policy_activation_gate(
         },
         {
             "name": "trades",
-            "passed": int(_as_float(bt.get("trades"), default=0.0)) >= int(min_trades),
-            "actual": int(_as_float(bt.get("trades"), default=0.0)),
-            "required": int(min_trades),
-        },
-        {
-            "name": "win_rate_pct",
-            "passed": float(_as_float(bt.get("win_rate_pct"), default=0.0)) >= float(min_win_rate_pct),
-            "actual": float(_as_float(bt.get("win_rate_pct"), default=0.0)),
-            "required": float(min_win_rate_pct),
-        },
-        {
-            "name": "backtest_score",
-            "passed": float(_as_float(bt.get("backtest_score"), default=-999.0)) >= float(min_backtest_score),
-            "actual": float(_as_float(bt.get("backtest_score"), default=-999.0)),
-            "required": float(min_backtest_score),
+            "passed": trades_actual >= int(min_trades_effective),
+            "actual": trades_actual,
+            "required": int(min_trades_effective),
         },
         {
             "name": "max_drawdown_pct",
-            "passed": float(_as_float(bt.get("max_drawdown_pct"), default=999.0)) <= float(max_drawdown_pct),
-            "actual": float(_as_float(bt.get("max_drawdown_pct"), default=999.0)),
+            "passed": mdd_actual <= float(max_drawdown_pct),
+            "actual": mdd_actual,
             "required": float(max_drawdown_pct),
         },
     ]
+    if is_paper and data_collection_enabled:
+        perf_pass = (
+            (win_rate_actual >= float(relaxed_min_win))
+            or (backtest_score_actual >= float(relaxed_min_score))
+            or (pf_actual >= float(relaxed_min_pf))
+            or (expectancy_actual >= float(relaxed_min_expectancy))
+        )
+        checks.append(
+            {
+                "name": "performance_or",
+                "passed": bool(perf_pass),
+                "actual": {
+                    "win_rate_pct": win_rate_actual,
+                    "backtest_score": backtest_score_actual,
+                    "profit_factor": pf_actual,
+                    "expectancy_after_cost_pct": expectancy_actual,
+                },
+                "required": {
+                    "any_of": {
+                        "win_rate_pct": float(relaxed_min_win),
+                        "backtest_score": float(relaxed_min_score),
+                        "profit_factor": float(relaxed_min_pf),
+                        "expectancy_after_cost_pct": float(relaxed_min_expectancy),
+                    }
+                },
+            }
+        )
+    else:
+        checks.extend(
+            [
+                {
+                    "name": "win_rate_pct",
+                    "passed": win_rate_actual >= float(min_win_rate_pct),
+                    "actual": win_rate_actual,
+                    "required": float(min_win_rate_pct),
+                },
+                {
+                    "name": "backtest_score",
+                    "passed": backtest_score_actual >= float(min_backtest_score),
+                    "actual": backtest_score_actual,
+                    "required": float(min_backtest_score),
+                },
+            ]
+        )
     passed = all(bool(c.get("passed")) for c in checks)
     return {
         "enabled": True,
@@ -537,6 +627,7 @@ def evaluate_policy_activation_gate(
         "checks": checks,
         "selected_backtest": dict(bt),
         "reason_code": "POLICY_GATE_PASS" if passed else "POLICY_GATE_BLOCKED",
+        "paper_data_collection_mode": bool(is_paper and data_collection_enabled),
     }
 
 
@@ -1682,11 +1773,47 @@ def run_governance_meeting_now(
             final_symbol=outputs.final_plan.symbol,
         )
         activation_passed = bool(activation_gate.get("passed"))
-        hold_only_plan = (
-            float(outputs.final_plan.target_position_pct) <= 0.0
-            or (not bool(outputs.final_plan.allowed_actions.buy))
+        gate_reason_code = str(activation_gate.get("reason_code") or "")
+        paper_mode_cfg = (rules_raw.get("paper_mode") or {}) if isinstance(rules_raw, Mapping) else {}
+        data_collection_cfg = (
+            (paper_mode_cfg.get("data_collection") or {}) if isinstance(paper_mode_cfg, Mapping) else {}
         )
-        activation_status = "ACTIVE" if activation_passed else ("ACTIVE_HOLD" if hold_only_plan else "PROPOSED")
+        force_plan_buy_allowed = bool(data_collection_cfg.get("force_plan_buy_allowed", True))
+        force_plan_target_pct = float(_as_float(data_collection_cfg.get("force_plan_target_pct"), default=5.0))
+        hard_plan_block = bool(outputs.ops.veto) or bool(outputs.risk.veto) or (not bool(outputs.ops.trade_window_allowed))
+        paper_data_collection_applied = bool(
+            activation_gate.get("paper_data_collection_mode")
+            and gate_reason_code == "POLICY_GATE_INSUFFICIENT_DATA"
+            and (not hard_plan_block)
+        )
+
+        resolved_allowed_actions = outputs.final_plan.allowed_actions.model_dump()
+        resolved_target_position_pct = float(outputs.final_plan.target_position_pct)
+        if paper_data_collection_applied:
+            resolved_allowed_actions["buy"] = bool(force_plan_buy_allowed)
+            if bool(resolved_allowed_actions["buy"]):
+                resolved_target_position_pct = max(
+                    0.0,
+                    min(
+                        float(force_plan_target_pct),
+                        float(outputs.risk.max_position_pct),
+                        float(rules.risk.max_position_pct_per_symbol),
+                        float(capital_profile.max_target_position_pct),
+                    ),
+                )
+            if float(resolved_target_position_pct) <= 0.0:
+                resolved_allowed_actions["buy"] = False
+            activation_gate = dict(activation_gate)
+            activation_gate["paper_data_collection_applied"] = True
+            activation_gate["paper_data_collection_target_pct"] = float(resolved_target_position_pct)
+            activation_gate["paper_data_collection_buy_allowed"] = bool(resolved_allowed_actions["buy"])
+
+        hold_only_plan = (float(resolved_target_position_pct) <= 0.0) or (not bool(resolved_allowed_actions.get("buy")))
+        activation_status = (
+            "ACTIVE"
+            if activation_passed
+            else ("ACTIVE_DATA_COLLECTION" if paper_data_collection_applied else ("ACTIVE_HOLD" if hold_only_plan else "PROPOSED"))
+        )
 
         gate_checks = [x for x in list(activation_gate.get("checks") or []) if isinstance(x, Mapping)]
         gate_fail_lines = [
@@ -1700,6 +1827,11 @@ def run_governance_meeting_now(
         )
         if gate_fail_lines:
             gate_msg += "\n" + "\n".join(gate_fail_lines[:8])
+        if paper_data_collection_applied:
+            gate_msg += (
+                f"\n- paper_data_collection: buy={bool(resolved_allowed_actions.get('buy'))}, "
+                f"target={float(resolved_target_position_pct):.1f}%"
+            )
         _store_message(
             repo=repo,
             meeting_id=meeting_id,
@@ -1713,7 +1845,7 @@ def run_governance_meeting_now(
 
         summary_short = (
             f"[{slot_key}] Trade Plan({activation_status}): "
-            f"{outputs.final_plan.symbol} target={outputs.final_plan.target_position_pct:.1f}%"
+            f"{outputs.final_plan.symbol} target={float(resolved_target_position_pct):.1f}%"
         )
         action_items = [
             {"owner": "research_agent", "action": "주요 뉴스 원문 확인 및 영향 업데이트", "due_date": str(now_kst.date())},
@@ -1730,16 +1862,29 @@ def run_governance_meeting_now(
             )
 
         # Trade plan payload (active/proposed 모두 저장).
+        plan_notes = str(outputs.final_plan.notes or "")
+        if paper_data_collection_applied:
+            plan_notes = _clip(
+                "\n".join(
+                    [
+                        plan_notes,
+                        "[paper_data_collection] strict gate 이전 표본 확보 모드 적용",
+                        f"- forced_buy_allowed={bool(resolved_allowed_actions.get('buy'))}",
+                        f"- forced_target_position_pct={float(resolved_target_position_pct):.1f}",
+                    ]
+                ),
+                1200,
+            )
         plan_payload = {
             "slot_key": slot_key,
             "meeting_id": str(meeting_id),
             "symbol": outputs.final_plan.symbol,
-            "target_position_pct": float(outputs.final_plan.target_position_pct),
+            "target_position_pct": float(resolved_target_position_pct),
             "valid_from_kst": outputs.final_plan.valid_from_kst,
             "valid_to_kst": outputs.final_plan.valid_to_kst,
             "constraints": outputs.final_plan.constraints,
-            "notes": outputs.final_plan.notes,
-            "allowed_actions": outputs.final_plan.allowed_actions.model_dump(),
+            "notes": plan_notes,
+            "allowed_actions": dict(resolved_allowed_actions),
             "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
             "cooldown_minutes": int(outputs.final_plan.cooldown_minutes),
             "rationale": outputs.final_plan.rationale,
@@ -1821,8 +1966,9 @@ def run_governance_meeting_now(
         # Trade plan activation gate:
         # - pass: TRADE_PLAN_SET (runtime consumes)
         # - fail + hold-only: TRADE_PLAN_SET (safe no-buy plan can be applied)
+        # - fail + data collection mode: TRADE_PLAN_SET (paper-only sample accumulation)
         # - fail + non-hold: TRADE_PLAN_PROPOSED only (fail-closed)
-        plan_set_allowed = bool(activation_passed or hold_only_plan)
+        plan_set_allowed = bool(activation_passed or hold_only_plan or paper_data_collection_applied)
         plan_event_type = "TRADE_PLAN_SET" if plan_set_allowed else "TRADE_PLAN_PROPOSED"
         trade_plan_event_id = uuid.uuid4()
         repo.insert_event(
@@ -1839,16 +1985,16 @@ def run_governance_meeting_now(
         )
         if plan_set_allowed:
             try:
-                rationale_lines = [str(x).strip() for x in list(outputs.final_plan.rationale or []) if str(x).strip()]
+                rationale_lines = [str(v).strip() for v in dict(outputs.final_plan.rationale or {}).values() if str(v).strip()]
                 notifier.notify_trade_plan_set(
                     event_id=trade_plan_event_id,
                     meeting_id=str(meeting_id),
                     slot_key=slot_key,
-                    symbol=outputs.final_plan.symbol,
-                    target_position_pct=float(outputs.final_plan.target_position_pct),
+                    symbol=str(plan_payload.get("symbol") or outputs.final_plan.symbol),
+                    target_position_pct=float(plan_payload.get("target_position_pct") or 0.0),
                     valid_from_kst=outputs.final_plan.valid_from_kst,
                     valid_to_kst=outputs.final_plan.valid_to_kst,
-                    allowed_actions=outputs.final_plan.allowed_actions.model_dump(),
+                    allowed_actions=dict(plan_payload.get("allowed_actions") or {}),
                     rebalance_band_pct=float(outputs.final_plan.rebalance_band_pct),
                     cooldown_minutes=int(outputs.final_plan.cooldown_minutes),
                     constraints=outputs.final_plan.constraints,
@@ -1883,6 +2029,8 @@ def run_governance_meeting_now(
             outputs=outputs,
             fact_pack=fact_pack,
             activation_gate=activation_gate,
+            activation_status=activation_status,
+            resolved_plan=plan_payload,
         )
         policy_event_id = uuid.uuid4()
         repo.insert_event(
