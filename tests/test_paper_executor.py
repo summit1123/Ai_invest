@@ -205,6 +205,119 @@ class PaperExecutorTests(unittest.TestCase):
         assert pos2 is not None
         self.assertEqual(pos2.qty, 0.0)
 
+    def test_buy_uses_target_position_pct_for_incremental_sizing(self) -> None:
+        repo = _FakeRepo()
+        ex = PaperExecutor(repo=repo)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+
+        # Seed equity ~10,000,000 KRW with existing 1% position.
+        repo.ensure_paper_seed_cash(currency="KRW", amount=10_000_000)
+        repo.insert_ledger_entry(
+            DbLedgerEntry(
+                entry_id=uuid.uuid4(),
+                ts=datetime.now(timezone.utc),
+                entry_type="TRADE_FILL",
+                symbol="KRW-BTC",
+                currency="KRW",
+                amount=-100_000.0,
+                price=100.0,
+                fee_amount=0.0,
+                fee_currency="KRW",
+                order_id=None,
+                fill_id=None,
+                meta={"paper": True, "side": "BUY"},
+            )
+        )
+        repo.upsert_position(
+            DbPosition(
+                symbol="KRW-BTC",
+                ts_updated=datetime.now(timezone.utc),
+                qty=1000.0,
+                avg_entry_price=100.0,
+                unrealized_pnl=None,
+                stop_price=None,
+                take_profit=None,
+                meta={"trade_id": str(uuid.uuid4()), "entry_decision_id": str(uuid.uuid4())},
+            )
+        )
+
+        snap_buy = MarketSnapshot(
+            ts_ms=0,
+            symbol="KRW-BTC",
+            last_price=100.0,
+            best_bid=99.0,
+            best_ask=101.0,
+        )
+        res = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=snap_buy,
+            rules=rules,
+            target_position_pct=3.0,
+        )
+        self.assertIsNotNone(res)
+        assert res is not None
+        # 1% -> 3% top-up should be around 2,000 qty at 100 KRW level (allow fee/price tolerance).
+        self.assertGreater(res.fill_qty, 1900.0)
+        self.assertLess(res.fill_qty, 2100.0)
+
+    def test_position_meta_tracks_strategy_and_cooldown(self) -> None:
+        repo = _FakeRepo()
+        ex = PaperExecutor(repo=repo)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+
+        snap_buy = MarketSnapshot(
+            ts_ms=0,
+            symbol="KRW-BTC",
+            last_price=100.0,
+            best_bid=99.0,
+            best_ask=101.0,
+        )
+        buy = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=snap_buy,
+            rules=rules,
+            strategy_tag="REV",
+        )
+        self.assertIsNotNone(buy)
+        pos = repo.fetch_position("KRW-BTC")
+        self.assertIsNotNone(pos)
+        assert pos is not None
+        self.assertEqual(str((pos.meta or {}).get("strategy_tag")), "REV")
+        self.assertIsNotNone((pos.meta or {}).get("entry_ts"))
+        self.assertIsNotNone((pos.meta or {}).get("entry_price"))
+        self.assertIsNotNone((pos.meta or {}).get("hwm_price"))
+
+        snap_sell = MarketSnapshot(
+            ts_ms=0,
+            symbol="KRW-BTC",
+            last_price=95.0,
+            best_bid=94.0,
+            best_ask=96.0,
+        )
+        sell = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="SELL",
+            snapshot=snap_sell,
+            rules=rules,
+            exit_reason="STOP",
+            cooldown_minutes=30,
+        )
+        self.assertIsNotNone(sell)
+        pos2 = repo.fetch_position("KRW-BTC")
+        self.assertIsNotNone(pos2)
+        assert pos2 is not None
+        self.assertEqual(pos2.qty, 0.0)
+        self.assertEqual(str((pos2.meta or {}).get("last_exit_reason")), "STOP")
+        self.assertIsNotNone((pos2.meta or {}).get("cooldown_until"))
+
 
 if __name__ == "__main__":
     unittest.main()
