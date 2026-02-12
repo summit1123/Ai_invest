@@ -19,20 +19,23 @@ from ai_invest.execution.paper_execution import PaperExecutor
 from ai_invest.judge.ai_judge import ai_judge_shadow_decide
 from ai_invest.judge.safe_judge import safe_judge_decide
 from ai_invest.learning.outcome_evaluator import evaluate_closed_trade
-from ai_invest.market_data.features import build_feature_snapshot_from_candles
+from ai_invest.market_data.features import build_alpha_features_from_1m_candles, build_feature_snapshot_from_candles
 from ai_invest.market_data.upbit_public import MarketSnapshot, UpbitPublicApiError, fetch_candles_minutes, fetch_market_snapshot
 from ai_invest.notifications.service import NotificationService
 from ai_invest.ops.reconciliation import record_reconciliation_check
+from ai_invest.runtime.position_state import parse_position_state, with_hwm_update
 from ai_invest.storage.postgres import (
     DbAgentOpinion,
     DbDecision,
     DbDecisionOutcome,
     DbEvent,
     DbPauseLog,
+    DbPosition,
     DbRuleVersion,
     DbRun,
     PostgresRepo,
 )
+from ai_invest.strategy.alpha_score import load_alpha_score_config
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -156,6 +159,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         repo.ensure_paper_seed_cash(currency=_quote_currency(default_symbol), amount=seed_cash)
     timeframe_entry = str(raw_rules.get("signal", {}).get("timeframe_entry", "15m"))
     tf_min = _timeframe_to_minutes(timeframe_entry)
+    alpha_cfg = load_alpha_score_config(rules_raw=raw_rules)
+    alpha_lookback = max(120, int(alpha_cfg.lookback_minutes))
 
     for _i in range(cycles):
         decision_id = uuid.uuid4()
@@ -171,12 +176,33 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         except UpbitPublicApiError as exc:
             # 거래소 공용 API 일시 제한(429) 등은 루프를 죽이지 않고 다음 사이클에서 재시도한다.
             print(f"[경고] market snapshot failed for {symbol}: {exc}")
-            time.sleep(float(sleep_sec))
+            if sleep_sec is not None:
+                time.sleep(float(sleep_sec))
             continue
         quote_ccy = _quote_currency(symbol)
         cash = repo.fetch_cash_balance(currency=quote_ccy)
         pos = repo.fetch_position(symbol)
         current_qty = float(pos.qty) if pos else 0.0
+        position_state = parse_position_state((pos.meta if pos else {}) or {})
+        if pos and current_qty > 0:
+            updated_state = with_hwm_update(state=position_state, last_price=float(snapshot.last_price))
+            if updated_state.hwm_price != position_state.hwm_price:
+                new_meta = dict(pos.meta or {})
+                new_meta.update(updated_state.as_meta_patch())
+                repo.upsert_position(
+                    DbPosition(
+                        symbol=pos.symbol,
+                        ts_updated=_utcnow(),
+                        qty=pos.qty,
+                        avg_entry_price=pos.avg_entry_price,
+                        unrealized_pnl=pos.unrealized_pnl,
+                        stop_price=pos.stop_price,
+                        take_profit=pos.take_profit,
+                        meta=new_meta,
+                    )
+                )
+                pos = repo.fetch_position(symbol)
+                position_state = parse_position_state((pos.meta if pos else {}) or {})
         pos_value = float(current_qty) * float(snapshot.mid_price)
         equity = float(cash) + float(pos_value)
         current_pct = (pos_value / equity * 100.0) if equity > 0 else 0.0
@@ -248,6 +274,23 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         closes = [float(c["trade_price"]) for c in candles]
         volumes = [float(c["candle_acc_trade_volume"]) for c in candles]
         feat = build_feature_snapshot_from_candles(highs=highs, lows=lows, closes=closes, volumes=volumes)
+        candles_1m = fetch_candles_minutes(symbol, unit=1, count=int(alpha_lookback))
+        highs_1m = [float(c["high_price"]) for c in candles_1m]
+        lows_1m = [float(c["low_price"]) for c in candles_1m]
+        closes_1m = [float(c["trade_price"]) for c in candles_1m]
+        volumes_1m = [float(c["candle_acc_trade_volume"]) for c in candles_1m]
+        alpha_features = build_alpha_features_from_1m_candles(
+            highs=highs_1m,
+            lows=lows_1m,
+            closes=closes_1m,
+            volumes=volumes_1m,
+            ema_fast=int(alpha_cfg.ema_fast),
+            ema_slow=int(alpha_cfg.ema_slow),
+            ret_short_bars=int(alpha_cfg.ret_short_mins),
+            ret_long_bars=int(alpha_cfg.ret_long_mins),
+        )
+        feat_map = asdict(feat)
+        feat_map.update(alpha_features)
         repo.insert_event(
             DbEvent(
                 event_id=uuid.uuid4(),
@@ -257,7 +300,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 entity_id=f"{symbol}:{decision_id}",
                 run_id=run_id,
                 rule_version_id=rule_version_id,
-                payload={"symbol": symbol, "decision_id": str(decision_id), "features": asdict(feat)},
+                payload={"symbol": symbol, "decision_id": str(decision_id), "features": feat_map},
             )
         )
 
@@ -270,7 +313,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             rule_version_id=rule_version_id,
             decision_id=decision_id,
             snapshot=snapshot,
-            features=asdict(feat),
+            features=feat_map,
             ops=ops,
             context={
                 "account": {
@@ -285,7 +328,12 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     "max_slippage_bps": float(rules.cost_guard.max_predicted_slippage_bps),
                     "max_spread_bps_entry": float(rules.cost_guard.max_spread_bps_entry),
                 },
-                "position": {"current_qty": float(current_qty), "current_position_pct": float(current_pct)},
+                "position": {
+                    "current_qty": float(current_qty),
+                    "current_position_pct": float(current_pct),
+                    "avg_entry_price": float(pos.avg_entry_price) if (pos and pos.avg_entry_price) else None,
+                },
+                "position_state": position_state.to_context(now=_utcnow()),
                 "trade_plan": {
                     "slot_key": plan.get("slot_key") if plan else None,
                     "target_position_pct": plan_target_pct,
@@ -378,7 +426,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         safe = safe_judge_decide(
             payload,
             rules=rules,
-            market={"signal": market.signal, "confidence": market.confidence},
+            market={"signal": market.signal, "confidence": market.confidence, "signal_target_pct": market.signal_target_pct},
             regime={"trade_allowed": regime.trade_allowed},
             risk={"veto": risk.veto},
             ops={"veto": ops_op.veto},
@@ -442,9 +490,13 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             context={
                 "last_price": snapshot.last_price,
                 "spread_bps": snapshot.spread_bps,
-                "rsi_14": feat.rsi_14,
-                "atr_pct": feat.atr_pct,
-                "vol_zscore": feat.vol_zscore,
+                "rsi_14": feat_map.get("rsi_14"),
+                "atr_pct": feat_map.get("atr_pct"),
+                "vol_zscore": feat_map.get("vol_zscore"),
+                "alpha": market.alpha,
+                "signal_target_pct": market.signal_target_pct,
+                "effective_target_pct": safe.effective_target_pct,
+                "exit_reason": market.exit_reason,
                 "market_signal": market.signal,
                 "market_confidence": market.confidence,
                 "regime": regime.regime,
@@ -469,7 +521,10 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             action=safe.action,
             snapshot=snapshot,
             rules=rules,
-            target_position_pct=plan_target_pct,
+            target_position_pct=(safe.effective_target_pct if safe.effective_target_pct is not None else plan_target_pct),
+            strategy_tag=market.strategy_tag,
+            exit_reason=market.exit_reason,
+            cooldown_minutes=int(alpha_cfg.cooldown_minutes),
         )
         if exec_res is not None:
             notifier.notify_fill(
