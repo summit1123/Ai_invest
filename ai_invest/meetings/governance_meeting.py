@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import uuid
 from dataclasses import asdict, dataclass
@@ -67,6 +68,24 @@ def _as_float(value: Any, *, default: float) -> float:
         return float(s)
     except Exception:
         return float(default)
+
+
+def _as_int(value: Any, *, default: int) -> int:
+    try:
+        if value is None:
+            return int(default)
+        if isinstance(value, bool):
+            return int(default)
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, float):
+            return int(value)
+        s = str(value).strip()
+        if not s:
+            return int(default)
+        return int(float(s))
+    except Exception:
+        return int(default)
 
 
 def should_block_prework(*, require_prework_reports: bool, prework: Mapping[str, Any]) -> bool:
@@ -410,6 +429,7 @@ class FinalTradePlanV2(BaseModel):
     evidence_refs: list[dict[str, Any]] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
     conflict_resolution: list[dict[str, Any]] = Field(default_factory=list)
+    conditional_activation: dict[str, Any] = Field(default_factory=dict)
     notes: str = Field(..., max_length=1200)
     confidence: PlanConfidence = Field(default_factory=PlanConfidence)
 
@@ -548,6 +568,131 @@ def _stable_hash(obj: Any) -> str:
     return hashlib.sha1(raw).hexdigest()
 
 
+def _round_num(value: Any, *, digits: int, default: float = 0.0) -> float:
+    return round(_as_float(value, default=default), int(digits))
+
+
+def _normalized_conditional_activation_config(
+    *,
+    rules_raw: Mapping[str, Any],
+    force_enabled: bool | None = None,
+) -> dict[str, Any]:
+    gov = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    gate_cfg = (gov.get("activation_gate") or {}) if isinstance(gov, Mapping) else {}
+    cap_cfg = (gate_cfg.get("conditional_activation") or {}) if isinstance(gate_cfg, Mapping) else {}
+    cond = (cap_cfg.get("conditions") or {}) if isinstance(cap_cfg, Mapping) else {}
+    promotion = (cap_cfg.get("promotion") or {}) if isinstance(cap_cfg, Mapping) else {}
+    enabled_default = bool(cap_cfg.get("enabled", True))
+    enabled = bool(force_enabled if force_enabled is not None else enabled_default)
+    sustain_seconds = max(15, _as_int(cond.get("sustain_seconds"), default=180))
+    min_pass_conditions = max(1, min(4, _as_int(cond.get("min_pass_conditions"), default=3)))
+    return {
+        "enabled": bool(enabled),
+        "auto_promote_to": "PAPER",
+        "conditions": {
+            "min_alpha": _as_float(cond.get("min_alpha"), default=0.75),
+            "max_spread_bps": _as_float(cond.get("max_spread_bps"), default=1.5),
+            "min_vol_z": _as_float(cond.get("min_vol_z"), default=0.0),
+            "min_atr_pct": _as_float(cond.get("min_atr_pct"), default=0.08),
+            "sustain_seconds": int(sustain_seconds),
+            "min_pass_conditions": int(min_pass_conditions),
+        },
+        "promotion": {
+            "target_position_pct_cap": _as_float(promotion.get("target_position_pct_cap"), default=3.0),
+            "cooldown_after_promotion_minutes": _as_int(
+                promotion.get("cooldown_after_promotion_minutes"),
+                default=60,
+            ),
+            "promotion_ttl_minutes": _as_int(promotion.get("promotion_ttl_minutes"), default=120),
+        },
+    }
+
+
+def _activation_hold_mode(*, activation_decision_effective: str, conditional_activation: Mapping[str, Any]) -> str:
+    if str(activation_decision_effective or "").upper() != "HOLD":
+        return "HOLD_STATIC"
+    return "HOLD_CONDITIONAL" if bool(conditional_activation.get("enabled")) else "HOLD_STATIC"
+
+
+def _initial_cap_runtime(
+    *,
+    conditional_activation: Mapping[str, Any],
+    decision_interval_sec: int,
+) -> dict[str, Any]:
+    cond = conditional_activation.get("conditions") if isinstance(conditional_activation, Mapping) else {}
+    sustain_seconds = max(15, _as_int((cond or {}).get("sustain_seconds"), default=180))
+    required_passes = max(1, int(math.ceil(float(sustain_seconds) / float(max(1, int(decision_interval_sec))))))
+    return {
+        "last_eval_at": None,
+        "consecutive_passes": 0,
+        "required_passes": int(required_passes),
+        "promoted_at": None,
+        "promote_expires_at": None,
+    }
+
+
+def _normalized_gate_checks_for_hash(checks: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for raw in list(checks or []):
+        if not isinstance(raw, Mapping):
+            continue
+        out.append(
+            {
+                "name": str(raw.get("name") or ""),
+                "passed": bool(raw.get("passed")),
+                "required": raw.get("required"),
+                "actual": raw.get("actual"),
+            }
+        )
+    out.sort(key=lambda x: str(x.get("name") or ""))
+    return out
+
+
+def _normalized_evaluated_for_hash(evaluated: Sequence[Mapping[str, Any]], *, top_n: int = 6) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for raw in list(evaluated or []):
+        if not isinstance(raw, Mapping):
+            continue
+        snap = raw.get("snapshot") if isinstance(raw.get("snapshot"), Mapping) else {}
+        feat = raw.get("features") if isinstance(raw.get("features"), Mapping) else {}
+        rows.append(
+            {
+                "symbol": str(raw.get("symbol") or "").upper(),
+                "score": _round_num(raw.get("score"), digits=4),
+                "spread_bps": _round_num((snap or {}).get("spread_bps"), digits=3),
+                "rsi_14": _round_num((feat or {}).get("rsi_14"), digits=4),
+                "vol_zscore": _round_num((feat or {}).get("vol_zscore"), digits=4),
+                "atr_pct": _round_num((feat or {}).get("atr_pct"), digits=4),
+            }
+        )
+    rows.sort(key=lambda x: (-float(x.get("score") or 0.0), str(x.get("symbol") or "")))
+    return rows[: max(1, int(top_n))]
+
+
+def _build_inputs_hash_payload(
+    *,
+    slot_key: str,
+    symbol: str,
+    allowed_symbols: Sequence[str],
+    evaluated: Sequence[Mapping[str, Any]],
+    activation_checks: Sequence[Mapping[str, Any]],
+    cost_model: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "slot_key": str(slot_key),
+        "symbol": str(symbol).upper(),
+        "allowed_symbols": sorted({str(x).upper() for x in list(allowed_symbols or []) if str(x).strip()}),
+        "evaluated_top_n": _normalized_evaluated_for_hash(evaluated),
+        "activation_checks": _normalized_gate_checks_for_hash(activation_checks),
+        "cost_model": {
+            "fee_total_bps": _round_num(cost_model.get("fee_total_bps"), digits=4),
+            "base_slippage_bps": _round_num(cost_model.get("base_slippage_bps"), digits=4),
+            "spread_penalty_mult": _round_num(cost_model.get("spread_penalty_mult"), digits=4),
+            "low_liquidity_penalty_bps": _round_num(cost_model.get("low_liquidity_penalty_bps"), digits=4),
+        },
+    }
+
+
 def _bounded_pair(lo: float, hi: float, *, min_v: float, max_v: float) -> tuple[float, float]:
     lo2 = max(float(min_v), min(float(max_v), float(lo)))
     hi2 = max(float(min_v), min(float(max_v), float(hi)))
@@ -599,6 +744,7 @@ def _to_final_trade_plan_v2(
     rules_raw: Mapping[str, Any],
     fact_pack: Mapping[str, Any],
     activation_gate: Mapping[str, Any],
+    conditional_activation: Mapping[str, Any] | None = None,
 ) -> FinalTradePlanV2:
     target = float(final_plan.target_position_pct)
     if bool(final_plan.allowed_actions.buy):
@@ -697,6 +843,7 @@ def _to_final_trade_plan_v2(
         evidence_refs=refs,
         open_questions=list(final_plan.open_questions or []),
         conflict_resolution=conflicts,
+        conditional_activation=dict(conditional_activation or {}),
         notes=str(final_plan.notes or ""),
         confidence=PlanConfidence(
             data_sufficiency=suff,
@@ -2109,10 +2256,31 @@ def run_governance_meeting_now(
         activation_decision_effective = str(activation_decision)
         if str(activation_decision).upper() == "LIVE" and not bool(live_execution_enabled):
             activation_decision_effective = "PAPER"
+        conditional_activation_cfg = _normalized_conditional_activation_config(
+            rules_raw=rules_raw,
+            force_enabled=None,
+        )
+        hold_mode = _activation_hold_mode(
+            activation_decision_effective=str(activation_decision_effective),
+            conditional_activation=conditional_activation_cfg,
+        )
+        decision_interval_sec = int(
+            _as_float(
+                ((rules_raw.get("scheduling") or {}).get("decision_interval_sec")),
+                default=15.0,
+            )
+        )
+        cap_runtime_seed = _initial_cap_runtime(
+            conditional_activation=conditional_activation_cfg,
+            decision_interval_sec=max(1, decision_interval_sec),
+        )
         activation_gate["decision"] = str(activation_decision)
         activation_gate["decision_effective"] = str(activation_decision_effective)
         activation_gate["live_execution_enabled"] = bool(live_execution_enabled)
         activation_gate["hard_plan_block"] = bool(hard_plan_block)
+        activation_gate["hold_mode"] = str(hold_mode)
+        activation_gate["conditional_activation"] = dict(conditional_activation_cfg)
+        activation_gate["cap_runtime"] = dict(cap_runtime_seed)
         paper_data_collection_applied = bool(
             activation_gate.get("paper_data_collection_mode")
             and gate_reason_code == "POLICY_GATE_INSUFFICIENT_DATA"
@@ -2228,6 +2396,9 @@ def run_governance_meeting_now(
             rules_raw=rules_raw,
             fact_pack=fact_pack,
             activation_gate=activation_gate,
+            conditional_activation=activation_gate.get("conditional_activation")
+            if isinstance(activation_gate.get("conditional_activation"), Mapping)
+            else None,
         )
         execution_plan = _build_execution_plan(
             final_plan=resolved_final_plan,
@@ -2279,16 +2450,15 @@ def run_governance_meeting_now(
                 f"risk_max={float(outputs.risk.max_position_pct):.1f}"
             ),
         }
-        inputs_hash = _stable_hash(
-            {
-                "slot_key": slot_key,
-                "symbol": str(resolved_final_plan.symbol),
-                "allowed_symbols": list(fact_pack.get("allowed_symbols") or []),
-                "evaluated_top": list(fact_pack.get("evaluated") or [])[:6],
-                "prework_status": dict(fact_pack.get("prework_status") or {}),
-                "activation_checks": gate_checks,
-            }
+        inputs_hash_payload = _build_inputs_hash_payload(
+            slot_key=slot_key,
+            symbol=str(resolved_final_plan.symbol),
+            allowed_symbols=[str(x) for x in list(fact_pack.get("allowed_symbols") or [])],
+            evaluated=[x for x in list(fact_pack.get("evaluated") or []) if isinstance(x, Mapping)],
+            activation_checks=gate_checks,
+            cost_model=cost_model,
         )
+        inputs_hash = _stable_hash(inputs_hash_payload)
         plan_payload = {
             "slot_key": slot_key,
             "meeting_id": str(meeting_id),
