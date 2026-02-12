@@ -21,6 +21,9 @@ REASON_CODE_KO: dict[str, str] = {
     "RG_MIN_ORDER_NOT_MET": "최소 주문금액 미충족",
     "RG_COOLDOWN_ACTIVE": "쿨다운 활성",
     "RG_SIGNAL_CONFLICT": "신호 충돌",
+    "RG_CAP_PENDING": "조건부 활성화 평가 중",
+    "RG_CAP_PROMOTED": "조건부 활성화로 PAPER 승격",
+    "RG_CAP_BLOCKED": "조건부 활성화 하드게이트 차단",
     "RG_PASS": "게이트 통과",
     # EX_* (execution)
     "EX_ORDER_SUBMIT_FAIL": "주문 제출 실패",
