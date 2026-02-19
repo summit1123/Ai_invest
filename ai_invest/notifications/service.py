@@ -779,6 +779,8 @@ class NotificationService:
         cooldown_minutes: int | None = None,
         constraints: Mapping[str, Any] | None = None,
         rationale_summary: str | None = None,
+        activation_status: str | None = None,
+        activation_gate: Mapping[str, Any] | None = None,
     ) -> None:
         try:
             chat_id = telegram_client.chat_id_meeting()
@@ -826,6 +828,8 @@ class NotificationService:
                 "cooldown_minutes": cooldown_minutes,
                 "constraints": dict(constraints or {}),
                 "rationale_summary": rationale_summary or "",
+                "activation_status": activation_status,
+                "activation_gate": dict(activation_gate or {}),
             },
         )
 
