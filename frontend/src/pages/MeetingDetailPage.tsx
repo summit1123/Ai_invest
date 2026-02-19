@@ -99,7 +99,7 @@ export function MeetingDetailPage() {
               <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
                 요약
               </div>
-              <div style={{ fontSize: 13, lineHeight: 1.55 }}>{String(s.summary)}</div>
+              <div style={{ fontSize: 13, lineHeight: 1.55, whiteSpace: 'pre-wrap' }}>{String(s.summary)}</div>
             </div>
           ) : null}
           {Array.isArray(actionItems) && actionItems.length > 0 ? (
