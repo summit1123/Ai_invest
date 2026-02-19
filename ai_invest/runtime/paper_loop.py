@@ -134,6 +134,24 @@ def _trade_plan_is_active(plan: dict[str, Any]) -> bool:
     return True
 
 
+def _fetch_open_position_symbols(*, repo: PostgresRepo) -> list[str]:
+    """Return currently open symbols (qty != 0) in a stable order."""
+    try:
+        overview = repo.fetch_portfolio_overview(quote_currency="KRW")
+        positions = overview.get("positions") if isinstance(overview, Mapping) else []
+        out: list[str] = []
+        for row in positions if isinstance(positions, list) else []:
+            if not isinstance(row, Mapping):
+                continue
+            symbol = str(row.get("symbol") or "").strip().upper()
+            qty = _as_float(row.get("qty"), default=0.0)
+            if symbol and qty > 0:
+                out.append(symbol)
+        return sorted(set(out))
+    except Exception:
+        return []
+
+
 def _timeframe_to_minutes(tf: str) -> int:
     tf = tf.strip().lower()
     if tf.endswith("m"):
@@ -233,11 +251,24 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
     for _i in range(cycles):
         decision_id = uuid.uuid4()
         symbol = default_symbol
+        plan_symbol: str | None = None
+        manage_open_position_only = False
         plan = repo.fetch_latest_trade_plan()
         if plan and _trade_plan_is_active(plan):
-            plan_symbol = str(plan.get("symbol") or "").strip()
-            if plan_symbol and plan_symbol in set(rules.universe.symbols):
-                symbol = plan_symbol
+            p_sym = str(plan.get("symbol") or "").strip().upper()
+            if p_sym:
+                plan_symbol = p_sym
+
+        open_symbols = _fetch_open_position_symbols(repo=repo)
+        if open_symbols:
+            if plan_symbol and plan_symbol in set(open_symbols):
+                symbol = str(plan_symbol)
+            else:
+                symbol = str(open_symbols[0])
+                if plan_symbol and plan_symbol != symbol:
+                    manage_open_position_only = True
+        elif plan_symbol and plan_symbol in set(rules.universe.symbols):
+            symbol = str(plan_symbol)
 
         try:
             snapshot = fetch_market_snapshot(symbol)
@@ -304,6 +335,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         plan_target_pct = None
         raw_plan_target_pct = None
         plan_activation_gate: dict[str, Any] = {}
+        plan_allowed_actions: dict[str, Any] = {}
         plan_activation_decision: str | None = None
         plan_activation_decision_effective: str | None = None
         plan_execution_plan: dict[str, Any] = {}
@@ -317,6 +349,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 )
                 if isinstance(plan.get("execution_plan"), dict):
                     plan_execution_plan = dict(plan.get("execution_plan") or {})
+                if isinstance(plan.get("allowed_actions"), dict):
+                    plan_allowed_actions = dict(plan.get("allowed_actions") or {})
                 execution_target = None
                 if isinstance(plan_execution_plan.get("final_numbers"), dict):
                     execution_target = (plan_execution_plan.get("final_numbers") or {}).get("target_position_pct")
@@ -332,8 +366,13 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         except Exception:
             plan_target_pct = None
             raw_plan_target_pct = None
+            plan_allowed_actions = {}
         if plan_target_pct is not None:
             plan_target_pct = max(0.0, min(float(plan_target_pct), float(effective_target_cap)))
+        if manage_open_position_only:
+            # Meeting plan switched symbol while we still hold another asset.
+            # In this mode, avoid adding to the orphan position and only allow risk-reducing exits.
+            plan_allowed_actions = {"buy": False, "sell": True}
         quote_ts = _utcnow()
         repo.insert_market_quote(
             ts=quote_ts,
@@ -434,14 +473,13 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "position_state": position_state.to_context(now=_utcnow()),
                 "trade_plan": {
                     "slot_key": plan.get("slot_key") if plan else None,
+                    "time_horizon": plan.get("time_horizon") if plan else None,
                     "target_position_pct": plan_target_pct,
                     "raw_target_position_pct": (raw_plan_target_pct if raw_plan_target_pct is not None else (plan.get("target_position_pct") if plan else None)),
                     "valid_to_kst": plan.get("valid_to_kst") if plan else None,
-                    "allowed_actions": (
-                        plan.get("allowed_actions")
-                        if (plan and isinstance(plan.get("allowed_actions"), dict))
-                        else {}
-                    ),
+                    "allowed_actions": dict(plan_allowed_actions),
+                    "execution_scope": "MANAGE_OPEN_POSITION_ONLY" if manage_open_position_only else "PLAN_SYMBOL",
+                    "plan_symbol": plan_symbol,
                     "activation_gate": dict(plan_activation_gate or {}),
                     "execution_plan": dict(plan_execution_plan or {}),
                 },
@@ -524,11 +562,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
 
         runtime_activation_gate = dict(plan_activation_gate or {})
         runtime_execution_plan = dict(plan_execution_plan or {})
-        runtime_allowed_actions = (
-            dict(plan.get("allowed_actions") or {})
-            if (plan and isinstance(plan.get("allowed_actions"), Mapping))
-            else {}
-        )
+        runtime_allowed_actions = dict(plan_allowed_actions)
         runtime_target_pct = plan_target_pct
         runtime_decision_effective = (
             str(runtime_activation_gate.get("decision_effective") or plan_activation_decision_effective or "").strip().upper()
@@ -819,12 +853,33 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "pause_state": ops.get("pause_state"),
                 "trade_plan_slot_key": plan.get("slot_key") if plan else None,
                 "trade_plan_target_pct": runtime_target_pct,
+                "trade_plan_cooldown_minutes": _as_int(
+                    ((runtime_execution_plan.get("final_numbers") or {}) if isinstance(runtime_execution_plan.get("final_numbers"), Mapping) else {}).get("cooldown_minutes"),
+                    default=int(alpha_cfg.cooldown_minutes),
+                ),
+                "trade_plan_min_hold_seconds": _as_int(
+                    ((runtime_execution_plan.get("final_numbers") or {}) if isinstance(runtime_execution_plan.get("final_numbers"), Mapping) else {}).get("min_hold_seconds"),
+                    default=int(rules.risk.min_hold_seconds),
+                ),
                 "capital_tier": capital_profile.tier_name,
                 "capital_target_cap_pct": effective_target_cap,
             },
         )
 
         # Paper execution
+        runtime_final_numbers = (
+            dict(runtime_execution_plan.get("final_numbers") or {})
+            if isinstance(runtime_execution_plan.get("final_numbers"), Mapping)
+            else {}
+        )
+        runtime_cooldown_minutes = _as_int(
+            runtime_final_numbers.get("cooldown_minutes"),
+            default=int(alpha_cfg.cooldown_minutes),
+        )
+        runtime_min_hold_seconds = _as_int(
+            runtime_final_numbers.get("min_hold_seconds"),
+            default=int(rules.risk.min_hold_seconds),
+        )
         exec_res = executor.execute(
             run_id=run_id,
             rule_version_id=rule_version_id,
@@ -835,7 +890,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             target_position_pct=(safe.effective_target_pct if safe.effective_target_pct is not None else runtime_target_pct),
             strategy_tag=market.strategy_tag,
             exit_reason=market.exit_reason,
-            cooldown_minutes=int(alpha_cfg.cooldown_minutes),
+            cooldown_minutes=int(runtime_cooldown_minutes),
         )
         if exec_res is not None:
             notifier.notify_fill(
@@ -854,6 +909,11 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     avg_exit_price=exec_res.closed_trade.avg_exit_price,
                     realized_pnl_krw=exec_res.closed_trade.realized_pnl,
                     fees_total_krw=exec_res.closed_trade.fees_total,
+                    ts_open=exec_res.closed_trade.ts_open,
+                    ts_close=exec_res.closed_trade.ts_close,
+                    pnl_bps=exec_res.closed_trade.pnl_bps,
+                    exit_reason=exec_res.closed_trade.exit_reason,
+                    min_hold_seconds=int(runtime_min_hold_seconds),
                 )
                 outcome_id = uuid.uuid4()
                 outcome_decision_id = exec_res.closed_trade.entry_decision_id or exec_res.closed_trade.exit_decision_id
