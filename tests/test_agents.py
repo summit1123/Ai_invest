@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import unittest
 
 from ai_invest.agents.market_agent import market_agent_opine
@@ -67,6 +68,22 @@ class AgentTests(unittest.TestCase):
         op = market_agent_opine(payload, rules=self.rules)
         self.assertEqual(op.signal, "HOLD")
         self.assertFalse(op.entry_allowed)
+
+    def test_market_agent_min_hold_blocks_non_protective_exit(self) -> None:
+        payload = base_payload()
+        payload["context"]["position"]["current_qty"] = 0.01
+        entry_ts = datetime.now(timezone.utc) - timedelta(seconds=60)
+        payload["context"]["position_state"] = {
+            "entry_price": 100.0,
+            "entry_ts": entry_ts.isoformat(),
+            "hwm_price": 100.25,
+            "strategy_tag": "MOM",
+        }
+        payload["features"]["atr_pct"] = 0.2
+        payload["snapshot"]["last_price"] = 99.95
+        payload["snapshot"]["mid_price"] = 99.95
+        op = market_agent_opine(payload, rules=self.rules)
+        self.assertNotEqual(op.signal, "SELL")
 
     def test_regime_agent_blocks_on_high_atr(self) -> None:
         payload = base_payload()
