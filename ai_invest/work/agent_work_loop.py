@@ -748,8 +748,30 @@ def run_agent_work_cycle(
 
     if "research_agent" in selected:
         research_tasks = repo.fetch_ready_agent_tasks(agent_name="research_agent", limit=10)
+        research_cfg = (rules_raw.get("research") or {}) if isinstance(rules_raw, Mapping) else {}
+        web_cfg = (research_cfg.get("web_search") or {}) if isinstance(research_cfg, Mapping) else {}
+        headline_limit = max(4, min(24, int(_as_float(research_cfg.get("headline_limit"), default=12))))
+        web_search_enabled = bool(web_cfg.get("enabled", False))
+        web_search_provider = str(web_cfg.get("provider") or "auto").strip() or "auto"
+        web_search_limit = max(
+            1,
+            min(
+                headline_limit,
+                int(_as_float(web_cfg.get("limit"), default=min(8, headline_limit))),
+            ),
+        )
+        web_search_timeout_sec = max(3, int(_as_float(web_cfg.get("timeout_sec"), default=10)))
+        rss_timeout_sec = max(3, int(_as_float(research_cfg.get("rss_timeout_sec"), default=12)))
         try:
-            headlines = fetch_crypto_headlines(symbol=symbol, limit=12)
+            headlines = fetch_crypto_headlines(
+                symbol=symbol,
+                limit=headline_limit,
+                include_web_search=web_search_enabled,
+                web_search_provider=web_search_provider,
+                web_search_limit=web_search_limit,
+                web_search_timeout_sec=web_search_timeout_sec,
+                rss_timeout_sec=rss_timeout_sec,
+            )
         except Exception:
             headlines = []
         research_route = llm_route_for_agent(rules_raw=rules_raw, agent_name="research_agent")
@@ -768,6 +790,7 @@ def run_agent_work_cycle(
             compact_headlines.append(
                 {
                     "source": h.get("source"),
+                    "channel": h.get("channel"),
                     "title": h.get("title"),
                     "url": h.get("url"),
                     "published_at": h.get("published_at"),
@@ -787,6 +810,14 @@ def run_agent_work_cycle(
                 "llm_meta": brief.llm_meta,
                 "symbol": symbol,
                 "headlines": compact_headlines,
+                "research_fetch": {
+                    "headline_limit": int(headline_limit),
+                    "web_search_enabled": bool(web_search_enabled),
+                    "web_search_provider": str(web_search_provider),
+                    "web_search_limit": int(web_search_limit),
+                    "web_search_timeout_sec": int(web_search_timeout_sec),
+                    "rss_timeout_sec": int(rss_timeout_sec),
+                },
                 "assigned_tasks": [dict(t.get("payload") or {}) for t in research_tasks[:5]],
             },
             risks={"watchlist": list(brief.risk_watchlist)},
