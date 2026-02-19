@@ -32,6 +32,14 @@ workers:
   quant_interval_sec: 3600
   risk_interval_sec: 3600
   ops_interval_sec: 3600
+research:
+  headline_limit: 14
+  rss_timeout_sec: 12
+  web_search:
+    enabled: true
+    provider: auto
+    limit: 8
+    timeout_sec: 10
 quant_backtest:
   lookback_bars: 1200
   hold_bars: 24
@@ -42,7 +50,7 @@ quant_backtest:
 strategy:
   alpha_score:
     enabled: true
-    entry_alpha: 0.6197
+    entry_alpha: 0.7672
     strong_alpha: 0.65
     cooldown_override_alpha: 0.8
     cooldown_override_enabled: true
@@ -65,7 +73,7 @@ strategy:
     trail_atr_mult: 0.9
     time_stop_mom_minutes: 240
     time_stop_rev_minutes: 120
-    cooldown_minutes: 44
+    cooldown_minutes: 57
     atr_block_pct: 2.5
     daily_loss_entry_block_ratio: 0.8
     mom_weight_rsi: 0.2
@@ -121,7 +129,7 @@ governance:
   plan_continuity:
     enabled: true
     sticky_if_position_open: true
-    min_hold_minutes: 267
+    min_hold_minutes: 348
     switch_min_backtest_score_delta: 2.0
     switch_min_candidate_score_delta: 0.15
   micro_mode:
@@ -131,8 +139,8 @@ governance:
     allow_plan_led_entry: true
     require_market_long: false
     max_position_pct: 2.0
-    max_spread_bps: 2.614
-    min_alpha: 0.2756
+    max_spread_bps: 1.968
+    min_alpha: 0.3411
     max_daily_loss_pct: 0.5
     max_trades_per_day: 5
   default_target_position_pct: 10.0
