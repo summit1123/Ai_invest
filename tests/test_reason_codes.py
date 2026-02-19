@@ -35,7 +35,11 @@ class ReasonCodesTests(unittest.TestCase):
                 allowed_domains={ReasonDomain.SAFE_JUDGE},
             )
 
+    def test_new_micro_block_codes_parse(self) -> None:
+        self.assertEqual(parse_reason_code("RG_MICRO_BLOCKED_COOLDOWN"), ReasonCode.RG_MICRO_BLOCKED_COOLDOWN)
+        self.assertEqual(parse_reason_code("RG_MICRO_BLOCKED_EDGE"), ReasonCode.RG_MICRO_BLOCKED_EDGE)
+        self.assertEqual(parse_reason_code("RG_MICRO_BLOCKED_POLICY"), ReasonCode.RG_MICRO_BLOCKED_POLICY)
+
 
 if __name__ == "__main__":
     unittest.main()
-
