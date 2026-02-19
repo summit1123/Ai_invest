@@ -40,6 +40,18 @@ def timeframe_to_minutes(tf: str) -> int:
     raise ValueError(f"Unsupported timeframe: {tf}")
 
 
+def as_float(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return float(default)
+        if isinstance(value, (int, float)):
+            return float(value)
+        s = str(value).strip()
+        return float(s) if s else float(default)
+    except Exception:
+        return float(default)
+
+
 def build_brief(
     *,
     symbol: str,
@@ -75,7 +87,24 @@ def build_brief(
         risk_watchlist.append("정합성 FAIL")
         next_actions.append("reconciliation_checks diff 확인 및 원인 제거")
 
-    headlines = fetch_crypto_headlines(symbol=symbol, limit=12)
+    research_cfg = (rules_raw.get("research") or {}) if isinstance(rules_raw, dict) else {}
+    web_cfg = (research_cfg.get("web_search") or {}) if isinstance(research_cfg, dict) else {}
+    headline_limit = max(4, min(24, int(as_float(research_cfg.get("headline_limit"), 12.0))))
+    web_search_enabled = bool(web_cfg.get("enabled", False))
+    web_search_provider = str(web_cfg.get("provider") or "auto").strip() or "auto"
+    web_search_limit = max(1, min(headline_limit, int(as_float(web_cfg.get("limit"), float(min(8, headline_limit))))))
+    web_search_timeout_sec = max(3, int(as_float(web_cfg.get("timeout_sec"), 10.0)))
+    rss_timeout_sec = max(3, int(as_float(research_cfg.get("rss_timeout_sec"), 12.0)))
+
+    headlines = fetch_crypto_headlines(
+        symbol=symbol,
+        limit=headline_limit,
+        include_web_search=web_search_enabled,
+        web_search_provider=web_search_provider,
+        web_search_limit=web_search_limit,
+        web_search_timeout_sec=web_search_timeout_sec,
+        rss_timeout_sec=rss_timeout_sec,
+    )
     llm_route = llm_route_for_agent(rules_raw=rules_raw, agent_name="research_agent")
     brief = research_agent_daily_brief(
         symbol=symbol,
@@ -99,6 +128,14 @@ def build_brief(
         },
         "features": {"atr_pct": feat.atr_pct, "rsi_14": feat.rsi_14, "vol_zscore": feat.vol_zscore},
         "ops": {"pause": pause, "latest_reconciliation": recon},
+        "research_fetch": {
+            "headline_limit": headline_limit,
+            "web_search_enabled": web_search_enabled,
+            "web_search_provider": web_search_provider,
+            "web_search_limit": web_search_limit,
+            "web_search_timeout_sec": web_search_timeout_sec,
+            "rss_timeout_sec": rss_timeout_sec,
+        },
         "latest_safe_decision": latest_safe,
         "news_headlines": headlines,
         "key_findings": brief.key_findings,
