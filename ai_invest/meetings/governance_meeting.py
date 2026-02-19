@@ -88,6 +88,86 @@ def _as_int(value: Any, *, default: int) -> int:
         return int(default)
 
 
+TIME_HORIZON_VALUES = {"intraday", "1d", "swing"}
+
+
+def _normalize_time_horizon(value: Any, *, default: str = "1d") -> str:
+    v = str(value or "").strip().lower()
+    if v in TIME_HORIZON_VALUES:
+        return v
+    d = str(default or "").strip().lower()
+    if d in TIME_HORIZON_VALUES:
+        return d
+    return "1d"
+
+
+def _symbol_eval_row(*, fact_pack: Mapping[str, Any], symbol: str | None) -> Mapping[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    rows = [x for x in list(fact_pack.get("evaluated") or []) if isinstance(x, Mapping)]
+    if sym:
+        for row in rows:
+            if str(row.get("symbol") or "").strip().upper() == sym:
+                return row
+    return rows[0] if rows else {}
+
+
+def _infer_time_horizon(*, fact_pack: Mapping[str, Any], symbol: str | None = None, fallback: str = "1d") -> str:
+    """Infer execution horizon from current market state + recent outcome quality.
+
+    This is used as deterministic fallback and as default when coordinator output omits horizon.
+    """
+    fallback_h = _normalize_time_horizon(fallback, default="1d")
+
+    row = _symbol_eval_row(fact_pack=fact_pack, symbol=symbol)
+    features = (row.get("features") or {}) if isinstance(row, Mapping) else {}
+    snapshot = (row.get("snapshot") or {}) if isinstance(row, Mapping) else {}
+    atr_pct = _as_float(features.get("atr_pct"), default=0.0)
+    spread_bps = _as_float(snapshot.get("spread_bps"), default=0.0)
+    vol_z = _as_float(features.get("vol_zscore"), default=0.0)
+
+    learning = (fact_pack.get("learning_context") or {}) if isinstance(fact_pack.get("learning_context"), Mapping) else {}
+    outcomes = (learning.get("recent_outcomes") or {}) if isinstance(learning.get("recent_outcomes"), Mapping) else {}
+    total_trades = max(0, int(_as_float(outcomes.get("total_trades"), default=0.0)))
+    top_errors = [x for x in list(outcomes.get("top_error_types") or []) if isinstance(x, Mapping)]
+    cost_error_count = 0
+    for row_err in top_errors:
+        err = str(row_err.get("error_type") or "").strip().upper()
+        if err == "OC_COST_UNDERESTIMATED":
+            cost_error_count = max(0, int(_as_float(row_err.get("count"), default=0.0)))
+            break
+    cost_error_ratio = (float(cost_error_count) / float(total_trades)) if total_trades > 0 else 0.0
+
+    # Cost pain -> prefer slower horizon when microstructure is acceptable.
+    if total_trades >= 12 and cost_error_ratio >= 0.30:
+        if atr_pct <= 1.8 and spread_bps <= 6.0:
+            return "swing"
+        return "1d"
+
+    # Very noisy tape -> shorter horizon.
+    if atr_pct >= 2.4 or spread_bps >= 12.0:
+        return "intraday"
+
+    # Calm + liquid tape -> allow swing plan.
+    if atr_pct <= 1.0 and spread_bps <= 4.5 and vol_z >= 0.0:
+        return "swing"
+
+    # Middle ground -> day horizon.
+    if atr_pct <= 1.8 and spread_bps <= 7.0:
+        return "1d"
+
+    return fallback_h
+
+
+def _execution_profile_for_horizon(*, horizon: str, rules: RulesConfig) -> dict[str, int]:
+    h = _normalize_time_horizon(horizon, default="1d")
+    base_time_stop = max(60, int(_as_float(rules.stop_policy.time_stop_minutes, default=360.0)))
+    if h == "intraday":
+        return {"min_hold_seconds": 0, "max_hold_minutes": min(base_time_stop, 360)}
+    if h == "1d":
+        return {"min_hold_seconds": 15 * 60, "max_hold_minutes": max(base_time_stop, 12 * 60)}
+    return {"min_hold_seconds": 90 * 60, "max_hold_minutes": max(base_time_stop, 48 * 60)}
+
+
 def should_block_prework(*, require_prework_reports: bool, prework: Mapping[str, Any]) -> bool:
     if not bool(require_prework_reports):
         return False
@@ -384,6 +464,7 @@ class AllowedActions(BaseModel):
 class QuantPlanDraft(BaseModel):
     symbol: str = Field(..., max_length=20)
     target_position_pct: float = Field(..., ge=0.0, le=100.0)
+    time_horizon: str = Field("auto", pattern="^(auto|intraday|1d|swing)$")
     allowed_actions: AllowedActions = Field(default_factory=AllowedActions)
     entry_triggers: list[str] = Field(default_factory=list)
     exit_triggers: list[str] = Field(default_factory=list)
@@ -417,6 +498,7 @@ class CritiqueOutput(BaseModel):
 class FinalTradePlan(BaseModel):
     symbol: str = Field(..., max_length=20)
     target_position_pct: float = Field(..., ge=0.0, le=100.0)
+    time_horizon: str = Field("auto", pattern="^(auto|intraday|1d|swing)$")
     allowed_actions: AllowedActions = Field(default_factory=AllowedActions)
     rebalance_band_pct: float = Field(2.0, ge=0.0, le=20.0)
     cooldown_minutes: int = Field(60, ge=0, le=7 * 24 * 60)
@@ -472,6 +554,8 @@ class ExecutionFinalNumbers(BaseModel):
     target_position_pct: float = Field(0.0, ge=0.0, le=100.0)
     rebalance_band_pct: float = Field(1.0, ge=0.0, le=50.0)
     cooldown_minutes: int = Field(30, ge=0, le=10080)
+    min_hold_seconds: int = Field(0, ge=0, le=7 * 24 * 3600)
+    max_hold_minutes: int = Field(360, ge=1, le=14 * 24 * 60)
 
 
 class ExecutionPlan(BaseModel):
@@ -876,9 +960,16 @@ def _to_final_trade_plan_v2(
             continue
         conflicts.append({"topic": f"conflict_{idx}", "positions": [], "resolution": c})
 
+    inferred_horizon = _infer_time_horizon(
+        fact_pack=fact_pack,
+        symbol=str(final_plan.symbol),
+        fallback="1d",
+    )
+    horizon = _normalize_time_horizon(getattr(final_plan, "time_horizon", None), default=inferred_horizon)
+
     return FinalTradePlanV2(
         symbol=str(final_plan.symbol),
-        intent=PlanIntent(mode=mode, direction_bias=direction_bias, time_horizon="intraday"),
+        intent=PlanIntent(mode=mode, direction_bias=direction_bias, time_horizon=horizon),
         position_policy=PositionPolicyRange(
             target_position_pct_range=(tgt_lo, tgt_hi),
             rebalance_band_pct_range=(rb_lo, rb_hi),
@@ -954,6 +1045,22 @@ def _build_execution_plan(
 
     chosen_rebalance = min(max(float(final_plan.rebalance_band_pct), float(rb_lo)), float(rb_hi))
     chosen_cooldown = min(max(int(final_plan.cooldown_minutes), int(cd_lo)), int(cd_hi))
+    horizon = _normalize_time_horizon(plan_v2.intent.time_horizon, default="1d")
+    exec_profile = _execution_profile_for_horizon(horizon=horizon, rules=rules)
+    chosen_min_hold_seconds = int(exec_profile.get("min_hold_seconds") or 0)
+    chosen_max_hold_minutes = int(exec_profile.get("max_hold_minutes") or max(1, int(rules.stop_policy.time_stop_minutes)))
+
+    constraint_min_hold = (plan_v2.constraints or {}).get("min_hold_seconds")
+    if constraint_min_hold is None:
+        constraint_min_hold = (final_plan.constraints or {}).get("min_hold_seconds")
+    if constraint_min_hold is not None:
+        chosen_min_hold_seconds = max(0, int(_as_float(constraint_min_hold, default=float(chosen_min_hold_seconds))))
+
+    constraint_max_hold = (plan_v2.constraints or {}).get("max_hold_minutes")
+    if constraint_max_hold is None:
+        constraint_max_hold = (final_plan.constraints or {}).get("max_hold_minutes")
+    if constraint_max_hold is not None:
+        chosen_max_hold_minutes = max(1, int(_as_float(constraint_max_hold, default=float(chosen_max_hold_minutes))))
 
     max_spread = _as_float(
         (plan_v2.constraints or {}).get("max_spread_bps"),
@@ -970,6 +1077,8 @@ def _build_execution_plan(
             target_position_pct=float(chosen_target),
             rebalance_band_pct=float(chosen_rebalance),
             cooldown_minutes=int(chosen_cooldown),
+            min_hold_seconds=int(chosen_min_hold_seconds),
+            max_hold_minutes=int(chosen_max_hold_minutes),
         ),
         gates={
             "spread_bps_max": float(max_spread),
@@ -979,6 +1088,7 @@ def _build_execution_plan(
             "regime_trade_allowed": True,
             "paper_only": bool(decision != "LIVE" or not live_execution_enabled),
             "activation_decision": decision,
+            "time_horizon": str(horizon),
         },
         sizing_rule="min(plan_cap_target, signal_target)",
         rebalance_rule="rebalance if abs(curr-target) > band",
@@ -1025,6 +1135,12 @@ def evaluate_policy_activation_gate(
     )
     relaxed_min_pf = float(_as_float(data_collection_cfg.get("relaxed_min_profit_factor"), default=1.05))
     relaxed_min_expectancy = float(_as_float(data_collection_cfg.get("relaxed_min_expectancy_pct"), default=0.0))
+    # 표본요건은 lookback 대비 과도하게 높으면 영구적으로 gate가 잠긴다.
+    # 기본 strict_min_trades를 상한으로 두고, 백테스트 창 길이에 맞춘 현실적 하한을 적용한다.
+    qb_cfg = (rules_raw.get("quant_backtest") or {}) if isinstance(rules_raw, Mapping) else {}
+    lookback_bars = int(_as_float(qb_cfg.get("lookback_bars"), default=500.0))
+    dynamic_strict_floor = max(6, int(round(float(lookback_bars) / 60.0)))
+    strict_min_trades_effective = max(int(min_trades), min(int(strict_min_trades), int(dynamic_strict_floor)))
 
     bt = _extract_quant_backtest_for_symbol(fact_pack=fact_pack, symbol=final_symbol)
     if bt is None:
@@ -1051,7 +1167,7 @@ def evaluate_policy_activation_gate(
     if is_paper and data_collection_enabled:
         min_trades_effective = max(min_trades, strict_min_trades)
 
-    if is_paper and data_collection_enabled and trades_actual < int(strict_min_trades):
+    if is_paper and data_collection_enabled and trades_actual < int(strict_min_trades_effective):
         checks = [
             {
                 "name": "symbol_match",
@@ -1063,7 +1179,7 @@ def evaluate_policy_activation_gate(
                 "name": "trades_for_strict_gate",
                 "passed": False,
                 "actual": trades_actual,
-                "required": int(strict_min_trades),
+                "required": int(strict_min_trades_effective),
             },
         ]
         return {
@@ -1073,6 +1189,9 @@ def evaluate_policy_activation_gate(
             "selected_backtest": dict(bt),
             "reason_code": "POLICY_GATE_INSUFFICIENT_DATA",
             "paper_data_collection_mode": True,
+            "strict_min_trades_effective": int(strict_min_trades_effective),
+            "strict_min_trades_config": int(strict_min_trades),
+            "lookback_bars": int(lookback_bars),
             "decision": "PAPER",
         }
 
@@ -1148,6 +1267,9 @@ def evaluate_policy_activation_gate(
         "selected_backtest": dict(bt),
         "reason_code": "POLICY_GATE_PASS" if passed else "POLICY_GATE_BLOCKED",
         "paper_data_collection_mode": bool(is_paper and data_collection_enabled),
+        "strict_min_trades_effective": int(strict_min_trades_effective),
+        "strict_min_trades_config": int(strict_min_trades),
+        "lookback_bars": int(lookback_bars),
         "decision": "LIVE" if bool(passed) else "PAPER",
     }
 
@@ -1274,6 +1396,7 @@ def _build_execution_playbook(
         "position_plan": {
             "symbol": str(outputs.final_plan.symbol),
             "target_position_pct": float(resolved_target_position_pct),
+            "time_horizon": _normalize_time_horizon(getattr(outputs.final_plan, "time_horizon", None), default="1d"),
             "buy_allowed": bool(buy_allowed),
             "sell_allowed": bool(sell_allowed),
             "rebalance_band_pct": float(outputs.final_plan.rebalance_band_pct),
@@ -1342,6 +1465,221 @@ def _build_playbook_action_items(
             "due_date": str(today_kst),
         },
     ]
+
+
+def _date_plus_days(*, ymd: str, days: int) -> str:
+    try:
+        return (datetime.fromisoformat(str(ymd)).date() + timedelta(days=int(days))).isoformat()
+    except Exception:
+        return str(ymd)
+
+
+def _build_improvement_roadmap(
+    *,
+    today_kst: str,
+    symbol: str,
+    activation_gate: Mapping[str, Any],
+    playbook: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    checks = [c for c in list(activation_gate.get("checks") or []) if isinstance(c, Mapping)]
+    reason_code = str(activation_gate.get("reason_code") or "").strip() or "UNKNOWN"
+    trades_actual = None
+    trades_required = None
+    for c in checks:
+        name = str(c.get("name") or "").strip()
+        if name in {"trades_for_strict_gate", "trades"}:
+            try:
+                trades_actual = int(float(c.get("actual")))
+            except Exception:
+                trades_actual = None
+            try:
+                trades_required = int(float(c.get("required")))
+            except Exception:
+                trades_required = None
+            break
+
+    fail_lines = []
+    for c in checks:
+        if bool(c.get("passed")):
+            continue
+        fail_lines.append(f"{c.get('name')}: actual={c.get('actual')} / required={c.get('required')}")
+    fail_txt = "; ".join(fail_lines[:3]) if fail_lines else "미확인"
+    spread_guard = "spread_bps <= max_spread_bps_entry"
+    safety_checks = (
+        (playbook.get("entry_plan") or {}).get("safety_checks")
+        if isinstance(playbook.get("entry_plan"), Mapping)
+        else []
+    )
+    if isinstance(safety_checks, list) and safety_checks:
+        spread_guard = str(safety_checks[0])
+
+    stage1_goal = f"게이트 통과를 위한 운영/표본 정합성 확보 ({reason_code})"
+    if reason_code == "POLICY_GATE_INSUFFICIENT_DATA" and trades_required is not None:
+        stage1_goal = f"strict gate 표본 확보 ({trades_actual or 0}/{trades_required} -> {trades_required}+)"
+
+    return [
+        {
+            "stage": "1단계",
+            "owner": "ops_manager",
+            "title": stage1_goal,
+            "task": (
+                f"{symbol} 기준 recon 커버리지와 게이트 실패항목을 고정하고, fail 사유를 회의 메시지에 수치로 남긴다 "
+                f"(현재: {fail_txt})"
+            ),
+            "due_date": str(today_kst),
+            "success_criteria": [
+                "latest_reconciliation.status=OK",
+                "활성화 게이트 fail 체크가 0~1개로 감소",
+                "회의록에 실패항목 actual/required 수치가 기록됨",
+            ],
+        },
+        {
+            "stage": "2단계",
+            "owner": "quant_strategist",
+            "title": "진입/청산 품질 개선 (즉시청산 감소)",
+            "task": (
+                "진입 후 즉시 반대매매를 줄이도록 진입·청산 조건을 보정하고, "
+                "보유시간/비용/손익 지표를 동일 슬롯 기준으로 비교한다."
+            ),
+            "due_date": _date_plus_days(ymd=today_kst, days=1),
+            "success_criteria": [
+                "중앙 보유시간 증가(기준대비)",
+                "수수료 대비 순손익 악화 패턴 감소",
+                spread_guard,
+            ],
+        },
+        {
+            "stage": "3단계",
+            "owner": "risk_manager",
+            "title": "손실 제어 + 실행 허용조건 재정렬",
+            "task": "risk veto 조건과 micro/data-collection 조건 충돌을 줄이고, 허용/차단 이유를 사람이 읽는 문장으로 고정한다.",
+            "due_date": _date_plus_days(ymd=today_kst, days=2),
+            "success_criteria": [
+                "RG_SIGNAL_CONFLICT 비중 감소",
+                "trade_plan allowed_actions와 Safe 결과의 일관성 확보",
+                "일손실 한도 접근 시 자동 축소 로직 확인",
+            ],
+        },
+        {
+            "stage": "4단계",
+            "owner": "governance_coordinator",
+            "title": "주간 검증 루프 고정",
+            "task": "주간 회고에서 승률/기대값/비용을 기준으로 다음 주 1개 개선항목만 선택하고 실험-검증-반영을 닫는다.",
+            "due_date": _date_plus_days(ymd=today_kst, days=3),
+            "success_criteria": [
+                "weekly_priority 1건 등록",
+                "성공기준 수치와 데드라인 명시",
+                "다음 회의에서 결과 PASS/FAIL 평가 완료",
+            ],
+        },
+    ]
+
+
+def _roadmap_to_action_items(*, roadmap: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for step in roadmap:
+        stage = str(step.get("stage") or "").strip()
+        owner = str(step.get("owner") or "").strip() or "governance_coordinator"
+        title = str(step.get("title") or "").strip()
+        task = str(step.get("task") or "").strip()
+        due = str(step.get("due_date") or "").strip()
+        crit = [str(x).strip() for x in list(step.get("success_criteria") or []) if str(x).strip()]
+        crit_txt = "; ".join(crit[:3]) if crit else "미정"
+        action_txt = f"[{stage}] {title} | {task} | 완료기준: {crit_txt}"
+        out.append({"owner": owner, "action": action_txt, "due_date": due})
+    return out
+
+
+def _render_reader_minutes(
+    *,
+    slot_key: str,
+    activation_status: str,
+    plan_symbol: str,
+    target_position_pct: float,
+    allowed_actions: Mapping[str, Any],
+    activation_gate: Mapping[str, Any],
+    rationale: Mapping[str, Any],
+    playbook: Mapping[str, Any],
+    roadmap: Sequence[Mapping[str, Any]],
+    llm_minutes_raw: str,
+) -> str:
+    buy_allowed = bool(allowed_actions.get("buy"))
+    sell_allowed = bool(allowed_actions.get("sell"))
+    reason_code = str(activation_gate.get("reason_code") or "UNKNOWN")
+    checks = [c for c in list(activation_gate.get("checks") or []) if isinstance(c, Mapping)]
+    failed_checks = [c for c in checks if not bool(c.get("passed"))]
+    position_plan = playbook.get("position_plan") if isinstance(playbook, Mapping) else {}
+
+    rationale_lines = [f"- {k}: {str(v).strip()}" for k, v in dict(rationale or {}).items() if str(v).strip()][:4]
+    if not rationale_lines:
+        rationale_lines = ["- 미확인"]
+
+    gate_lines = [f"- reason_code: {reason_code}"]
+    for c in failed_checks[:6]:
+        gate_lines.append(f"- {c.get('name')}: actual={c.get('actual')} / required={c.get('required')}")
+    if len(gate_lines) == 1:
+        gate_lines.append("- 주요 실패 게이트 없음")
+
+    entry_triggers = []
+    exit_triggers = []
+    if isinstance(playbook.get("entry_plan"), Mapping):
+        entry_triggers = [str(x) for x in list((playbook.get("entry_plan") or {}).get("when_to_buy") or []) if str(x).strip()][:3]
+    if isinstance(playbook.get("exit_plan"), Mapping):
+        exit_triggers = [str(x) for x in list((playbook.get("exit_plan") or {}).get("when_to_sell_or_reduce") or []) if str(x).strip()][:3]
+    if not entry_triggers:
+        entry_triggers = ["미확인"]
+    if not exit_triggers:
+        exit_triggers = ["미확인"]
+
+    bt = activation_gate.get("selected_backtest") if isinstance(activation_gate.get("selected_backtest"), Mapping) else {}
+    metric_lines = [
+        f"- 백테스트(trades/win/score): {bt.get('trades', '미확인')} / {bt.get('win_rate_pct', '미확인')} / {bt.get('backtest_score', '미확인')}",
+        f"- 비용반영 기대값(expectancy_after_cost_pct): {bt.get('expectancy_after_cost_pct', '미확인')}",
+        f"- 계획 성향(time_horizon): {str((position_plan or {}).get('time_horizon') or '미확인')}",
+        f"- 실행 허용: buy={buy_allowed}, sell={sell_allowed}, target={float(target_position_pct):.1f}%",
+    ]
+
+    roadmap_lines: list[str] = []
+    for step in list(roadmap or [])[:4]:
+        stage = str(step.get("stage") or "").strip()
+        owner = str(step.get("owner") or "").strip()
+        title = str(step.get("title") or "").strip()
+        due = str(step.get("due_date") or "").strip()
+        roadmap_lines.append(f"[{stage}] {title} (담당: {owner}, 기한: {due})")
+        criteria = [str(x).strip() for x in list(step.get("success_criteria") or []) if str(x).strip()]
+        if criteria:
+            roadmap_lines.append(f"- 완료기준: {'; '.join(criteria[:3])}")
+
+    llm_ref = _clip(str(llm_minutes_raw or "").strip(), 900)
+    if not llm_ref:
+        llm_ref = "미확인"
+
+    minutes = "\n".join(
+        [
+            "1) 이번 슬롯 결론",
+            f"- 슬롯: {slot_key}",
+            f"- 상태: {activation_status}",
+            f"- 실행 플랜: {plan_symbol} / target={float(target_position_pct):.1f}% / buy={buy_allowed} / sell={sell_allowed}",
+            "",
+            "2) 왜 이렇게 결정했는지 (핵심 근거)",
+            *rationale_lines,
+            "",
+            "3) 현재 제약/게이트",
+            *gate_lines,
+            "",
+            "4) 단계별 개선 플랜",
+            *(roadmap_lines or ["- 미확인"]),
+            "",
+            "5) 다음 슬롯 전 체크 지표",
+            f"- 진입 조건(요약): {' / '.join(entry_triggers)}",
+            f"- 청산 조건(요약): {' / '.join(exit_triggers)}",
+            *metric_lines,
+            "",
+            "참고) Secretary 원문 요약",
+            llm_ref,
+        ]
+    )
+    return _clip(minutes, 3200)
 
 
 def enforce_final_trade_plan(
@@ -1598,6 +1936,116 @@ def _default_fact_pack(
     }
 
 
+def _evaluated_score_for_symbol(*, fact_pack: Mapping[str, Any], symbol: str) -> float | None:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return None
+    rows = [x for x in list(fact_pack.get("evaluated") or []) if isinstance(x, Mapping)]
+    for row in rows:
+        if str(row.get("symbol") or "").strip().upper() != sym:
+            continue
+        try:
+            return float(row.get("score"))
+        except Exception:
+            return None
+    return None
+
+
+def _apply_plan_continuity(
+    *,
+    plan: FinalTradePlan,
+    fact_pack: Mapping[str, Any],
+    rules_raw: Mapping[str, Any],
+) -> FinalTradePlan:
+    """Reduce hourly symbol churn by carrying over the previous slot plan when switch edge is weak."""
+
+    gov = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    cfg = (gov.get("plan_continuity") or {}) if isinstance(gov, Mapping) else {}
+    enabled = bool(cfg.get("enabled", True))
+    if not enabled:
+        return plan
+
+    prev = (
+        (fact_pack.get("previous_plan_summary") or {})
+        if isinstance(fact_pack.get("previous_plan_summary"), Mapping)
+        else {}
+    )
+    prev_symbol = str(prev.get("symbol") or "").strip().upper()
+    if not prev_symbol:
+        return plan
+
+    curr_symbol = str(plan.symbol or "").strip().upper()
+    if not curr_symbol or prev_symbol == curr_symbol:
+        return plan
+
+    allowed = set(str(x).strip().upper() for x in list(fact_pack.get("allowed_symbols") or []) if str(x).strip())
+    if prev_symbol not in allowed:
+        return plan
+
+    account_state = (fact_pack.get("account_state") or {}) if isinstance(fact_pack.get("account_state"), Mapping) else {}
+    open_symbols = set(
+        str(x).strip().upper()
+        for x in list(account_state.get("open_symbols") or [])
+        if str(x).strip()
+    )
+
+    keep_prev = False
+    keep_reason = ""
+
+    if bool(cfg.get("sticky_if_position_open", True)) and prev_symbol in open_symbols:
+        keep_prev = True
+        keep_reason = "open_position"
+
+    if not keep_prev:
+        min_hold_min = int(_as_float(cfg.get("min_hold_minutes"), default=120.0))
+        prev_ts = _as_kst_dt(prev.get("created_at_kst") or prev.get("ts") or prev.get("valid_from_kst"))
+        if prev_ts is not None:
+            age_min = max(0.0, (_now_kst() - prev_ts).total_seconds() / 60.0)
+            if age_min < float(min_hold_min):
+                keep_prev = True
+                keep_reason = f"min_hold({age_min:.0f}<{min_hold_min})"
+
+    if not keep_prev:
+        bt_delta_required = float(_as_float(cfg.get("switch_min_backtest_score_delta"), default=2.0))
+        curr_bt = _extract_quant_backtest_for_symbol(fact_pack=fact_pack, symbol=curr_symbol)
+        prev_bt = _extract_quant_backtest_for_symbol(fact_pack=fact_pack, symbol=prev_symbol)
+        if isinstance(curr_bt, Mapping) and isinstance(prev_bt, Mapping):
+            curr_score = _as_float(curr_bt.get("backtest_score"), default=-999.0)
+            prev_score = _as_float(prev_bt.get("backtest_score"), default=-999.0)
+            if float(curr_score - prev_score) < float(bt_delta_required):
+                keep_prev = True
+                keep_reason = f"bt_delta<{bt_delta_required:.2f}"
+        else:
+            ev_delta_required = float(_as_float(cfg.get("switch_min_candidate_score_delta"), default=0.15))
+            curr_score = _as_float(_evaluated_score_for_symbol(fact_pack=fact_pack, symbol=curr_symbol), default=-999.0)
+            prev_score = _as_float(_evaluated_score_for_symbol(fact_pack=fact_pack, symbol=prev_symbol), default=-999.0)
+            if float(curr_score - prev_score) < float(ev_delta_required):
+                keep_prev = True
+                keep_reason = f"candidate_delta<{ev_delta_required:.2f}"
+
+    if not keep_prev:
+        return plan
+
+    conflict = [str(x) for x in list(plan.conflict_resolution or []) if str(x).strip()][:15]
+    conflict.append(f"plan continuity 적용: symbol {curr_symbol} -> {prev_symbol} ({keep_reason})")
+    notes = _clip(
+        "\n".join(
+            [
+                str(plan.notes or "").strip(),
+                f"[plan_continuity] previous={prev_symbol}, current={curr_symbol}, reason={keep_reason}",
+            ]
+        ),
+        1200,
+    )
+    return plan.model_copy(
+        update={
+            "symbol": str(prev_symbol),
+            "conflict_resolution": conflict[:16],
+            "notes": notes,
+        }
+    )
+
+
 def run_governance_protocol(
     *,
     fact_pack: Mapping[str, Any],
@@ -1644,6 +2092,25 @@ def run_governance_protocol(
 
     pause = bool(((fact_pack.get("ops_state") or {}).get("pause") or {}).get("paused") or False)
     recon_status = str(((fact_pack.get("ops_state") or {}).get("latest_reconciliation") or {}).get("status") or "OK").upper()
+    learning_ctx = fact_pack.get("learning_context") if isinstance(fact_pack.get("learning_context"), Mapping) else {}
+    recent_outcomes = (
+        (learning_ctx.get("recent_outcomes") or {})
+        if isinstance(learning_ctx.get("recent_outcomes"), Mapping)
+        else {}
+    )
+    latest_priority = (
+        (learning_ctx.get("latest_weekly_priority") or {})
+        if isinstance(learning_ctx.get("latest_weekly_priority"), Mapping)
+        else {}
+    )
+    recent_trades = int(_as_float(recent_outcomes.get("total_trades"), default=0.0))
+    recent_win_rate = float(_as_float(recent_outcomes.get("win_rate_pct"), default=0.0))
+    top_error_items = [x for x in list(recent_outcomes.get("top_error_types") or []) if isinstance(x, Mapping)]
+    top_error_txt = ", ".join(
+        f"{str(x.get('error_type') or '').strip()}:{int(_as_float(x.get('count'), default=0.0))}"
+        for x in top_error_items[:3]
+        if str(x.get("error_type") or "").strip()
+    )
 
     # Research deterministic
     headlines = (fact_pack.get("research_brief") or {}).get("headlines") if isinstance(fact_pack.get("research_brief"), Mapping) else None
@@ -1668,6 +2135,12 @@ def run_governance_protocol(
         det_risks.append("시스템 PAUSE 상태(실행 차단 가능)")
     if recon_status == "FAIL":
         det_risks.append("정합성 FAIL(운영 리스크)")
+    if recent_trades >= 5:
+        det_risks.append(
+            f"최근 {int(recent_outcomes.get('window_days') or 3)}일 성과: trades={recent_trades}, win_rate={recent_win_rate:.1f}%"
+        )
+        if top_error_txt:
+            det_risks.append(f"최근 반복 에러유형: {top_error_txt}")
     if not det_risks:
         det_risks.append("특이 운영 리스크 없음(기계적 체크 기준)")
     det_research = ResearchGovOutput(
@@ -1677,10 +2150,17 @@ def run_governance_protocol(
         unknowns=["헤드라인 기반이며 세부 내용(원문) 미검증"] if det_evidence else [],
     )
 
+    inferred_horizon = _infer_time_horizon(
+        fact_pack=fact_pack,
+        symbol=str(best_symbol),
+        fallback="1d",
+    )
+
     # Quant deterministic
     det_quant = QuantPlanDraft(
         symbol=best_symbol if best_symbol in allowed else (next(iter(allowed), best_symbol)),
         target_position_pct=float(min(max_pos, default_target)),
+        time_horizon=str(inferred_horizon),
         allowed_actions=AllowedActions(buy=not pause and recon_status != "FAIL", sell=True),
         entry_triggers=[
             "스프레드(cost_guard.max_spread_bps_entry) 이내",
@@ -1698,7 +2178,10 @@ def run_governance_protocol(
             int(((fact_pack.get("rules") or {}).get("risk") or {}).get("cooldown_minutes_after_trigger") or 180),
             max(0, int(cap_cooldown)),
         ),
-        notes=f"deterministic 초안: 점수 상위 심볼을 기본 비중으로 채택 (capital_tier={cap_tier})",
+        notes=(
+            "deterministic 초안: 점수 상위 심볼을 기본 비중으로 채택 "
+            f"(capital_tier={cap_tier}, recent_win_rate={recent_win_rate:.1f}%, top_errors={top_error_txt or '없음'})"
+        ),
     )
 
     det_risk = RiskDraft(
@@ -1709,6 +2192,15 @@ def run_governance_protocol(
         required_constraints={**dict((fact_pack.get("rules") or {}).get("cost_guard") or {}), "capital_max_position_pct": float(max_pos)},
         notes=f"deterministic: 룰 상한 + 자본 티어(capital_tier={cap_tier})를 적용",
     )
+    if latest_priority:
+        det_risk = det_risk.model_copy(
+            update={
+                "notes": _clip(
+                    f"{det_risk.notes}; latest_weekly_priority={str(latest_priority.get('priority_title') or '미확인')}",
+                    480,
+                )
+            }
+        )
 
     det_ops = OpsDraft(
         veto=bool(recon_status == "FAIL"),
@@ -1744,6 +2236,7 @@ def run_governance_protocol(
     det_final = FinalTradePlan(
         symbol=det_quant.symbol,
         target_position_pct=float(det_quant.target_position_pct),
+        time_horizon=str(inferred_horizon),
         allowed_actions=det_quant.allowed_actions,
         rebalance_band_pct=float(det_quant.rebalance_band_pct),
         cooldown_minutes=int(det_quant.cooldown_minutes),
@@ -1777,6 +2270,23 @@ def run_governance_protocol(
         allowed_symbols=allowed,
         fallback_symbol=best_symbol,
         hard_max_position_pct=max_pos,
+    )
+    det_final = _apply_plan_continuity(
+        plan=det_final,
+        fact_pack=fact_pack,
+        rules_raw=rules_raw,
+    )
+    det_final = det_final.model_copy(
+        update={
+            "time_horizon": _normalize_time_horizon(
+                det_final.time_horizon,
+                default=_infer_time_horizon(
+                    fact_pack=fact_pack,
+                    symbol=str(det_final.symbol),
+                    fallback=str(inferred_horizon),
+                ),
+            )
+        }
     )
 
     if not (use_llm and sdk_ok and _llm_enabled_for(_route("governance_coordinator"))):
@@ -1958,6 +2468,23 @@ def run_governance_protocol(
         fallback_symbol=best_symbol,
         hard_max_position_pct=max_pos,
     )
+    final_plan = _apply_plan_continuity(
+        plan=final_plan,
+        fact_pack=fact_pack,
+        rules_raw=rules_raw,
+    )
+    final_plan = final_plan.model_copy(
+        update={
+            "time_horizon": _normalize_time_horizon(
+                final_plan.time_horizon,
+                default=_infer_time_horizon(
+                    fact_pack=fact_pack,
+                    symbol=str(final_plan.symbol),
+                    fallback="1d",
+                ),
+            )
+        }
+    )
     _step("governance_coordinator", "FINAL_TRADE_PLAN", final_plan, llm_meta["governance_coordinator"])
 
     # Secretary: human minutes
@@ -2104,6 +2631,53 @@ def _as_kst_dt(value: Any) -> datetime | None:
             return value.replace(tzinfo=timezone.utc).astimezone(KST)
         return value.astimezone(KST)
     return None
+
+
+def _summarize_recent_outcomes(*, repo: PostgresRepo, now_kst: datetime, days: int = 3) -> dict[str, Any]:
+    since = now_kst - timedelta(days=max(1, int(days)))
+    rows = repo.fetch_decision_outcomes(limit=1200)
+    total = 0
+    labels: dict[str, int] = {}
+    errors: dict[str, int] = {}
+    for r in rows:
+        close_kst = _as_kst_dt(r.get("ts_close"))
+        if close_kst is not None and close_kst < since:
+            continue
+        total += 1
+        lb = str(r.get("outcome_label") or "").strip().upper() or "UNKNOWN"
+        labels[lb] = labels.get(lb, 0) + 1
+        err = str(r.get("error_type") or "").strip().upper()
+        if err:
+            errors[err] = errors.get(err, 0) + 1
+    loss = int(labels.get("LOSS") or 0)
+    win = int(labels.get("WIN") or 0)
+    win_rate = (float(win) / float(total) * 100.0) if total > 0 else 0.0
+    top_errors = sorted(errors.items(), key=lambda x: x[1], reverse=True)[:5]
+    return {
+        "window_days": int(max(1, int(days))),
+        "total_trades": int(total),
+        "win_rate_pct": float(round(win_rate, 2)),
+        "labels": {k: int(v) for k, v in labels.items()},
+        "top_error_types": [{"error_type": str(k), "count": int(v)} for k, v in top_errors],
+        "loss_count": int(loss),
+    }
+
+
+def _latest_weekly_priority_snapshot(*, repo: PostgresRepo) -> dict[str, Any] | None:
+    rows = repo.fetch_strategy_reviews(limit=1)
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "review_id": str(r.get("review_id") or ""),
+        "week_start": str(r.get("week_start") or ""),
+        "week_end": str(r.get("week_end") or ""),
+        "priority_title": str(r.get("priority_title") or ""),
+        "hypothesis": str(r.get("hypothesis") or ""),
+        "owner": str(r.get("owner") or ""),
+        "status": str(r.get("status") or ""),
+        "success_criteria": dict(r.get("success_criteria") or {}),
+    }
 
 
 def _close_or_skip_open_meeting(
@@ -2348,6 +2922,22 @@ def run_governance_meeting_now(
         pos = repo.fetch_position(best_symbol)
         pos_value = (float(pos.qty) * float((evaluated[0] if evaluated else {}).get("snapshot", {}).get("mid_price") or 0.0)) if pos else 0.0
         equity = float(cash) + float(pos_value)
+        portfolio_overview = repo.fetch_portfolio_overview(quote_currency=quote_ccy)
+        open_positions = []
+        for row in list(portfolio_overview.get("positions") or []):
+            if not isinstance(row, Mapping):
+                continue
+            sym = str(row.get("symbol") or "").strip().upper()
+            qty = _as_float(row.get("qty"), default=0.0)
+            if sym and qty > 0:
+                open_positions.append(
+                    {
+                        "symbol": sym,
+                        "qty": float(qty),
+                        "value_krw": float(_as_float(row.get("value_krw"), default=0.0)),
+                        "unrealized_pnl_krw": float(_as_float(row.get("unrealized_pnl_krw"), default=0.0)),
+                    }
+                )
         capital_profile = resolve_capital_policy(
             rules_raw=rules_raw,
             equity_krw=equity,
@@ -2361,6 +2951,8 @@ def run_governance_meeting_now(
             "position_value_krw": float(pos_value),
             "current_qty": float(pos.qty) if pos else 0.0,
             "avg_entry_price": float(pos.avg_entry_price) if (pos and pos.avg_entry_price) else None,
+            "open_positions": list(open_positions),
+            "open_symbols": [str(x.get("symbol") or "") for x in open_positions if str(x.get("symbol") or "").strip()],
             "capital_profile": capital_profile.as_dict(),
         }
 
@@ -2374,6 +2966,10 @@ def run_governance_meeting_now(
             research_brief=research_brief,
             account_state=account_state,
         )
+        fact_pack["learning_context"] = {
+            "recent_outcomes": _summarize_recent_outcomes(repo=repo, now_kst=now_kst, days=3),
+            "latest_weekly_priority": _latest_weekly_priority_snapshot(repo=repo),
+        }
         fact_pack["prework_reports"] = dict((prework or {}).get("reports") or {})
         fact_pack["prework_status"] = {
             "require_prework_reports": bool(require_prework_reports),
@@ -2393,6 +2989,23 @@ def run_governance_meeting_now(
             "ranked_count": int(_as_float((universe_selection or {}).get("ranked_count"), default=0.0)),
             "top24h_turnover": [x for x in list((universe_selection or {}).get("top24h_turnover") or []) if isinstance(x, Mapping)][:10],
         }
+        prev_plan = repo.fetch_latest_trade_plan(prefer_active=False, lookback_limit=300)
+        if isinstance(prev_plan, Mapping):
+            prev_slot = str(prev_plan.get("slot_key") or "").strip()
+            if prev_slot and prev_slot != str(slot_key):
+                fact_pack["previous_plan_summary"] = {
+                    "slot_key": prev_slot,
+                    "ts": str(prev_plan.get("ts") or ""),
+                    "symbol": str(prev_plan.get("symbol") or ""),
+                    "target_position_pct": _as_float(prev_plan.get("target_position_pct"), default=0.0),
+                    "allowed_actions": dict(prev_plan.get("allowed_actions") or {})
+                    if isinstance(prev_plan.get("allowed_actions"), Mapping)
+                    else {},
+                    "valid_from_kst": str(prev_plan.get("valid_from_kst") or ""),
+                    "valid_to_kst": str(prev_plan.get("valid_to_kst") or ""),
+                    "activation_status": str(prev_plan.get("activation_status") or ""),
+                    "created_at_kst": str(prev_plan.get("created_at_kst") or ""),
+                }
 
         def _confidence_for(message_type: str) -> float | None:
             m = str(message_type or "")
@@ -2498,6 +3111,8 @@ def run_governance_meeting_now(
         resolved_target_position_pct = float(outputs.final_plan.target_position_pct)
         if paper_data_collection_applied:
             resolved_allowed_actions["buy"] = bool(force_plan_buy_allowed)
+            # 데이터 수집 모드에서는 리스크 감축(SELL) 경로를 항상 열어 둔다.
+            resolved_allowed_actions["sell"] = True
             if bool(resolved_allowed_actions["buy"]):
                 resolved_target_position_pct = max(
                     0.0,
@@ -2558,8 +3173,9 @@ def run_governance_meeting_now(
         )
 
         summary_short = (
-            f"[{slot_key}] Trade Plan({activation_status}): "
-            f"{outputs.final_plan.symbol} target={float(resolved_target_position_pct):.1f}%"
+            f"[{slot_key}] {activation_status}: "
+            f"{outputs.final_plan.symbol} target={float(resolved_target_position_pct):.1f}% "
+            f"(gate={activation_gate.get('reason_code')})"
         )
         execution_playbook = _build_execution_playbook(
             slot_key=slot_key,
@@ -2569,6 +3185,13 @@ def run_governance_meeting_now(
             resolved_allowed_actions=resolved_allowed_actions,
         )
         action_items = _build_playbook_action_items(today_kst=str(now_kst.date()), playbook=execution_playbook)
+        improvement_roadmap = _build_improvement_roadmap(
+            today_kst=str(now_kst.date()),
+            symbol=str(outputs.final_plan.symbol),
+            activation_gate=activation_gate,
+            playbook=execution_playbook,
+        )
+        action_items.extend(_roadmap_to_action_items(roadmap=improvement_roadmap))
         if not activation_passed:
             action_items.append(
                 {
@@ -2660,6 +3283,17 @@ def run_governance_meeting_now(
                 f"risk_max={float(outputs.risk.max_position_pct):.1f}"
             ),
         }
+        resolved_constraints = dict(resolved_final_plan.constraints or {})
+        if resolved_constraints.get("max_spread_bps") is None:
+            resolved_constraints["max_spread_bps"] = float(rules.cost_guard.max_spread_bps_entry)
+        if resolved_constraints.get("max_slippage_bps") is None:
+            resolved_constraints["max_slippage_bps"] = float(rules.cost_guard.max_predicted_slippage_bps)
+        if resolved_constraints.get("max_position_pct") is None:
+            resolved_constraints["max_position_pct"] = float(
+                min(float(outputs.risk.max_position_pct), float(rules.risk.max_position_pct_per_symbol))
+            )
+        if resolved_constraints.get("min_expected_edge_bps") is None:
+            resolved_constraints["min_expected_edge_bps"] = float(rules.cost_guard.min_expected_edge_bps)
         inputs_hash_payload = _build_inputs_hash_payload(
             slot_key=slot_key,
             symbol=str(resolved_final_plan.symbol),
@@ -2673,14 +3307,17 @@ def run_governance_meeting_now(
             "slot_key": slot_key,
             "meeting_id": str(meeting_id),
             "symbol": resolved_final_plan.symbol,
+            "time_horizon": str(final_plan_v2.intent.time_horizon),
             "target_position_pct": float(execution_plan.final_numbers.target_position_pct),
             "valid_from_kst": resolved_final_plan.valid_from_kst,
             "valid_to_kst": resolved_final_plan.valid_to_kst,
-            "constraints": resolved_final_plan.constraints,
+            "constraints": dict(resolved_constraints),
             "notes": plan_notes,
             "allowed_actions": dict(resolved_allowed_actions),
             "rebalance_band_pct": float(execution_plan.final_numbers.rebalance_band_pct),
             "cooldown_minutes": int(execution_plan.final_numbers.cooldown_minutes),
+            "min_hold_seconds": int(execution_plan.final_numbers.min_hold_seconds),
+            "max_hold_minutes": int(execution_plan.final_numbers.max_hold_minutes),
             "rationale": resolved_final_plan.rationale,
             "conflict_resolution": resolved_final_plan.conflict_resolution,
             "evidence_refs": resolved_final_plan.evidence_refs,
@@ -2697,13 +3334,26 @@ def run_governance_meeting_now(
             "cost_model": cost_model,
             "paper_live_policy": paper_live_policy,
             "execution_playbook": execution_playbook,
+            "improvement_roadmap": list(improvement_roadmap),
         }
+        formatted_minutes = _render_reader_minutes(
+            slot_key=slot_key,
+            activation_status=activation_status,
+            plan_symbol=str(resolved_final_plan.symbol),
+            target_position_pct=float(execution_plan.final_numbers.target_position_pct),
+            allowed_actions=dict(resolved_allowed_actions),
+            activation_gate=activation_gate,
+            rationale=dict(resolved_final_plan.rationale or {}),
+            playbook=execution_playbook,
+            roadmap=improvement_roadmap,
+            llm_minutes_raw=str(outputs.secretary_minutes or ""),
+        )
 
         repo.update_meeting_session(
             meeting_id=meeting_id,
             status="CLOSED",
             ended_at=ended_at,
-            summary=outputs.secretary_minutes,
+            summary=formatted_minutes,
             decisions={
                 "trade_plan": resolved_final_plan.model_dump(),
                 "trade_plan_v2": final_plan_v2.model_dump(),
@@ -2711,6 +3361,8 @@ def run_governance_meeting_now(
                 "plan_payload": plan_payload,
                 "activation_status": activation_status,
                 "activation_gate": activation_gate,
+                "improvement_roadmap": list(improvement_roadmap),
+                "secretary_minutes_raw": str(outputs.secretary_minutes or ""),
             },
             action_items={"items": action_items},
         )
@@ -2729,10 +3381,12 @@ def run_governance_meeting_now(
                     "meeting_id": str(meeting_id),
                     "slot_key": slot_key,
                     "summary_short": summary_short,
-                    "assistant_minutes": outputs.secretary_minutes,
+                    "assistant_minutes": formatted_minutes,
+                    "assistant_minutes_raw": str(outputs.secretary_minutes or ""),
                     "activation_status": activation_status,
                     "activation_gate": activation_gate,
                     "trade_plan": plan_payload,
+                    "improvement_roadmap": list(improvement_roadmap),
                     "llm_meta": {k: asdict(v) for k, v in outputs.llm_meta.items()},
                 },
             )
@@ -2744,7 +3398,7 @@ def run_governance_meeting_now(
                 event_id=summary_event_id,
                 meeting_id=str(meeting_id),
                 summary=summary_short,
-                assistant_minutes=outputs.secretary_minutes,
+                assistant_minutes=formatted_minutes,
                 assistant_meta=secretary_meta,
                 trade_plan=plan_payload,
             )
@@ -2802,7 +3456,20 @@ def run_governance_meeting_now(
         )
         if plan_set_allowed:
             try:
-                rationale_lines = [str(v).strip() for v in dict(outputs.final_plan.rationale or {}).values() if str(v).strip()]
+                rationale_lines = [
+                    f"activation={activation_status}",
+                    f"decision={str(activation_gate.get('decision_effective') or activation_gate.get('decision') or '-')}",
+                    f"reason={str(activation_gate.get('reason_code') or '-')}",
+                    f"hard_block={bool(activation_gate.get('hard_plan_block'))}",
+                    f"soft_block={bool(activation_gate.get('soft_plan_block'))}",
+                    f"buy_intent={bool(plan_payload.get('allowed_actions', {}).get('buy'))}",
+                ]
+                hard_reasons = [str(x).strip() for x in list(activation_gate.get("hard_plan_block_reasons") or []) if str(x).strip()]
+                soft_reasons = [str(x).strip() for x in list(activation_gate.get("soft_plan_block_reasons") or []) if str(x).strip()]
+                if hard_reasons:
+                    rationale_lines.append(f"hard_reasons={','.join(hard_reasons[:3])}")
+                if soft_reasons:
+                    rationale_lines.append(f"soft_reasons={','.join(soft_reasons[:3])}")
                 notifier.notify_trade_plan_set(
                     event_id=trade_plan_event_id,
                     meeting_id=str(meeting_id),
@@ -2816,6 +3483,8 @@ def run_governance_meeting_now(
                     cooldown_minutes=int(_as_float(plan_payload.get("cooldown_minutes"), default=0.0)),
                     constraints=dict(plan_payload.get("constraints") or {}),
                     rationale_summary=" | ".join(rationale_lines[:3]),
+                    activation_status=str(activation_status),
+                    activation_gate=dict(activation_gate or {}),
                 )
             except Exception:
                 pass
@@ -2880,12 +3549,16 @@ def run_governance_meeting_now(
             repo.update_meeting_session(
                 meeting_id=meeting_id,
                 decisions={
-                    "trade_plan": outputs.final_plan.model_dump(),
+                    "trade_plan": resolved_final_plan.model_dump(),
+                    "trade_plan_v2": final_plan_v2.model_dump(),
+                    "execution_plan": execution_plan.model_dump(),
                     "plan_payload": plan_payload,
                     "policy_version": int(policy_version),
                     "activation_status": activation_status,
                     "activation_gate": activation_gate,
                     "assigned_tasks": assigned_tasks,
+                    "improvement_roadmap": list(improvement_roadmap),
+                    "secretary_minutes_raw": str(outputs.secretary_minutes or ""),
                 },
                 action_items={
                     "items": list(action_items)
@@ -2910,12 +3583,14 @@ def run_governance_meeting_now(
                     "slot_key": slot_key,
                     "ended_at": ended_at.isoformat(),
                     "summary_short": summary_short,
-                    "assistant_minutes": outputs.secretary_minutes,
+                    "assistant_minutes": formatted_minutes,
+                    "assistant_minutes_raw": str(outputs.secretary_minutes or ""),
                     "trade_plan": plan_payload,
                     "policy_version": int(policy_version),
                     "activation_status": activation_status,
                     "activation_gate": activation_gate,
                     "assigned_tasks": assigned_tasks,
+                    "improvement_roadmap": list(improvement_roadmap),
                 },
             )
             emit("done", {"ok": True})
@@ -3026,6 +3701,14 @@ def maybe_run_scheduled_governance_meeting(
         day_cursor += timedelta(days=1)
 
     for slot_dt in sorted(due_slots):
+        # Catch-up은 "아직 유효한 슬롯"만 실행한다.
+        # 과거에 이미 만료된 슬롯을 재생성하면 최신 계획 이해를 혼선시킬 수 있다.
+        try:
+            slot_end = next_slot_kst(slot_dt, times=times, current=slot_dt.strftime("%H:%M"))
+        except Exception:
+            slot_end = slot_dt + timedelta(hours=1)
+        if slot_end <= now_kst:
+            continue
         slot_key = _slot_key_for_dt(slot_dt)
         if repo.meeting_slot_exists(slot_key=slot_key):
             continue
