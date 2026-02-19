@@ -31,10 +31,12 @@ def _build_commands(
     ops_interval_sec: float,
     governance_sleep_sec: float,
     review_sleep_sec: float,
+    adaptive_sleep_sec: float,
     enable_paper: bool,
     enable_work: bool,
     enable_governance: bool,
     enable_review: bool,
+    enable_adaptive: bool,
 ) -> list[tuple[str, list[str]]]:
     cmds: list[tuple[str, list[str]]] = []
     if enable_paper:
@@ -132,6 +134,19 @@ def _build_commands(
                 ],
             )
         )
+    if enable_adaptive:
+        cmds.append(
+            (
+                "adaptive_tuning_loop",
+                [
+                    python_bin,
+                    str(ROOT / "scripts" / "run_adaptive_tuning_loop.py"),
+                    "--align-to-clock",
+                    "--sleep-sec",
+                    str(float(adaptive_sleep_sec)),
+                ],
+            )
+        )
     return cmds
 
 
@@ -156,12 +171,14 @@ def main() -> int:
     p.add_argument("--ops-interval-sec", type=float, default=-1.0, help="ops worker interval")
     p.add_argument("--governance-sleep-sec", type=float, default=30.0, help="governance scheduler check interval")
     p.add_argument("--review-sleep-sec", type=float, default=60.0, help="daily/weekly review loop interval")
+    p.add_argument("--adaptive-sleep-sec", type=float, default=-1.0, help="adaptive tuning worker interval")
     p.add_argument("--restart-delay-sec", type=float, default=5.0, help="delay before restarting a crashed worker")
     p.add_argument("--status-file", type=str, default=str(DEFAULT_STATUS_FILE), help="orchestrator status json path")
     p.add_argument("--no-paper", action="store_true", help="disable paper loop worker")
     p.add_argument("--no-work", action="store_true", help="disable prework loop worker")
     p.add_argument("--no-governance", action="store_true", help="disable governance loop worker")
     p.add_argument("--no-review", action="store_true", help="disable review loop worker")
+    p.add_argument("--no-adaptive", action="store_true", help="disable adaptive tuning worker")
     p.add_argument("--dry-run", action="store_true", help="print commands and exit")
     args = p.parse_args()
 
@@ -174,10 +191,14 @@ def main() -> int:
     default_quant = float((workers_cfg.get("quant_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 3600)))
     default_risk = float((workers_cfg.get("risk_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 3600)))
     default_ops = float((workers_cfg.get("ops_interval_sec") or (legacy_work_interval if legacy_work_interval > 0 else 3600)))
+    tuning_cfg = rules.get("adaptive_tuning") or {}
+    adaptive_enabled_default = bool(tuning_cfg.get("enabled", False))
+    default_adaptive = float((tuning_cfg.get("interval_sec") or 3600))
     research_interval = float(args.research_interval_sec if args.research_interval_sec > 0 else default_research)
     quant_interval = float(args.quant_interval_sec if args.quant_interval_sec > 0 else default_quant)
     risk_interval = float(args.risk_interval_sec if args.risk_interval_sec > 0 else default_risk)
     ops_interval = float(args.ops_interval_sec if args.ops_interval_sec > 0 else default_ops)
+    adaptive_interval = float(args.adaptive_sleep_sec if args.adaptive_sleep_sec > 0 else default_adaptive)
 
     commands = _build_commands(
         python_bin=sys.executable,
@@ -188,10 +209,12 @@ def main() -> int:
         ops_interval_sec=ops_interval,
         governance_sleep_sec=float(args.governance_sleep_sec),
         review_sleep_sec=float(args.review_sleep_sec),
+        adaptive_sleep_sec=float(adaptive_interval),
         enable_paper=not bool(args.no_paper),
         enable_work=not bool(args.no_work),
         enable_governance=not bool(args.no_governance),
         enable_review=not bool(args.no_review),
+        enable_adaptive=(not bool(args.no_adaptive)) and bool(adaptive_enabled_default),
     )
 
     if not commands:
