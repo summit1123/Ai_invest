@@ -1,61 +1,50 @@
-version: "v1.0"
-as_of_date: "2026-02-09"
-
+version: v1.0
+as_of_date: '2026-02-09'
 universe:
-  market: "upbit"
-  # fallback 유니버스(동적 스캔 실패 시 사용)
+  market: upbit
   symbols:
-    - "KRW-BTC"
-    - "KRW-ETH"
-    - "KRW-XRP"
-    - "KRW-SOL"
-  # 동적 유니버스: 업비트 API로 KRW 마켓을 스캔해 거래대금 상위 후보를 자동 선정
+  - KRW-BTC
+  - KRW-ETH
+  - KRW-XRP
+  - KRW-SOL
   dynamic:
     enabled: true
-    quote_currency: "KRW"
+    enforce_static_allowlist: false
+    quote_currency: KRW
     top_n_by_24h_turnover: 40
     max_candidates: 12
     min_24h_turnover_krw: 5000000000
     include_symbols: []
     exclude_symbols: []
-  trade_side: "long_only"
-  mode: "paper"
+  trade_side: long_only
+  mode: paper
   max_open_positions: 1
-
-# Paper trading 전용: 초기 현금(원) seed. ledger_entries에 1회(DEPOSIT)로 주입된다.
 paper:
   initial_cash_krw: 10000000
-
 scheduling:
   decision_interval_sec: 15
   candle_timeframes:
-    - "1m"
-    - "15m"
-    - "1h"
-
-# 독립 워커 실행 주기(초)
+  - 1m
+  - 15m
+  - 1h
 workers:
   research_interval_sec: 3600
   quant_interval_sec: 3600
   risk_interval_sec: 3600
   ops_interval_sec: 3600
-
-# Quant 사전검증(경량 리플레이) 가정값
 quant_backtest:
   lookback_bars: 1200
   hold_bars: 24
   base_slippage_bps: 1.0
-  spread_penalty_mult: 0.30
+  spread_penalty_mult: 0.3
   low_liquidity_penalty_bps: 1.2
   fill_ratio: 0.92
-
 strategy:
   alpha_score:
     enabled: true
-    # 보수 유지 + 거래 관측용: 진입 임계는 완화하되 비중은 축소.
-    entry_alpha: 0.45
+    entry_alpha: 0.6197
     strong_alpha: 0.65
-    cooldown_override_alpha: 0.80
+    cooldown_override_alpha: 0.8
     cooldown_override_enabled: true
     base_target_pct: 2.0
     max_target_pct: 3.5
@@ -76,20 +65,16 @@ strategy:
     trail_atr_mult: 0.9
     time_stop_mom_minutes: 240
     time_stop_rev_minutes: 120
-    cooldown_minutes: 30
+    cooldown_minutes: 44
     atr_block_pct: 2.5
     daily_loss_entry_block_ratio: 0.8
-    # 방향성(수익률/추세) 비중을 높이고 RSI/거래량은 보조로 사용.
-    mom_weight_rsi: 0.20
+    mom_weight_rsi: 0.2
     mom_weight_vol: 0.15
-    mom_weight_ret: 0.40
+    mom_weight_ret: 0.4
     mom_weight_trend: 0.25
-    # 역추세(REV) 신호가 상위 추세 역행일 때 완만히 페널티.
-    rev_penalty_when_trend_weak: 0.80
-    # 비용이 높을수록 진입 임계를 동적으로 상향.
+    rev_penalty_when_trend_weak: 0.8
     entry_alpha_spread_k: 0.015
     entry_alpha_fee_k: 0.02
-
 paper_mode:
   data_collection:
     enabled: true
@@ -100,85 +85,63 @@ paper_mode:
     relaxed_min_expectancy_pct: 0.0
     force_plan_buy_allowed: true
     force_plan_target_pct: 5.0
-
 governance:
-  # 정기 회의(1시간 간격). 실시간 트리거(수익/손절/비용/레짐/운영)는 즉시 Safe Judge로 처리하고,
-  # 회의는 "종목/비중/허용조건(Trade Plan)"과 "룰 패치 제안"을 갱신하는 거버넌스 용도.
-  # 매시 정각 슬롯만 사용(분 단위 커스텀 슬롯은 무시).
   meeting_on_the_hour_only: true
   daily_meeting_times_kst:
-    # 24:00은 다음날 00:00과 동일하므로 시스템 저장값은 00:00을 사용
-    - "00:00"
-    - "01:00"
-    - "02:00"
-    - "03:00"
-    - "04:00"
-    - "05:00"
-    - "06:00"
-    - "07:00"
-    - "08:00"
-    - "09:00"
-    - "10:00"
-    - "11:00"
-    - "12:00"
-    - "13:00"
-    - "14:00"
-    - "15:00"
-    - "16:00"
-    - "17:00"
-    - "18:00"
-    - "19:00"
-    - "20:00"
-    - "21:00"
-    - "22:00"
-    - "23:00"
-  # 회의 시작 전, 에이전트 사전업무 리포트 허용 최대 나이(분)
-  # 시간당 회의 기준으로 최근 90분 이내 리포트만 fresh로 인정.
+  - 00:00
+  - 01:00
+  - 02:00
+  - 03:00
+  - 04:00
+  - 05:00
+  - 06:00
+  - 07:00
+  - 08:00
+  - 09:00
+  - '10:00'
+  - '11:00'
+  - '12:00'
+  - '13:00'
+  - '14:00'
+  - '15:00'
+  - '16:00'
+  - '17:00'
+  - '18:00'
+  - '19:00'
+  - '20:00'
+  - '21:00'
+  - '22:00'
+  - '23:00'
   prework_max_age_min: 90
-  # 사전업무 리프레시 재시도 최소 간격(분, 슬롯 단위)
   prework_refresh_cooldown_min: 5
-  # true면 사전업무 리포트가 없거나 stale일 때 회의를 fail-closed로 중단
   require_prework_reports: true
-  # 슬롯 시각 이후 몇 분까지를 “해당 회의 시간대”로 볼지(중복 생성 방지)
   meeting_window_min: 5
-  # 재시작 후 누락된 정기 슬롯을 자동 보강할지 여부
   catchup_enabled: true
-  # 보강 대상 최대 과거 범위(시간)
   catchup_lookback_hours: 36
-  # 플랜 연속성: 매 슬롯 심볼이 흔들리지 않도록 이전 플랜을 조건부 계승.
   plan_continuity:
     enabled: true
-    # 기존 보유 심볼이 있으면 해당 심볼을 우선 유지.
     sticky_if_position_open: true
-    # 직전 플랜 이후 이 시간(분) 동안은 심볼 전환을 억제.
-    min_hold_minutes: 180
-    # 심볼 전환 최소 개선폭(백테스트 score 기준, new-old).
+    min_hold_minutes: 267
     switch_min_backtest_score_delta: 2.0
-    # 백테스트 score가 없을 때 후보 score 기준 최소 개선폭.
     switch_min_candidate_score_delta: 0.15
-  # HOLD 플랜에서도 초소형 파일럿 진입 허용(Always-On Micro Mode).
   micro_mode:
     enabled: true
+    entry_mode: adaptive
     plan_hold_only: true
-    # LLM 플랜이 HOLD에서도 소액으로 검증되도록 pilot 진입 허용.
     allow_plan_led_entry: true
-    # false면 시장신호 LONG이 아니어도(plan target>0) micro 진입 가능.
     require_market_long: false
     max_position_pct: 2.0
-    max_spread_bps: 4.0
-    min_alpha: 0.20
-    max_daily_loss_pct: 0.50
+    max_spread_bps: 2.614
+    min_alpha: 0.2756
+    max_daily_loss_pct: 0.5
     max_trades_per_day: 5
-  # 회의 결과로 기본 채택할 목표 비중(실행은 Safe Judge 게이트 통과 시에만)
   default_target_position_pct: 10.0
-  # 정책/플랜 활성화 게이트: 사전검증 미통과 시 ACTIVE 반영 금지(FAIL-CLOSED)
   activation_gate:
     enabled: true
-    # LIVE 분기 준비는 하되 기본은 비활성(현재는 PAPER/HOLD 자동운용)
     live_execution_enabled: false
     conditional_activation:
       enabled: true
-      auto_promote_to: "PAPER"
+      auto_promote_to: PAPER
       conditions:
         min_alpha: 0.75
         max_spread_bps: 1.5
@@ -195,32 +158,83 @@ governance:
     min_win_rate_pct: 40.0
     min_backtest_score: 0.0
     max_drawdown_pct: 25.0
-  # 자본(에쿼티) 규모별 비중/상한/쿨다운 정책.
-  # - 회의 플랜(target_position_pct)과 실시간 실행 비중 모두 이 상한을 넘지 않도록 적용된다.
-  # - min_equity_krw 이상 조건 중 가장 큰 티어를 선택한다.
   capital_policy:
     enabled: true
     tiers:
-      - name: "seed_small"
-        min_equity_krw: 0
-        max_target_position_pct: 6.0
-        max_position_pct_per_symbol: 12.0
-        cooldown_minutes_after_trigger: 240
-      - name: "core"
-        min_equity_krw: 3000000
-        max_target_position_pct: 10.0
-        max_position_pct_per_symbol: 18.0
-        cooldown_minutes_after_trigger: 180
-      - name: "expanded"
-        min_equity_krw: 10000000
-        max_target_position_pct: 12.0
-        max_position_pct_per_symbol: 20.0
-        cooldown_minutes_after_trigger: 120
-
+    - name: seed_small
+      min_equity_krw: 0
+      max_target_position_pct: 6.0
+      max_position_pct_per_symbol: 12.0
+      cooldown_minutes_after_trigger: 240
+    - name: core
+      min_equity_krw: 3000000
+      max_target_position_pct: 10.0
+      max_position_pct_per_symbol: 18.0
+      cooldown_minutes_after_trigger: 180
+    - name: expanded
+      min_equity_krw: 10000000
+      max_target_position_pct: 12.0
+      max_position_pct_per_symbol: 20.0
+      cooldown_minutes_after_trigger: 120
+adaptive_tuning:
+  enabled: true
+  interval_sec: 3600
+  align_to_clock: true
+  max_step_pct: 10.0
+  target_trades_in_execution_window: 3
+  windows:
+    execution_hours: 6
+    short_days: 14
+    medium_days: 90
+    anchor_days: 270
+  regime_weights:
+    TREND:
+      execution: 0.35
+      short: 0.3
+      medium: 0.2
+      anchor: 0.15
+    CHOP:
+      execution: 0.25
+      short: 0.35
+      medium: 0.25
+      anchor: 0.15
+    SHOCK:
+      execution: 0.2
+      short: 0.25
+      medium: 0.2
+      anchor: 0.35
+  whitelist_paths:
+  - strategy.alpha_score.entry_alpha
+  - strategy.alpha_score.cooldown_minutes
+  - governance.micro_mode.min_alpha
+  - governance.micro_mode.max_spread_bps
+  - governance.plan_continuity.min_hold_minutes
+  bounds:
+    strategy.alpha_score.entry_alpha:
+    - 0.15
+    - 0.9
+    strategy.alpha_score.cooldown_minutes:
+    - 5
+    - 720
+    governance.micro_mode.min_alpha:
+    - 0.1
+    - 0.95
+    governance.micro_mode.max_spread_bps:
+    - 0.5
+    - 15.0
+    governance.plan_continuity.min_hold_minutes:
+    - 30
+    - 1440
+  rollback_guard:
+    enabled: true
+    check_after_hours: 24
+    baseline_hours: 72
+    ev_degrade_ratio: 0.2
+    drawdown_degrade_ratio: 0.3
 execution:
-  order_style: "limit_post_only_first"
-  default_ord_type: "limit"
-  default_time_in_force: "post_only"
+  order_style: limit_post_only_first
+  default_ord_type: limit
+  default_time_in_force: post_only
   post_only_timeout_sec: 30
   reprice_interval_sec: 8
   max_reprice_count: 3
@@ -228,32 +242,28 @@ execution:
   min_order_krw: 10000
   max_submit_retries: 2
   cancel_on_timeout_sec: 90
-
 fees:
-  source: "upbit_orders_chance"
+  source: upbit_orders_chance
   refresh_interval_sec: 300
   fallback_bid_fee_bps: 5.0
   fallback_ask_fee_bps: 5.0
-
 risk:
   max_risk_per_trade_pct: 0.35
-  max_daily_loss_pct: 1.50
-  max_weekly_loss_pct: 4.00
+  max_daily_loss_pct: 1.5
+  max_weekly_loss_pct: 4.0
   max_position_pct_per_symbol: 20.0
   max_total_exposure_pct: 30.0
   consecutive_loss_cooldown_count: 3
   cooldown_minutes_after_trigger: 180
   min_hold_seconds: 300
-
 cost_guard:
   max_spread_bps_entry: 8.0
   max_predicted_slippage_bps: 10.0
   max_total_cost_bps: 18.0
   min_expected_edge_bps: 28.0
   entry_cost_buffer_bps: 5.0
-
 stop_policy:
-  mode: "atr_with_hard_stop"
+  mode: atr_with_hard_stop
   atr_window: 14
   atr_stop_mult: 2.2
   atr_trail_mult: 2.8
@@ -263,24 +273,21 @@ stop_policy:
   break_even_after_rr: 1.0
   include_tax_in_realtime_stop: false
   include_fee_in_realtime_stop: true
-
 regime:
   trade_allowed:
-    - "TREND"
+  - TREND
   blocked:
-    - "HIGH_VOL"
-    - "DATA_UNSTABLE"
+  - HIGH_VOL
+  - DATA_UNSTABLE
   trend_adx_min: 25
   volatility_block_atr_pct: 2.5
-
 signal:
   trend_follow_enabled: true
-  timeframe_entry: "15m"
-  timeframe_context: "1h"
+  timeframe_entry: 15m
+  timeframe_context: 1h
   donchian_window: 20
   volume_zscore_min: 1.2
   rsi_min: 50
-
 ops_guard:
   pause_on_ws_reconnects_5m: 5
   pause_on_rest_429_5m: 8
@@ -288,91 +295,81 @@ ops_guard:
   max_data_lag_sec: 3
   max_clock_skew_ms: 1500
   max_fill_latency_sec: 45
-
 resume_policy:
   recon_ok_streak_required: 3
   check_interval_sec: 20
   min_stable_duration_sec: 300
   auto_resume_blocked_reasons:
-    - "RECON_FAIL"
-    - "DAILY_LOSS"
-    - "MANUAL"
-
+  - RECON_FAIL
+  - DAILY_LOSS
+  - MANUAL
 settlement:
-  timezone: "Asia/Seoul"
-
+  timezone: Asia/Seoul
 reporting:
-  # 일일 리뷰 알림 전송 시각(KST)
-  daily_review_time_kst: "23:10"
-  # 주간 리뷰 알림(week window: 월~일)
-  weekly_review_day: "SUN"
-  weekly_review_time_kst: "21:00"
-
-# LLM 라우팅(Agent별 모델/성능/엔드포인트). 실행 경로(Safe Judge/주문)는 LLM에 의존하지 않는다.
+  daily_review_time_kst: '23:10'
+  weekly_review_day: SUN
+  weekly_review_time_kst: '21:00'
 llm:
   default:
     enabled: true
-    api_style: "auto"   # auto|responses|chat
-    model: "gpt-5-mini"
-    reasoning_effort: "low"
+    api_style: auto
+    model: gpt-5-mini
+    reasoning_effort: low
     temperature: 0.2
-    # 공통 LLM 타임아웃(초). per-agent 지정 없이 이 값을 사용.
     timeout_sec: 3600
   agents:
     research_agent:
-      model: "gpt-5.2"
-      api_style: "responses"
-      reasoning_effort: "xhigh"
+      model: gpt-5.2
+      api_style: responses
+      reasoning_effort: xhigh
       temperature: 0.2
     secretary_agent:
-      model: "gpt-5-nano"
-      api_style: "responses"
-      reasoning_effort: "low"
+      model: gpt-5-nano
+      api_style: responses
+      reasoning_effort: low
       temperature: 0.2
     strategy_coordinator:
-      model: "gpt-5.2"
-      api_style: "responses"
-      reasoning_effort: "xhigh"
+      model: gpt-5.2
+      api_style: responses
+      reasoning_effort: xhigh
       temperature: 0.2
-    # 주간 우선순위(차주 계획) 전용: 고품질 모델
     strategy_coordinator_weekly:
-      model: "gpt-5.2-pro"
-      api_style: "responses"
-      reasoning_effort: "xhigh"
+      model: gpt-5.2-pro
+      api_style: responses
+      reasoning_effort: xhigh
       temperature: 0.1
-    # 월말 정산/검증 전용: 월 1회 고품질 모델
     finance_tax_agent:
-      model: "gpt-5.2-pro"
-      api_style: "responses"
-      reasoning_effort: "xhigh"
+      model: gpt-5.2-pro
+      api_style: responses
+      reasoning_effort: xhigh
       temperature: 0.1
     governance_research_agent:
-      model: "gpt-5.2"
-      api_style: "responses"
-      reasoning_effort: "medium"
+      model: gpt-5.2
+      api_style: responses
+      reasoning_effort: medium
       temperature: 0.2
     governance_quant_strategist:
-      model: "gpt-5.2"
-      api_style: "responses"
-      reasoning_effort: "medium"
+      model: gpt-5.2
+      api_style: responses
+      reasoning_effort: medium
       temperature: 0.2
     governance_risk_manager:
-      model: "gpt-5.2"
-      api_style: "responses"
-      reasoning_effort: "medium"
+      model: gpt-5.2
+      api_style: responses
+      reasoning_effort: medium
       temperature: 0.1
     governance_ops_manager:
-      model: "gpt-5-mini"
-      api_style: "responses"
-      reasoning_effort: "medium"
+      model: gpt-5-mini
+      api_style: responses
+      reasoning_effort: medium
       temperature: 0.1
     governance_coordinator:
-      model: "gpt-5.2"
-      api_style: "responses"
-      reasoning_effort: "medium"
+      model: gpt-5.2
+      api_style: responses
+      reasoning_effort: medium
       temperature: 0.1
     governance_secretary:
-      model: "gpt-5-nano"
-      api_style: "responses"
-      reasoning_effort: "medium"
+      model: gpt-5-nano
+      api_style: responses
+      reasoning_effort: medium
       temperature: 0.2
