@@ -223,6 +223,209 @@ def _candidate_score_alpha(*, alpha: float, spread_bps: float, max_spread_bps: f
     return float(score)
 
 
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(float(lo), min(float(hi), float(value)))
+
+
+def _mean(values: Sequence[float]) -> float:
+    xs = [float(v) for v in list(values or [])]
+    return (sum(xs) / float(len(xs))) if xs else 0.0
+
+
+def _to_symbol(value: Any) -> str:
+    s = str(value or "").strip().upper()
+    return s
+
+
+def _safe_repo_rows(*, repo: Any, method_name: str, limit: int) -> list[Mapping[str, Any]]:
+    fn = getattr(repo, str(method_name), None)
+    if not callable(fn):
+        return []
+    try:
+        rows = fn(limit=int(limit))
+        if isinstance(rows, list):
+            return [r for r in rows if isinstance(r, Mapping)]
+        return []
+    except Exception:
+        return []
+
+
+def _build_quant_feedback_profiles(
+    *,
+    repo: PostgresRepo,
+    rules_raw: Mapping[str, Any],
+    symbols: Sequence[str],
+) -> dict[str, Any]:
+    cfg = (rules_raw.get("quant_feedback") or {}) if isinstance(rules_raw, Mapping) else {}
+    enabled = bool(cfg.get("enabled", True))
+    if not enabled:
+        return {"enabled": False, "profiles": {}, "summary": {"reason": "disabled"}}
+
+    trades_limit = max(100, int(_as_float(cfg.get("realized_trades_limit"), default=1200)))
+    exec_limit = max(100, int(_as_float(cfg.get("execution_metrics_limit"), default=1200)))
+    outcomes_limit = max(100, int(_as_float(cfg.get("decision_outcomes_limit"), default=1200)))
+    min_samples = max(3, int(_as_float(cfg.get("min_samples_per_symbol"), default=8)))
+    max_boost = max(0.0, _as_float(cfg.get("max_score_boost"), default=0.18))
+    max_penalty = max(0.0, _as_float(cfg.get("max_score_penalty"), default=0.30))
+
+    allowed = {_to_symbol(s) for s in list(symbols or []) if _to_symbol(s)}
+    if not allowed:
+        return {"enabled": True, "profiles": {}, "summary": {"reason": "no_symbols"}}
+
+    trades = _safe_repo_rows(repo=repo, method_name="fetch_realized_trades", limit=trades_limit)
+    execm = _safe_repo_rows(repo=repo, method_name="fetch_execution_metrics", limit=exec_limit)
+    outcomes = _safe_repo_rows(repo=repo, method_name="fetch_decision_outcomes", limit=outcomes_limit)
+
+    trade_map: dict[str, list[Mapping[str, Any]]] = {sym: [] for sym in allowed}
+    for row in trades:
+        sym = _to_symbol(row.get("symbol"))
+        if sym in allowed:
+            trade_map[sym].append(row)
+
+    exec_map: dict[str, list[Mapping[str, Any]]] = {sym: [] for sym in allowed}
+    for row in execm:
+        sym = _to_symbol(row.get("symbol"))
+        if sym in allowed:
+            exec_map[sym].append(row)
+
+    outcome_map: dict[str, list[Mapping[str, Any]]] = {sym: [] for sym in allowed}
+    for row in outcomes:
+        sym = _to_symbol(row.get("symbol"))
+        if sym in allowed:
+            outcome_map[sym].append(row)
+
+    profiles: dict[str, dict[str, Any]] = {}
+    adjustments: list[float] = []
+    symbols_with_data = 0
+    for sym in sorted(allowed):
+        tr_rows = list(trade_map.get(sym) or [])
+        ex_rows = list(exec_map.get(sym) or [])
+        oc_rows = list(outcome_map.get(sym) or [])
+
+        n_tr = len(tr_rows)
+        n_ex = len(ex_rows)
+        n_oc = len(oc_rows)
+        sample_total = n_tr + n_ex + n_oc
+        if sample_total > 0:
+            symbols_with_data += 1
+
+        avg_pnl_bps = _mean([_as_float(r.get("pnl_bps"), default=0.0) for r in tr_rows])
+        win_rate_trades = (
+            float(sum(1 for r in tr_rows if _as_float(r.get("realized_pnl"), default=0.0) > 0.0)) / float(n_tr)
+            if n_tr > 0
+            else 0.0
+        )
+        trade_sample = min(1.0, float(n_tr) / float(min_samples))
+        trade_edge = _clamp(avg_pnl_bps / 35.0, -0.35, 0.35)
+        trade_consistency = _clamp((win_rate_trades - 0.5) * 1.4, -0.30, 0.30)
+        trade_component = trade_sample * (0.65 * trade_edge + 0.35 * trade_consistency)
+
+        avg_slippage_bps = _mean([_as_float(r.get("slippage_bps_vs_submit"), default=0.0) for r in ex_rows])
+        avg_spread_submit_bps = _mean([_as_float(r.get("spread_bps_at_submit"), default=0.0) for r in ex_rows])
+        avg_fill_ratio = _mean([_as_float(r.get("filled_ratio"), default=1.0) for r in ex_rows]) if n_ex > 0 else 1.0
+        exec_sample = min(1.0, float(n_ex) / float(min_samples))
+        slip_pen = _clamp(max(0.0, avg_slippage_bps - 2.5) / 20.0, 0.0, 0.20)
+        spread_pen = _clamp(max(0.0, avg_spread_submit_bps - 4.0) / 28.0, 0.0, 0.12)
+        fill_pen = _clamp(max(0.0, 0.92 - avg_fill_ratio) * 0.8, 0.0, 0.10)
+        slip_bonus = _clamp(max(0.0, -avg_slippage_bps) / 30.0, 0.0, 0.05)
+        execution_component = exec_sample * (slip_bonus - (slip_pen + spread_pen + fill_pen))
+
+        wins_outcome = sum(1 for r in oc_rows if str(r.get("outcome_label") or "").strip().upper() == "WIN")
+        losses_outcome = sum(1 for r in oc_rows if str(r.get("outcome_label") or "").strip().upper() == "LOSS")
+        err_counter: dict[str, int] = {}
+        for r in oc_rows:
+            code = str(r.get("error_type") or "").strip().upper()
+            if not code:
+                continue
+            err_counter[code] = err_counter.get(code, 0) + 1
+        oc_sample = min(1.0, float(n_oc) / float(min_samples))
+        outcome_edge = (
+            _clamp((float(wins_outcome - losses_outcome) / float(max(1, n_oc))) * 0.25, -0.15, 0.15) if n_oc > 0 else 0.0
+        )
+        cost_ratio = (float(err_counter.get("OC_COST_UNDERESTIMATED", 0)) / float(n_oc)) if n_oc > 0 else 0.0
+        liq_ratio = (float(err_counter.get("OC_LIQUIDITY_DROPOUT", 0)) / float(n_oc)) if n_oc > 0 else 0.0
+        latency_ratio = (float(err_counter.get("OC_EXECUTION_LATENCY", 0)) / float(n_oc)) if n_oc > 0 else 0.0
+        false_break_ratio = (float(err_counter.get("OC_FALSE_BREAKOUT", 0)) / float(n_oc)) if n_oc > 0 else 0.0
+        outcome_penalty = oc_sample * (
+            0.22 * cost_ratio + 0.12 * latency_ratio + 0.10 * liq_ratio + 0.08 * false_break_ratio
+        )
+        outcome_component = oc_sample * outcome_edge - outcome_penalty
+
+        raw_adjust = trade_component + execution_component + outcome_component
+        score_adjustment = _clamp(raw_adjust, -float(max_penalty), float(max_boost))
+        adjustments.append(float(score_adjustment))
+        profiles[sym] = {
+            "sample_total": int(sample_total),
+            "samples": {"realized_trades": int(n_tr), "execution_metrics": int(n_ex), "decision_outcomes": int(n_oc)},
+            "trade_stats": {"avg_pnl_bps": float(avg_pnl_bps), "win_rate_trades": float(win_rate_trades)},
+            "execution_stats": {
+                "avg_slippage_bps": float(avg_slippage_bps),
+                "avg_spread_submit_bps": float(avg_spread_submit_bps),
+                "avg_fill_ratio": float(avg_fill_ratio),
+            },
+            "outcome_stats": {
+                "wins": int(wins_outcome),
+                "losses": int(losses_outcome),
+                "oc_cost_underestimated_ratio": float(cost_ratio),
+                "oc_execution_latency_ratio": float(latency_ratio),
+                "oc_liquidity_dropout_ratio": float(liq_ratio),
+            },
+            "components": {
+                "trade_component": float(trade_component),
+                "execution_component": float(execution_component),
+                "outcome_component": float(outcome_component),
+            },
+            "score_adjustment": float(score_adjustment),
+        }
+
+    return {
+        "enabled": True,
+        "profiles": profiles,
+        "summary": {
+            "symbols_with_feedback": int(symbols_with_data),
+            "avg_adjustment": float(_mean(adjustments)),
+            "max_adjustment": float(max(adjustments)) if adjustments else 0.0,
+            "min_adjustment": float(min(adjustments)) if adjustments else 0.0,
+            "limits": {
+                "realized_trades_limit": int(trades_limit),
+                "execution_metrics_limit": int(exec_limit),
+                "decision_outcomes_limit": int(outcomes_limit),
+                "min_samples_per_symbol": int(min_samples),
+                "max_score_boost": float(max_boost),
+                "max_score_penalty": float(max_penalty),
+            },
+        },
+    }
+
+
+def _apply_feedback_to_candidates(
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    feedback_profiles: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in list(candidates or []):
+        item = dict(row or {})
+        sym = _to_symbol(item.get("symbol"))
+        profile = dict(feedback_profiles.get(sym) or {}) if isinstance(feedback_profiles, Mapping) else {}
+        base_score = _as_float(item.get("score"), default=0.0)
+        score_adjustment = _as_float(profile.get("score_adjustment"), default=0.0) if profile else 0.0
+        item["base_score"] = float(base_score)
+        item["feedback_score_adjustment"] = float(score_adjustment)
+        item["score"] = float(base_score + score_adjustment)
+        if profile:
+            item["feedback"] = {
+                "sample_total": int(profile.get("sample_total") or 0),
+                "samples": dict(profile.get("samples") or {}),
+                "trade_stats": dict(profile.get("trade_stats") or {}),
+                "execution_stats": dict(profile.get("execution_stats") or {}),
+                "outcome_stats": dict(profile.get("outcome_stats") or {}),
+            }
+        out.append(item)
+    out.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    return out
+
+
 def _quant_candidate_rows(
     *,
     rules_raw: Mapping[str, Any],
@@ -276,6 +479,7 @@ def _quick_backtest_candidate(
     low_liquidity_penalty_bps: float = 1.2,
     fill_ratio: float = 1.0,
     lookback_bars: int = 500,
+    hold_bars: int = 24,
 ) -> dict[str, Any]:
     """Lightweight replay aligned with AlphaScore entry/exit/cooldown."""
 
@@ -335,6 +539,7 @@ def _quick_backtest_candidate(
     lookback = max(80, int(alpha_cfg.lookback_minutes))
     warmup = max(80, int(alpha_cfg.ema_slow) + 5, int(alpha_cfg.ret_long_mins) + 1)
     cooldown_bars = max(0, int(alpha_cfg.cooldown_minutes))
+    min_hold_bars = max(0, int(hold_bars))
 
     for i in range(warmup, n):
         px = float(closes[i])
@@ -377,9 +582,9 @@ def _quick_backtest_candidate(
         exit_cond = False
         if stop_pct > 0 and px <= entry_px * (1.0 - stop_pct):
             exit_cond = True
-        elif trail_pct > 0 and px <= hwm * (1.0 - trail_pct):
+        elif hold_minutes >= min_hold_bars and trail_pct > 0 and px <= hwm * (1.0 - trail_pct):
             exit_cond = True
-        elif rsi <= float(alpha_cfg.exit_rsi) or (ema20 > 0 and ema60 > 0 and ema20 < ema60):
+        elif hold_minutes >= min_hold_bars and (rsi <= float(alpha_cfg.exit_rsi) or (ema20 > 0 and ema60 > 0 and ema20 < ema60)):
             exit_cond = True
         elif hold_minutes >= time_limit:
             exit_cond = True
@@ -456,6 +661,7 @@ def _quick_backtest_candidate(
             "low_liquidity_penalty_bps": float(low_liquidity_penalty_bps),
             "fill_ratio": float(fill_ratio_n),
             "entry_alpha": float(alpha_cfg.entry_alpha),
+            "hold_bars": int(min_hold_bars),
         },
     }
 
@@ -500,6 +706,7 @@ def run_agent_work_cycle(
     lookback_minutes = max(120, int(alpha_cfg.lookback_minutes))
 
     need_market_ctx = bool({"research_agent", "quant_strategist"} & selected)
+    learning_feedback: dict[str, Any] = {"enabled": False, "profiles": {}, "summary": {}}
     candidates: list[dict[str, Any]] = (
         _quant_candidate_rows(
             rules_raw=rules_raw,
@@ -511,6 +718,12 @@ def run_agent_work_cycle(
         if need_market_ctx
         else []
     )
+    if need_market_ctx:
+        learning_feedback = _build_quant_feedback_profiles(repo=repo, rules_raw=rules_raw, symbols=symbols)
+        feedback_profiles = learning_feedback.get("profiles") if isinstance(learning_feedback, Mapping) else {}
+        if isinstance(feedback_profiles, Mapping) and feedback_profiles:
+            candidates = _apply_feedback_to_candidates(candidates=candidates, feedback_profiles=feedback_profiles)
+
     top = candidates[0] if candidates else {"symbol": default_symbol, "score": 0.0, "snapshot": {}, "features": {}}
     symbol = str(top.get("symbol") or default_symbol)
     snapshot = (top.get("snapshot") or {}) if isinstance(top.get("snapshot"), Mapping) else {}
@@ -596,6 +809,7 @@ def run_agent_work_cycle(
         low_liquidity_penalty_bps = _as_float(bt_cfg.get("low_liquidity_penalty_bps"), default=1.2)
         fill_ratio = _as_float(bt_cfg.get("fill_ratio"), default=0.92)
         lookback_bars = int(_as_float(bt_cfg.get("lookback_bars"), default=500))
+        hold_bars = int(_as_float(bt_cfg.get("hold_bars"), default=24))
         backtests: list[dict[str, Any]] = []
         for row in candidates[: min(8, len(candidates))]:
             sym = str(row.get("symbol") or "").strip().upper()
@@ -610,6 +824,7 @@ def run_agent_work_cycle(
                 low_liquidity_penalty_bps=low_liquidity_penalty_bps,
                 fill_ratio=fill_ratio,
                 lookback_bars=lookback_bars,
+                hold_bars=hold_bars,
             )
             backtests.append(bt)
         if backtests:
@@ -642,13 +857,35 @@ def run_agent_work_cycle(
             float(capital_profile.max_position_pct_per_symbol),
             max(0.0, default_target if float(top.get("score") or 0.0) > 0 else 0.0),
         )
+        feedback_profiles = learning_feedback.get("profiles") if isinstance(learning_feedback, Mapping) else {}
+        top_sym = _to_symbol(top.get("symbol") or symbol)
+        top_feedback_profile = (
+            dict(feedback_profiles.get(top_sym) or {}) if isinstance(feedback_profiles, Mapping) and top_sym else {}
+        )
+        top_feedback_adj = _as_float(
+            top.get("feedback_score_adjustment"),
+            default=_as_float(top_feedback_profile.get("score_adjustment"), default=0.0),
+        )
         quant_summary = (
             f"후보 1순위 {top.get('symbol')} (signal_score={float(top.get('score') or 0.0):.3f}), "
             f"권장 목표비중 {target:.1f}% (tier={capital_profile.tier_name}, equity={equity:.0f} KRW)"
         )
+        if abs(float(top_feedback_adj)) > 1e-6:
+            quant_summary += f", feedback_adj={float(top_feedback_adj):+.3f}"
         quant_risks: list[str] = []
         if _as_float((top.get("snapshot") or {}).get("spread_bps"), default=0.0) > float(rules.cost_guard.max_spread_bps_entry):
             quant_risks.append("상위 후보의 스프레드가 제한보다 넓음")
+        if float(top_feedback_adj) < -0.10:
+            quant_risks.append("과거 성과/비용 회고 기준에서 상위 후보 품질이 약함")
+        feedback_snapshot: dict[str, Any] = {}
+        if isinstance(feedback_profiles, Mapping):
+            for row in candidates[:8]:
+                sym = _to_symbol(row.get("symbol"))
+                if not sym:
+                    continue
+                prof = feedback_profiles.get(sym)
+                if isinstance(prof, Mapping):
+                    feedback_snapshot[sym] = dict(prof)
         quant_id = _store_report(
             repo=repo,
             report_date_kst=now_kst,
@@ -680,8 +917,18 @@ def run_agent_work_cycle(
                         "low_liquidity_penalty_bps": low_liquidity_penalty_bps,
                         "fill_ratio": fill_ratio,
                         "lookback_bars": lookback_bars,
+                        "hold_bars": hold_bars,
                     },
                     "ranked": sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)[:8],
+                },
+                "learning_feedback": {
+                    "enabled": bool(learning_feedback.get("enabled")) if isinstance(learning_feedback, Mapping) else False,
+                    "summary": (
+                        dict(learning_feedback.get("summary") or {}) if isinstance(learning_feedback, Mapping) else {}
+                    ),
+                    "top_symbol": top_sym,
+                    "top_symbol_profile": top_feedback_profile,
+                    "by_symbol": feedback_snapshot,
                 },
                 "suggested_plan": {"symbol": top.get("symbol"), "target_position_pct": target},
                 "capital_profile": capital_profile.as_dict(),
