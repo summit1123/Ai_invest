@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -127,6 +128,51 @@ def _dedupe(headlines: list[NewsHeadline], *, limit: int) -> list[NewsHeadline]:
     return out
 
 
+def _merge_headline_groups(
+    *,
+    rss_items: list[NewsHeadline],
+    web_items: list[NewsHeadline],
+    limit: int,
+    web_slot: int,
+) -> list[NewsHeadline]:
+    total_lim = max(1, int(limit))
+    web_cap = max(0, min(int(web_slot), total_lim))
+    rss_cap = max(0, total_lim - web_cap)
+
+    picked_rss = _dedupe(rss_items, limit=max(rss_cap, total_lim))
+    picked_web = _dedupe(web_items, limit=max(web_cap, total_lim))
+
+    out: list[NewsHeadline] = []
+    seen: set[str] = set()
+
+    def _push(item: NewsHeadline) -> None:
+        if len(out) >= total_lim:
+            return
+        key = (item.url or "").strip() or (item.title or "").strip()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append(item)
+
+    for item in picked_rss[:rss_cap]:
+        _push(item)
+    for item in picked_web[:web_cap]:
+        _push(item)
+
+    if len(out) < total_lim:
+        for item in picked_rss[rss_cap:]:
+            _push(item)
+            if len(out) >= total_lim:
+                break
+    if len(out) < total_lim:
+        for item in picked_web[web_cap:]:
+            _push(item)
+            if len(out) >= total_lim:
+                break
+
+    return out
+
+
 def fetch_rss_headlines(
     *,
     url: str,
@@ -152,6 +198,12 @@ def google_news_rss_url(*, query: str, hl: str = "ko", gl: str = "KR", ceid: str
     return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
 
 
+def bing_news_rss_url(*, query: str, mkt: str = "ko-KR") -> str:
+    q = quote_plus(query)
+    market = quote_plus(str(mkt or "ko-KR"))
+    return f"https://www.bing.com/news/search?q={q}&format=rss&mkt={market}"
+
+
 def symbol_to_news_query(symbol: str) -> str:
     sym = str(symbol or "").strip().upper()
     # Upbit spot symbol: KRW-BTC / BTC-ETH etc.
@@ -167,12 +219,150 @@ def symbol_to_news_query(symbol: str) -> str:
     return "bitcoin OR BTC"
 
 
+def _fetch_bing_news_headlines(*, query: str, limit: int, timeout_sec: int) -> list[NewsHeadline]:
+    q = re.sub(r"\s+OR\s+", " ", str(query or ""), flags=re.IGNORECASE)
+    q = re.sub(r"\s+", " ", q).strip()
+    if q and "news" not in q.lower():
+        q = f"{q} news"
+    lim = max(1, int(limit))
+    lim_kr = max(1, int(round(lim * 0.7)))
+    lim_en = max(0, lim - lim_kr)
+    urls: list[tuple[str, str, int]] = [
+        ("Bing News KR", bing_news_rss_url(query=q, mkt="ko-KR"), lim_kr),
+    ]
+    if lim_en > 0:
+        urls.append(("Bing News Global", bing_news_rss_url(query=q, mkt="en-US"), lim_en))
+
+    out: list[NewsHeadline] = []
+    for source, url, per_lim in urls:
+        out.extend(fetch_rss_headlines(url=url, source=source, limit=per_lim, timeout_sec=int(timeout_sec)))
+    return _dedupe(out, limit=lim)
+
+
+def fetch_wqb_headlines(
+    *,
+    query: str,
+    limit: int = 8,
+    timeout_sec: int = 10,
+    endpoint: str | None = None,
+    api_key: str | None = None,
+) -> list[NewsHeadline]:
+    """Fetch headlines from optional WQB search endpoint.
+
+    Expected response shape (flexible):
+    - {"results": [{title,url,source,published_at}, ...]}
+    - {"items": [...]}
+    - [...]
+    """
+
+    ep = str(endpoint or os.environ.get("WQB_SEARCH_ENDPOINT", "")).strip()
+    if not ep:
+        return []
+
+    key = str(api_key or os.environ.get("WQB_SEARCH_API_KEY", "")).strip()
+    headers = {"User-Agent": "Mozilla/5.0 (ai-invest research; +https://example.invalid)"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    try:
+        resp = requests.get(
+            ep,
+            params={"q": str(query), "query": str(query), "limit": int(limit)},
+            timeout=int(timeout_sec),
+            headers=headers,
+        )
+        if not resp.ok:
+            return []
+        payload = resp.json()
+    except Exception:
+        return []
+
+    rows: list[Any]
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, Mapping):
+        rows = []
+        for k in ("results", "items", "data", "documents"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                rows = v
+                break
+    else:
+        rows = []
+
+    out: list[NewsHeadline] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        title = str(row.get("title") or row.get("name") or row.get("headline") or "").strip()
+        url = str(row.get("url") or row.get("link") or row.get("href") or "").strip()
+        if not title or not url:
+            continue
+        source = str(row.get("source") or row.get("site") or row.get("domain") or "WQB").strip() or "WQB"
+        published_at = (
+            str(
+                row.get("published_at")
+                or row.get("publishedAt")
+                or row.get("pubDate")
+                or row.get("date")
+                or ""
+            ).strip()
+            or None
+        )
+        out.append(NewsHeadline(source=source, title=title, url=url, published_at=published_at))
+        if len(out) >= int(limit):
+            break
+    return _dedupe(out, limit=int(limit))
+
+
+def fetch_web_search_headlines(
+    *,
+    query: str,
+    provider: str = "auto",
+    limit: int = 8,
+    timeout_sec: int = 10,
+) -> list[NewsHeadline]:
+    p = str(provider or "auto").strip().lower()
+    lim = max(1, int(limit))
+    to = max(3, int(timeout_sec))
+
+    if p == "wqb":
+        return fetch_wqb_headlines(query=query, limit=lim, timeout_sec=to)
+    if p in {"bing", "bing_news", "bing_news_rss"}:
+        return _fetch_bing_news_headlines(query=query, limit=lim, timeout_sec=to)
+
+    # auto: prefer WQB if configured; otherwise Bing News RSS.
+    wqb = fetch_wqb_headlines(query=query, limit=lim, timeout_sec=to)
+    if wqb:
+        return wqb
+    return _fetch_bing_news_headlines(query=query, limit=lim, timeout_sec=to)
+
+
+def _headline_channel(source: str) -> str:
+    s = str(source or "").strip().lower()
+    if "bing news" in s:
+        return "web_search"
+    if s == "wqb":
+        return "web_search"
+    return "rss"
+
+
 def fetch_crypto_headlines(
     *,
     symbol: str,
     limit: int = 12,
+    include_web_search: bool = False,
+    web_search_provider: str = "auto",
+    web_search_limit: int = 8,
+    web_search_timeout_sec: int = 10,
+    rss_timeout_sec: int = 15,
 ) -> list[dict[str, Any]]:
-    """Fetch a small set of crypto headlines (RSS only; no full article content)."""
+    """Fetch a small set of crypto headlines.
+
+    Sources:
+    - RSS feeds (Google News query + major crypto media RSS)
+    - Optional web-search headlines (Bing News RSS or WQB endpoint)
+    """
     q = symbol_to_news_query(symbol)
     urls: list[tuple[str, str, int]] = [
         ("Google News", google_news_rss_url(query=q), 8),
@@ -182,12 +372,42 @@ def fetch_crypto_headlines(
 
     all_items: list[NewsHeadline] = []
     for source, url, per_lim in urls:
-        all_items.extend(fetch_rss_headlines(url=url, source=source, limit=per_lim))
+        all_items.extend(
+            fetch_rss_headlines(
+                url=url,
+                source=source,
+                limit=per_lim,
+                timeout_sec=max(3, int(rss_timeout_sec)),
+            )
+        )
 
-    out = _dedupe(all_items, limit=int(limit))
+    web_items: list[NewsHeadline] = []
+    if include_web_search:
+        web_items = fetch_web_search_headlines(
+            query=q,
+            provider=str(web_search_provider or "auto"),
+            limit=max(1, int(web_search_limit)),
+            timeout_sec=max(3, int(web_search_timeout_sec)),
+        )
+
+    if include_web_search:
+        total_limit = max(1, int(limit))
+        desired_web = min(max(1, int(web_search_limit)), total_limit)
+        # Keep at least half for RSS to avoid losing core crypto feeds.
+        web_slot = min(desired_web, max(1, total_limit // 2))
+        out = _merge_headline_groups(
+            rss_items=all_items,
+            web_items=web_items,
+            limit=total_limit,
+            web_slot=web_slot,
+        )
+    else:
+        out = _dedupe(all_items, limit=int(limit))
+
     return [
         {
             "source": h.source,
+            "channel": _headline_channel(h.source),
             "title": h.title,
             "url": h.url,
             "published_at": h.published_at,
@@ -216,4 +436,3 @@ def summarize_headlines_text(headlines: list[Mapping[str, Any]], *, max_items: i
         else:
             lines.append(f"- {title}")
     return "\n".join(lines).strip()
-
