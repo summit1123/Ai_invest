@@ -142,6 +142,86 @@ class AgentWorkLoopTests(unittest.TestCase):
         universe_selection = dict(findings.get("universe_selection") or {})
         assert "KRW-FAKE" in list(universe_selection.get("excluded_not_allowed") or [])
 
+    def test_quant_feedback_adjustment_uses_trade_execution_outcomes(self) -> None:
+        class Repo:
+            def fetch_realized_trades(self, *, limit: int = 200):  # noqa: ARG002
+                rows = []
+                for i in range(12):
+                    rows.append({"symbol": "KRW-BTC", "realized_pnl": -1000.0, "pnl_bps": -18.0, "trade_id": f"btc-{i}"})
+                for i in range(12):
+                    rows.append({"symbol": "KRW-ETH", "realized_pnl": 1200.0, "pnl_bps": 22.0, "trade_id": f"eth-{i}"})
+                return rows
+
+            def fetch_execution_metrics(self, *, limit: int = 200):  # noqa: ARG002
+                rows = []
+                for i in range(12):
+                    rows.append(
+                        {
+                            "symbol": "KRW-BTC",
+                            "slippage_bps_vs_submit": 8.0,
+                            "spread_bps_at_submit": 12.0,
+                            "filled_ratio": 0.83,
+                            "metric_id": f"btc-m-{i}",
+                        }
+                    )
+                for i in range(12):
+                    rows.append(
+                        {
+                            "symbol": "KRW-ETH",
+                            "slippage_bps_vs_submit": 0.7,
+                            "spread_bps_at_submit": 2.0,
+                            "filled_ratio": 0.99,
+                            "metric_id": f"eth-m-{i}",
+                        }
+                    )
+                return rows
+
+            def fetch_decision_outcomes(self, *, limit: int = 200):  # noqa: ARG002
+                rows = []
+                for i in range(10):
+                    rows.append(
+                        {
+                            "symbol": "KRW-BTC",
+                            "outcome_label": "LOSS",
+                            "error_type": "OC_COST_UNDERESTIMATED",
+                            "outcome_id": f"btc-o-{i}",
+                        }
+                    )
+                for i in range(10):
+                    rows.append(
+                        {
+                            "symbol": "KRW-ETH",
+                            "outcome_label": "WIN",
+                            "error_type": "NONE",
+                            "outcome_id": f"eth-o-{i}",
+                        }
+                    )
+                return rows
+
+        repo = Repo()
+        feedback = awl._build_quant_feedback_profiles(
+            repo=repo,  # type: ignore[arg-type]
+            rules_raw={},
+            symbols=["KRW-BTC", "KRW-ETH"],
+        )
+        profiles = dict(feedback.get("profiles") or {})
+        self.assertIn("KRW-BTC", profiles)
+        self.assertIn("KRW-ETH", profiles)
+        self.assertLess(
+            float((profiles.get("KRW-BTC") or {}).get("score_adjustment") or 0.0),
+            float((profiles.get("KRW-ETH") or {}).get("score_adjustment") or 0.0),
+        )
+
+        adjusted = awl._apply_feedback_to_candidates(
+            candidates=[
+                {"symbol": "KRW-BTC", "score": 0.70, "snapshot": {}, "features": {}},
+                {"symbol": "KRW-ETH", "score": 0.70, "snapshot": {}, "features": {}},
+            ],
+            feedback_profiles=profiles,
+        )
+        self.assertEqual(adjusted[0]["symbol"], "KRW-ETH")
+        self.assertEqual(adjusted[1]["symbol"], "KRW-BTC")
+
 
 if __name__ == "__main__":
     unittest.main()
