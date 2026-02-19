@@ -36,6 +36,7 @@ class PaperClosedTrade:
     realized_pnl: float
     fees_total: float
     pnl_bps: float | None
+    exit_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,18 @@ class PaperExecutor:
         pos_entry_decision_id = str(pos_meta.get("entry_decision_id") or "").strip() or None
 
         if action == "BUY":
+            # Portfolio-level safety: do not open new symbols beyond configured cap.
+            if current_qty <= 0:
+                universe_cfg = rules.raw.get("universe", {}) if isinstance(rules.raw, dict) else {}
+                try:
+                    max_open_positions = int(float(universe_cfg.get("max_open_positions") or 1))
+                except Exception:
+                    max_open_positions = 1
+                if max_open_positions > 0:
+                    overview = self._repo.fetch_portfolio_overview(quote_currency=quote_ccy)
+                    open_positions = int(overview.get("positions_count") or 0)
+                    if open_positions >= int(max_open_positions):
+                        return None
             min_order_krw = int(rules.execution.min_order_krw)
             price = snapshot.best_bid  # post-only maker bias
             if cash_balance <= 0:
@@ -405,6 +418,7 @@ class PaperExecutor:
                     "trade_id": str(trade_id),
                     "entry_decision_id": str(entry_decision_id) if entry_decision_id else None,
                     "exit_decision_id": str(decision_id),
+                    "exit_reason": str(exit_reason or "SELL_SIGNAL").strip().upper(),
                 },
             )
             self._repo.upsert_pnl_daily_delta(
@@ -446,6 +460,7 @@ class PaperExecutor:
                 realized_pnl=realized_pnl,
                 fees_total=fees_total,
                 pnl_bps=pnl_bps,
+                exit_reason=str(exit_reason or "SELL_SIGNAL").strip().upper(),
             )
 
         # TCA-lite metric.
