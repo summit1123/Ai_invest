@@ -44,6 +44,13 @@ REASON_CODE_KO: dict[str, str] = {
     "OC_COST_UNDERESTIMATED": "비용 과소추정(수수료/스프레드/슬리피지)",
     "OC_FALSE_BREAKOUT": "가짜 돌파",
     "OC_REGIME_MISCLASSIFIED": "레짐 오분류",
+    "OC_STOP_TOO_TIGHT": "손절폭 과도하게 타이트",
+    "OC_STOP_TOO_LOOSE": "손절폭 과도하게 느슨",
+    "OC_LATE_ENTRY": "늦은 진입",
+    "OC_EARLY_EXIT": "너무 이른 청산",
+    "OC_LIQUIDITY_DROPOUT": "유동성 급감",
+    "OC_NEWS_SHOCK": "뉴스 급변",
+    "OC_SIGNAL_OVERFIT": "신호 과최적화",
     "OC_EXECUTION_LATENCY": "실행 지연",
     "OC_RULE_DRIFT": "룰 드리프트",
 }
