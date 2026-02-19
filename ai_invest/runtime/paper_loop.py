@@ -233,6 +233,9 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
     )
 
     default_symbol = rules.universe.symbols[0]
+    universe_cfg = (raw_rules.get("universe") or {}) if isinstance(raw_rules, Mapping) else {}
+    dynamic_cfg = (universe_cfg.get("dynamic") or {}) if isinstance(universe_cfg, Mapping) else {}
+    enforce_static_allowlist = bool(dynamic_cfg.get("enforce_static_allowlist", False))
     # Seed paper cash once so position sizing can use target_position_pct realistically.
     paper_cfg = raw_rules.get("paper", {}) if isinstance(raw_rules, dict) else {}
     seed_cash = float((paper_cfg or {}).get("initial_cash_krw") or 0.0)
@@ -267,7 +270,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 symbol = str(open_symbols[0])
                 if plan_symbol and plan_symbol != symbol:
                     manage_open_position_only = True
-        elif plan_symbol and plan_symbol in set(rules.universe.symbols):
+        elif plan_symbol and (not enforce_static_allowlist or plan_symbol in set(rules.universe.symbols)):
             symbol = str(plan_symbol)
 
         try:
@@ -769,10 +772,11 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "alpha": market.alpha,
                 "mom_s": market.mom_s,
                 "rev_s": market.rev_s,
+                "reason_codes": list(market.reason_codes or []),
             },
-            regime={"trade_allowed": regime.trade_allowed},
-            risk={"veto": risk.veto},
-            ops={"veto": ops_op.veto},
+            regime={"trade_allowed": regime.trade_allowed, "reason_codes": list(regime.reason_codes or [])},
+            risk={"veto": risk.veto, "reason_codes": list(risk.reason_codes or [])},
+            ops={"veto": ops_op.veto, "reason_codes": list(ops_op.reason_codes or [])},
         )
         repo.insert_decision(
             DbDecision(
