@@ -274,6 +274,20 @@ def tpl_weekly_priority(data: Mapping[str, Any]) -> str:
 def tpl_trade_plan_set(data: Mapping[str, Any]) -> str:
     allowed = _as_mapping(data.get("allowed_actions"))
     constraints = _as_mapping(data.get("constraints"))
+    activation_gate = _as_mapping(data.get("activation_gate"))
+    activation_status = str(data.get("activation_status") or "-")
+    decision = str(activation_gate.get("decision") or "-")
+    decision_effective = str(activation_gate.get("decision_effective") or "-")
+    hard_block = bool(activation_gate.get("hard_plan_block"))
+    soft_block = bool(activation_gate.get("soft_plan_block"))
+    hard_reasons = [str(x).strip() for x in list(activation_gate.get("hard_plan_block_reasons") or []) if str(x).strip()]
+    soft_reasons = [str(x).strip() for x in list(activation_gate.get("soft_plan_block_reasons") or []) if str(x).strip()]
+    if hard_block:
+        exec_state = f"차단(HARD): {', '.join(hard_reasons[:3]) or '-'}"
+    elif soft_block:
+        exec_state = f"제한(SOFT): {', '.join(soft_reasons[:3]) or '-'} (Safe Judge 실시간 재평가)"
+    else:
+        exec_state = "가능(단, Safe Judge 실시간 게이트 적용)"
     return (
         "[거버넌스] 트레이드 플랜 확정\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
@@ -281,8 +295,10 @@ def tpl_trade_plan_set(data: Mapping[str, Any]) -> str:
         f"- 심볼/목표비중: {data.get('symbol')} / {_as_float(data.get('target_position_pct'))}%\n"
         f"- 유효시간(KST): {data.get('valid_from_kst')} ~ {data.get('valid_to_kst')}\n"
         f"- 허용 액션: buy={_as_bool_ko(allowed.get('buy'))}, sell={_as_bool_ko(allowed.get('sell'))}\n"
+        f"- 활성화 상태: {activation_status} (decision={decision}, effective={decision_effective})\n"
+        f"- 런타임 실행 상태: {exec_state}\n"
         f"- 과매매 방지: cooldown={_as_int(data.get('cooldown_minutes'))}분, rebalance_band={_as_float(data.get('rebalance_band_pct'))}%\n"
-        f"- 실행 제약: max_spread={constraints.get('max_spread_bps')}bps, max_slippage={constraints.get('max_slippage_bps')}bps, max_position={constraints.get('max_position_pct')}%\n"
+        f"- 실행 제약: max_spread={_as_float(constraints.get('max_spread_bps'))}bps, max_slippage={_as_float(constraints.get('max_slippage_bps'))}bps, max_position={_as_float(constraints.get('max_position_pct'))}%\n"
         f"- 근거 요약: {_clip(data.get('rationale_summary'), 240)}\n"
         "- 운영자 확인: TTL 만료 전 회의 갱신 여부를 확인하세요.\n"
     )
