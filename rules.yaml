@@ -42,7 +42,7 @@ workers:
 
 # Quant 사전검증(경량 리플레이) 가정값
 quant_backtest:
-  lookback_bars: 500
+  lookback_bars: 1200
   hold_bars: 24
   base_slippage_bps: 1.0
   spread_penalty_mult: 0.30
@@ -93,7 +93,7 @@ strategy:
 paper_mode:
   data_collection:
     enabled: true
-    min_trades_for_strict_gate: 30
+    min_trades_for_strict_gate: 4
     relaxed_min_win_rate_pct: 25.0
     relaxed_min_backtest_score: -1.5
     relaxed_min_profit_factor: 1.05
@@ -145,6 +145,17 @@ governance:
   catchup_enabled: true
   # 보강 대상 최대 과거 범위(시간)
   catchup_lookback_hours: 36
+  # 플랜 연속성: 매 슬롯 심볼이 흔들리지 않도록 이전 플랜을 조건부 계승.
+  plan_continuity:
+    enabled: true
+    # 기존 보유 심볼이 있으면 해당 심볼을 우선 유지.
+    sticky_if_position_open: true
+    # 직전 플랜 이후 이 시간(분) 동안은 심볼 전환을 억제.
+    min_hold_minutes: 180
+    # 심볼 전환 최소 개선폭(백테스트 score 기준, new-old).
+    switch_min_backtest_score_delta: 2.0
+    # 백테스트 score가 없을 때 후보 score 기준 최소 개선폭.
+    switch_min_candidate_score_delta: 0.15
   # HOLD 플랜에서도 초소형 파일럿 진입 허용(Always-On Micro Mode).
   micro_mode:
     enabled: true
