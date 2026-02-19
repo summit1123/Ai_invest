@@ -53,6 +53,29 @@ def _as_float(value: Any, *, default: float = 0.0) -> float:
         return float(default)
 
 
+def _as_int(value: Any, *, default: int = 0) -> int:
+    try:
+        if value is None:
+            return int(default)
+        if isinstance(value, bool):
+            return int(default)
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, float):
+            return int(value)
+        s = str(value).strip()
+        return int(float(s)) if s else int(default)
+    except Exception:
+        return int(default)
+
+
+def _round_trip_fee_bps(rules: RulesConfig) -> float:
+    fees_cfg = (rules.raw.get("fees") or {}) if isinstance(rules.raw, Mapping) else {}
+    bid_bps = _as_float(fees_cfg.get("fallback_bid_fee_bps"), default=5.0)
+    ask_bps = _as_float(fees_cfg.get("fallback_ask_fee_bps"), default=5.0)
+    return max(0.0, float(bid_bps)) + max(0.0, float(ask_bps))
+
+
 def market_agent_opine(
     payload: Mapping[str, Any],
     *,
@@ -72,6 +95,12 @@ def market_agent_opine(
     account = context.get("account") or {}
     pos_ctx = context.get("position") or {}
     pos_state_map = context.get("position_state") if isinstance(context.get("position_state"), Mapping) else {}
+    trade_plan = context.get("trade_plan") if isinstance(context.get("trade_plan"), Mapping) else {}
+    plan_exec = trade_plan.get("execution_plan") if isinstance(trade_plan.get("execution_plan"), Mapping) else {}
+    plan_final_numbers = (
+        plan_exec.get("final_numbers") if isinstance(plan_exec.get("final_numbers"), Mapping) else {}
+    )
+    plan_time_horizon = str(trade_plan.get("time_horizon") or "").strip().lower()
     now = _now_utc(payload)
 
     cfg = load_alpha_score_config(rules_raw=rules.raw)
@@ -85,6 +114,7 @@ def market_agent_opine(
     last_price = _as_float(snapshot.get("last_price"), default=_as_float(snapshot.get("mid_price"), default=0.0))
     daily_loss_pct = _as_float(account.get("daily_loss_pct"), default=0.0)
     max_daily_loss = float(rules.risk.max_daily_loss_pct)
+    fee_total_bps = _round_trip_fee_bps(rules)
     current_qty = _as_float(pos_ctx.get("current_qty"), default=0.0)
     has_position = current_qty > 0.0
     state = parse_position_state(pos_state_map)
@@ -141,16 +171,40 @@ def market_agent_opine(
         hwm_price = _as_float(state.hwm_price, default=max(last_price, entry_price))
         stop_pct = float(cfg.stop_atr_mult) * (atr_pct / 100.0)
         trail_pct = float(cfg.trail_atr_mult) * (atr_pct / 100.0)
+        hold_seconds = (
+            max(0.0, (now - state.entry_ts).total_seconds())
+            if state.entry_ts is not None
+            else None
+        )
+        min_hold_seconds = max(
+            0,
+            _as_int((plan_final_numbers or {}).get("min_hold_seconds"), default=int(rules.risk.min_hold_seconds)),
+        )
+        min_hold_active = bool(hold_seconds is not None and hold_seconds < float(min_hold_seconds))
+        hwm_gain_bps = ((hwm_price - entry_price) / entry_price * 10000.0) if entry_price > 0 and hwm_price > 0 else 0.0
+        # Trail exit is armed only after enough favorable move to clear round-trip cost.
+        trail_arm_floor_bps = max(float(fee_total_bps) + 2.0, 12.0)
+        trail_armed = bool(hwm_gain_bps >= float(trail_arm_floor_bps))
         exit_reason: str | None = None
         if entry_price > 0 and stop_pct > 0 and last_price > 0 and last_price <= entry_price * (1.0 - stop_pct):
             exit_reason = "STOP"
-        elif hwm_price > 0 and trail_pct > 0 and last_price > 0 and last_price <= hwm_price * (1.0 - trail_pct):
+        elif (
+            (not min_hold_active)
+            and trail_armed
+            and hwm_price > 0
+            and trail_pct > 0
+            and last_price > 0
+            and last_price <= hwm_price * (1.0 - trail_pct)
+        ):
             exit_reason = "TRAIL"
-        elif rsi_14 <= float(cfg.exit_rsi) or (ema20 > 0 and ema60 > 0 and ema20 < ema60):
+        elif (not min_hold_active) and (rsi_14 <= float(cfg.exit_rsi) or (ema20 > 0 and ema60 > 0 and ema20 < ema60)):
             exit_reason = "MOMENTUM_BREAK"
         elif state.entry_ts is not None:
             hold_minutes = max(0.0, (now - state.entry_ts).total_seconds() / 60.0)
             max_hold = float(cfg.time_stop_rev_minutes) if str(strategy_tag).upper() == "REV" else float(cfg.time_stop_mom_minutes)
+            plan_max_hold = _as_int((plan_final_numbers or {}).get("max_hold_minutes"), default=0)
+            if plan_max_hold > 0:
+                max_hold = float(plan_max_hold)
             if hold_minutes >= max_hold:
                 exit_reason = "TIMESTOP"
 
@@ -179,6 +233,14 @@ def market_agent_opine(
                     "ema20": ema20,
                     "ema60": ema60,
                     "atr_pct": atr_pct,
+                    "hold_seconds": hold_seconds,
+                    "min_hold_seconds": min_hold_seconds,
+                    "min_hold_active": min_hold_active,
+                    "plan_max_hold_minutes": _as_int((plan_final_numbers or {}).get("max_hold_minutes"), default=0),
+                    "plan_time_horizon": str(plan_time_horizon or ""),
+                    "hwm_gain_bps": hwm_gain_bps,
+                    "trail_armed": trail_armed,
+                    "trail_arm_floor_bps": float(trail_arm_floor_bps),
                 },
             )
 
@@ -240,11 +302,6 @@ def market_agent_opine(
             reason={"cooldown_until": state.cooldown_until.isoformat() if state.cooldown_until else None},
         )
 
-    fees_cfg = (rules.raw.get("fees") or {}) if isinstance(rules.raw, Mapping) else {}
-    fee_total_bps = _as_float(fees_cfg.get("fallback_bid_fee_bps"), default=5.0) + _as_float(
-        fees_cfg.get("fallback_ask_fee_bps"),
-        default=5.0,
-    )
     entry_alpha_effective = float(cfg.entry_alpha) + (
         float(cfg.entry_alpha_spread_k) * max(0.0, float(spread_bps)) / 10.0
     ) + (
