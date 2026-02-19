@@ -865,6 +865,97 @@ def _hard_plan_block_from_fact_pack(*, fact_pack: Mapping[str, Any]) -> tuple[bo
     return bool(reasons), reasons
 
 
+def _contains_no_trade_language(text: str) -> bool:
+    src = str(text or "").strip().lower()
+    if not src:
+        return False
+    needles = [
+        "no-trade",
+        "no trade",
+        "execution blocked",
+        "실행 금지",
+        "거래창 미허용",
+        "신규 주문",
+        "하드 게이트 미충족",
+        "veto=true",
+    ]
+    return any(n in src for n in needles)
+
+
+def _build_plan_consistency_checks(
+    *,
+    hard_plan_block: bool,
+    hard_plan_block_reasons: Sequence[str],
+    soft_plan_block: bool,
+    soft_plan_block_reasons: Sequence[str],
+    activation_decision_effective: str,
+    paper_data_collection_applied: bool,
+    allowed_actions: Mapping[str, Any],
+    target_position_pct: float,
+    notes: str,
+) -> dict[str, Any]:
+    buy_allowed = bool((allowed_actions or {}).get("buy"))
+    sell_allowed = bool((allowed_actions or {}).get("sell"))
+    target_pct = float(_as_float(target_position_pct, default=0.0))
+    hold_effective = str(activation_decision_effective or "").upper() == "HOLD"
+    plan_execution_blocked = bool(hard_plan_block or soft_plan_block)
+    notes_indicate_no_trade = _contains_no_trade_language(notes)
+
+    checks = [
+        {
+            "name": "blocked_plan_must_not_buy",
+            "passed": not (plan_execution_blocked and buy_allowed),
+            "actual": bool(buy_allowed),
+            "required": False if plan_execution_blocked else None,
+        },
+        {
+            "name": "blocked_plan_target_must_be_zero",
+            "passed": not (plan_execution_blocked and target_pct > 0.0),
+            "actual": float(target_pct),
+            "required": 0.0 if plan_execution_blocked else None,
+        },
+        {
+            "name": "hold_decision_must_be_flat",
+            "passed": not (hold_effective and (buy_allowed or sell_allowed or target_pct > 0.0)),
+            "actual": {
+                "buy": bool(buy_allowed),
+                "sell": bool(sell_allowed),
+                "target_position_pct": float(target_pct),
+            },
+            "required": {"buy": False, "sell": False, "target_position_pct": 0.0} if hold_effective else None,
+        },
+        {
+            "name": "notes_no_trade_must_not_conflict",
+            "passed": not (notes_indicate_no_trade and (buy_allowed or target_pct > 0.0)),
+            "actual": {
+                "notes_indicate_no_trade": bool(notes_indicate_no_trade),
+                "buy": bool(buy_allowed),
+                "target_position_pct": float(target_pct),
+            },
+            "required": {"buy": False, "target_position_pct": 0.0} if notes_indicate_no_trade else None,
+        },
+    ]
+
+    failed = [str(c.get("name") or "") for c in checks if not bool(c.get("passed"))]
+    return {
+        "passed": not bool(failed),
+        "failed_checks": failed,
+        "plan_execution_blocked": bool(plan_execution_blocked),
+        "hard_plan_block": bool(hard_plan_block),
+        "hard_plan_block_reasons": [str(x) for x in list(hard_plan_block_reasons or []) if str(x).strip()],
+        "soft_plan_block": bool(soft_plan_block),
+        "soft_plan_block_reasons": [str(x) for x in list(soft_plan_block_reasons or []) if str(x).strip()],
+        "activation_decision_effective": str(activation_decision_effective or ""),
+        "paper_data_collection_applied": bool(paper_data_collection_applied),
+        "resolved_execution": {
+            "buy": bool(buy_allowed),
+            "sell": bool(sell_allowed),
+            "target_position_pct": float(target_pct),
+        },
+        "checks": checks,
+    }
+
+
 def _execution_style_from_rules(*, rules_raw: Mapping[str, Any]) -> str:
     ex = (rules_raw.get("execution") or {}) if isinstance(rules_raw, Mapping) else {}
     style = str(ex.get("order_style") or "").strip().lower()
@@ -2767,7 +2858,7 @@ def run_governance_meeting_now(
         return slot_key
 
     # Governance meeting must consume DB prework outputs (no live universe scan here).
-    symbols = list(rules.universe.symbols)
+    symbols = [str(s).strip().upper() for s in list(rules.universe.symbols) if str(s).strip()]
 
     # Valid window (deterministic):
     # - scheduled slot: [slot_dt, next_slot_dt)
@@ -2894,8 +2985,27 @@ def run_governance_meeting_now(
         prework_reports = dict((prework or {}).get("reports") or {})
         quant_report = prework_reports.get("quant_strategist") if isinstance(prework_reports.get("quant_strategist"), Mapping) else {}
         quant_findings = dict((quant_report or {}).get("findings") or {}) if isinstance(quant_report, Mapping) else {}
+        uv_cfg = (rules_raw.get("universe") or {}) if isinstance(rules_raw, Mapping) else {}
+        dyn_cfg = (uv_cfg.get("dynamic") or {}) if isinstance(uv_cfg, Mapping) else {}
+        enforce_static_allowlist = bool(dyn_cfg.get("enforce_static_allowlist", False))
+        static_symbols = [str(s).strip().upper() for s in list(rules.universe.symbols) if str(s).strip()]
+        prework_symbols: list[str] = []
+        universe_selection_raw = (
+            quant_findings.get("universe_selection")
+            if isinstance(quant_findings.get("universe_selection"), Mapping)
+            else {}
+        )
+        if isinstance(universe_selection_raw, Mapping):
+            for raw_sym in list(universe_selection_raw.get("symbols") or []):
+                sym = str(raw_sym or "").strip().upper()
+                if sym:
+                    prework_symbols.append(sym)
         evaluated_raw = quant_findings.get("candidates") if isinstance(quant_findings.get("candidates"), list) else []
         evaluated = [x for x in list(evaluated_raw or []) if isinstance(x, Mapping)]
+        for row in evaluated:
+            sym = str(row.get("symbol") or "").strip().upper()
+            if sym:
+                prework_symbols.append(sym)
         if not evaluated:
             evaluated = [{"symbol": (symbols[0] if symbols else "KRW-BTC"), "score": -9.0, "snapshot": {}, "features": {}}]
 
@@ -2903,6 +3013,14 @@ def run_governance_meeting_now(
         recon = repo.fetch_latest_reconciliation()
 
         suggested_plan = quant_findings.get("suggested_plan") if isinstance(quant_findings.get("suggested_plan"), Mapping) else {}
+        suggested_symbol = str((suggested_plan or {}).get("symbol") or "").strip().upper()
+        if suggested_symbol:
+            prework_symbols.append(suggested_symbol)
+        prework_symbols = list(dict.fromkeys(prework_symbols))
+        if enforce_static_allowlist:
+            symbols = [s for s in prework_symbols if s in set(static_symbols)] or list(static_symbols)
+        else:
+            symbols = prework_symbols or list(static_symbols)
         best_symbol = str((suggested_plan or {}).get("symbol") or (evaluated[0] if evaluated else {}).get("symbol") or (symbols[0] if symbols else "KRW-BTC"))
         research_report = prework_reports.get("research_agent") if isinstance(prework_reports.get("research_agent"), Mapping) else {}
         research_findings = dict((research_report or {}).get("findings") or {}) if isinstance(research_report, Mapping) else {}
@@ -3066,6 +3184,7 @@ def run_governance_meeting_now(
         if not bool(outputs.ops.trade_window_allowed):
             soft_plan_block_reasons.append("ops.trade_window_allowed=false")
         soft_plan_block = bool(soft_plan_block_reasons)
+        plan_execution_blocked = bool(hard_plan_block or soft_plan_block)
         activation_decision = _activation_decision_from_gate(
             activation_gate=activation_gate,
             hard_plan_block=hard_plan_block,
@@ -3098,6 +3217,7 @@ def run_governance_meeting_now(
         activation_gate["hard_plan_block_reasons"] = list(hard_plan_block_reasons)
         activation_gate["soft_plan_block"] = bool(soft_plan_block)
         activation_gate["soft_plan_block_reasons"] = list(soft_plan_block_reasons)
+        activation_gate["plan_execution_blocked"] = bool(plan_execution_blocked)
         activation_gate["hold_mode"] = str(hold_mode)
         activation_gate["conditional_activation"] = dict(conditional_activation_cfg)
         activation_gate["cap_runtime"] = dict(cap_runtime_seed)
@@ -3129,6 +3249,16 @@ def run_governance_meeting_now(
             activation_gate["paper_data_collection_applied"] = True
             activation_gate["paper_data_collection_target_pct"] = float(resolved_target_position_pct)
             activation_gate["paper_data_collection_buy_allowed"] = bool(resolved_allowed_actions["buy"])
+
+        if plan_execution_blocked:
+            resolved_allowed_actions["buy"] = False
+            resolved_target_position_pct = 0.0
+            activation_gate = dict(activation_gate)
+            activation_gate["resolved_execution_blocked"] = True
+            activation_gate["resolved_execution_blocked_reasons"] = [
+                *list(hard_plan_block_reasons),
+                *list(soft_plan_block_reasons),
+            ]
 
         if str(activation_decision_effective).upper() == "HOLD":
             resolved_allowed_actions["buy"] = False
@@ -3215,6 +3345,34 @@ def run_governance_meeting_now(
                 ),
                 1200,
             )
+        resolved_execution_lines = [
+            "[resolved_execution]",
+            f"- activation_status={str(activation_status)}",
+            f"- decision_effective={str(activation_gate.get('decision_effective') or activation_gate.get('decision') or '')}",
+            f"- plan_execution_blocked={bool(plan_execution_blocked)}",
+            f"- allowed_actions.buy={bool(resolved_allowed_actions.get('buy'))}",
+            f"- allowed_actions.sell={bool(resolved_allowed_actions.get('sell'))}",
+            f"- target_position_pct={float(resolved_target_position_pct):.1f}",
+        ]
+        if plan_execution_blocked:
+            blocked_reasons = [str(x).strip() for x in list(hard_plan_block_reasons) + list(soft_plan_block_reasons) if str(x).strip()]
+            if blocked_reasons:
+                resolved_execution_lines.append(f"- blocked_reasons={','.join(blocked_reasons[:6])}")
+        plan_notes = _clip(
+            "\n".join([x for x in [str(plan_notes or "").strip(), *resolved_execution_lines] if str(x).strip()]),
+            1200,
+        )
+        consistency_checks = _build_plan_consistency_checks(
+            hard_plan_block=bool(hard_plan_block),
+            hard_plan_block_reasons=list(hard_plan_block_reasons),
+            soft_plan_block=bool(soft_plan_block),
+            soft_plan_block_reasons=list(soft_plan_block_reasons),
+            activation_decision_effective=str(activation_decision_effective),
+            paper_data_collection_applied=bool(paper_data_collection_applied),
+            allowed_actions=resolved_allowed_actions,
+            target_position_pct=float(resolved_target_position_pct),
+            notes=str(plan_notes),
+        )
         resolved_final_plan = outputs.final_plan.model_copy(
             update={
                 "target_position_pct": float(resolved_target_position_pct),
@@ -3335,6 +3493,7 @@ def run_governance_meeting_now(
             "paper_live_policy": paper_live_policy,
             "execution_playbook": execution_playbook,
             "improvement_roadmap": list(improvement_roadmap),
+            "consistency_checks": consistency_checks,
         }
         formatted_minutes = _render_reader_minutes(
             slot_key=slot_key,
