@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from ai_invest.domain.reason_codes import ReasonCode
 from ai_invest.learning.outcome_evaluator import classify_outcome_label, evaluate_closed_trade
@@ -37,7 +38,24 @@ class OutcomeEvaluatorTests(unittest.TestCase):
         self.assertEqual(ev.outcome_label, "LOSS")
         self.assertIsNone(ev.error_type)
 
+    def test_early_exit_pattern(self) -> None:
+        ts_open = datetime(2026, 2, 15, 0, 0, tzinfo=timezone.utc)
+        ts_close = ts_open + timedelta(minutes=2)
+        ev = evaluate_closed_trade(
+            qty=1.0,
+            avg_entry_price=100.0,
+            avg_exit_price=99.9,
+            realized_pnl_krw=-0.3,
+            fees_total_krw=0.2,
+            ts_open=ts_open,
+            ts_close=ts_close,
+            exit_reason="TRAIL",
+            min_hold_seconds=300,
+            flat_tolerance_krw=0.0,
+        )
+        self.assertEqual(ev.outcome_label, "LOSS")
+        self.assertEqual(ev.error_type, ReasonCode.OC_EARLY_EXIT.value)
+
 
 if __name__ == "__main__":
     unittest.main()
-
