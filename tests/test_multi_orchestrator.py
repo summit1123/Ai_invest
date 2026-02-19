@@ -26,10 +26,12 @@ class MultiOrchestratorTests(unittest.TestCase):
             ops_interval_sec=60,
             governance_sleep_sec=30,
             review_sleep_sec=60,
+            adaptive_sleep_sec=3600,
             enable_paper=True,
             enable_work=True,
             enable_governance=True,
             enable_review=True,
+            enable_adaptive=True,
         )
         names = [name for name, _ in cmds]
         self.assertEqual(
@@ -39,11 +41,12 @@ class MultiOrchestratorTests(unittest.TestCase):
                 "research_work_loop",
                 "quant_work_loop",
                 "risk_work_loop",
-                "ops_work_loop",
-                "governance_loop",
-                "review_loop",
-            ],
-        )
+                    "ops_work_loop",
+                    "governance_loop",
+                    "review_loop",
+                    "adaptive_tuning_loop",
+                ],
+            )
 
     def test_build_commands_respects_disable_flags(self) -> None:
         mod = _load_module()
@@ -56,10 +59,12 @@ class MultiOrchestratorTests(unittest.TestCase):
             ops_interval_sec=60,
             governance_sleep_sec=30,
             review_sleep_sec=60,
+            adaptive_sleep_sec=3600,
             enable_paper=False,
             enable_work=True,
             enable_governance=False,
             enable_review=False,
+            enable_adaptive=False,
         )
         self.assertEqual([name for name, _ in cmds], ["research_work_loop", "quant_work_loop", "risk_work_loop", "ops_work_loop"])
 
