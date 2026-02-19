@@ -227,7 +227,84 @@ class SafeJudgeTests(unittest.TestCase):
             ops={"veto": False},
         )
         self.assertEqual(decision_buy.action, "HOLD")
-        self.assertEqual(decision_buy.selected_reasons, [ReasonCode.RG_TRADE_PLAN_FLAT.value])
+        self.assertEqual(decision_buy.selected_reasons, [ReasonCode.RG_MICRO_BLOCKED_POLICY.value])
+
+    def test_hold_uses_market_reason_codes(self) -> None:
+        payload = base_payload()
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "HOLD", "reason_codes": [ReasonCode.RG_EDGE_TOO_LOW.value]},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_EDGE_TOO_LOW.value])
+        self.assertIn(ReasonCode.RG_EDGE_TOO_LOW.value, list(decision.gates.get("market_reason_codes") or []))
+
+    def test_micro_plan_led_promotes_buy_in_hold_mode(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": True, "sell": True},
+            "target_position_pct": 2.5,
+            "activation_gate": {
+                "decision": "HOLD",
+                "decision_effective": "HOLD",
+                "hard_plan_block": False,
+                "soft_plan_block": False,
+                "plan_execution_blocked": False,
+            },
+        }
+        payload["context"]["position"] = {"current_position_pct": 0.0}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={
+                "signal": "HOLD",
+                "alpha": 0.90,
+                "signal_target_pct": 0.0,
+                "reason_codes": [ReasonCode.RG_PASS.value],
+            },
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "BUY")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_CAP_PROMOTED.value])
+        self.assertAlmostEqual(float(decision.effective_target_pct or 0.0), 2.0, places=6)
+        self.assertEqual(str(decision.gates.get("micro_mode_entry_path")), "plan-led")
+
+    def test_micro_blocked_by_market_cooldown_reason(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": True, "sell": True},
+            "target_position_pct": 2.0,
+            "activation_gate": {
+                "decision": "HOLD",
+                "decision_effective": "HOLD",
+                "hard_plan_block": False,
+                "soft_plan_block": False,
+                "plan_execution_blocked": False,
+            },
+        }
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={
+                "signal": "HOLD",
+                "alpha": 0.95,
+                "signal_target_pct": 0.0,
+                "reason_codes": [ReasonCode.RG_COOLDOWN_ACTIVE.value],
+            },
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_MICRO_BLOCKED_COOLDOWN.value])
 
     def test_cap_promoted_paper_override_allows_buy_with_effective_target(self) -> None:
         payload = base_payload()
