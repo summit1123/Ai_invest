@@ -51,6 +51,61 @@ def _format_risks(risks: Any, *, limit: int = 8) -> str:
     return "\n".join(lines) if lines else "- (없음)"
 
 
+def _join_nonempty(parts: list[str], *, sep: str = ", ", fallback: str = "-") -> str:
+    vals = [str(x).strip() for x in parts if str(x).strip()]
+    return sep.join(vals) if vals else fallback
+
+
+def _to_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return bool(value)
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _human_trade_action_hint(*, action: str, buy: Any, sell: Any) -> str:
+    a = str(action or "").upper()
+    b = _to_bool(buy)
+    s = _to_bool(sell)
+    if a == "PAUSE":
+        return "시스템 보호 모드입니다. 신규/청산 모두 대기하고 운영 상태를 먼저 확인합니다."
+    if a == "HOLD":
+        return "신규 진입은 보류합니다. 차단 사유가 풀리면 다음 사이클에서 자동 재평가합니다."
+    if a == "BUY":
+        return "진입 신호입니다. 체결가/수수료/슬리피지를 확인하세요."
+    if a == "SELL":
+        return "감축/청산 신호입니다. 보유 수량과 체결 내역을 확인하세요."
+    if b is False and s is True:
+        return "지금은 추가 매수 없이 기존 포지션 정리만 허용된 상태입니다."
+    if b is False and s is False:
+        return "지금은 매수/매도 모두 막힌 상태입니다."
+    return "-"
+
+
+def _plain_exec_state(activation_gate: Mapping[str, Any]) -> tuple[str, str]:
+    reason_code = str(activation_gate.get("reason_code") or "").strip()
+    hard_block = bool(activation_gate.get("hard_plan_block"))
+    soft_block = bool(activation_gate.get("soft_plan_block"))
+    hard_reasons = [str(x).strip() for x in list(activation_gate.get("hard_plan_block_reasons") or []) if str(x).strip()]
+    soft_reasons = [str(x).strip() for x in list(activation_gate.get("soft_plan_block_reasons") or []) if str(x).strip()]
+
+    if hard_block:
+        why = _join_nonempty(hard_reasons[:3], fallback="하드 게이트 미충족")
+        return "실행 차단", why
+    if soft_block:
+        why = _join_nonempty(soft_reasons[:3], fallback="소프트 게이트 제한")
+        return "조건부 제한", f"{why} (실시간 게이트 재평가)"
+    if reason_code:
+        return "실행 가능", f"정책 상태: {reason_code}"
+    return "실행 가능", "실시간 Safe Judge 게이트 적용"
+
+
 def _operator_hint_for_action(action: str) -> str:
     a = str(action or "").upper()
     if a == "PAUSE":
@@ -87,9 +142,15 @@ def tpl_safe_decision(data: Mapping[str, Any]) -> str:
     reasons = data.get("reasons") if isinstance(data.get("reasons"), list) else []
     ctx = _as_mapping(data.get("context"))
     action = str(data.get("action") or "-").upper()
+    simple_hint = _human_trade_action_hint(
+        action=action,
+        buy=ctx.get("trade_plan_buy_allowed"),
+        sell=ctx.get("trade_plan_sell_allowed"),
+    )
     return (
         "[거래] Safe 결정\n"
         f"- 한 줄 요약: {data.get('symbol')} {action} ({format_reason_codes_ko(reasons)})\n"
+        f"- 지금 판단 뜻: {simple_hint}\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- 핵심지표: spread={_as_float(ctx.get('spread_bps'))}bps, rsi={_as_float(ctx.get('rsi_14'))}, atr={_as_float(ctx.get('atr_pct'))}%, vol_z={_as_float(ctx.get('vol_zscore'))}\n"
         f"- 게이트상태: regime_trade_allowed={_as_bool_ko(ctx.get('regime_trade_allowed'))}, risk_veto={_as_bool_ko(ctx.get('risk_veto'))}, ops_veto={_as_bool_ko(ctx.get('ops_veto'))}, recon={ctx.get('reconciliation_status')}\n"
@@ -228,15 +289,24 @@ def tpl_meeting_summary(data: Mapping[str, Any]) -> str:
         )
 
     body = assistant_minutes or str(data.get("summary") or "").strip() or "(요약 없음)"
+    action_hint = _human_trade_action_hint(
+        action=str((_as_mapping(trade_plan.get("final_trade_plan")).get("action") or "")),
+        buy=_as_mapping(trade_plan.get("allowed_actions")).get("buy"),
+        sell=_as_mapping(trade_plan.get("allowed_actions")).get("sell"),
+    )
+    buy_flag = _as_mapping(trade_plan.get("allowed_actions")).get("buy")
+    sell_flag = _as_mapping(trade_plan.get("allowed_actions")).get("sell")
     return (
-        "[회의] 회의록\n"
+        "[회의] 회의록 (쉬운 요약)\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- meeting_id: {data.get('meeting_id')}\n"
         f"{source_line}\n"
         f"- 한 줄 결론: {_clip(data.get('summary'), 180)}\n"
         + plan_line
+        + f"- 실행 이해: {action_hint}\n"
+        + f"- 이번 슬롯 허용: buy={_as_bool_ko(buy_flag)}, sell={_as_bool_ko(sell_flag)}\n"
         + "\n"
-        + f"{_clip(body, 3200)}\n"
+        + f"{_clip(body, 1800)}\n"
     )
 
 
@@ -278,25 +348,23 @@ def tpl_trade_plan_set(data: Mapping[str, Any]) -> str:
     activation_status = str(data.get("activation_status") or "-")
     decision = str(activation_gate.get("decision") or "-")
     decision_effective = str(activation_gate.get("decision_effective") or "-")
-    hard_block = bool(activation_gate.get("hard_plan_block"))
-    soft_block = bool(activation_gate.get("soft_plan_block"))
-    hard_reasons = [str(x).strip() for x in list(activation_gate.get("hard_plan_block_reasons") or []) if str(x).strip()]
-    soft_reasons = [str(x).strip() for x in list(activation_gate.get("soft_plan_block_reasons") or []) if str(x).strip()]
-    if hard_block:
-        exec_state = f"차단(HARD): {', '.join(hard_reasons[:3]) or '-'}"
-    elif soft_block:
-        exec_state = f"제한(SOFT): {', '.join(soft_reasons[:3]) or '-'} (Safe Judge 실시간 재평가)"
-    else:
-        exec_state = "가능(단, Safe Judge 실시간 게이트 적용)"
+    exec_state_title, exec_state_detail = _plain_exec_state(activation_gate)
+    action_hint = _human_trade_action_hint(
+        action=str(data.get("action") or ""),
+        buy=allowed.get("buy"),
+        sell=allowed.get("sell"),
+    )
     return (
         "[거버넌스] 트레이드 플랜 확정\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- 회의/슬롯: {data.get('meeting_id')} / {data.get('slot_key')}\n"
-        f"- 심볼/목표비중: {data.get('symbol')} / {_as_float(data.get('target_position_pct'))}%\n"
+        f"- 이번 슬롯 결론: {data.get('symbol')} / 목표 {_as_float(data.get('target_position_pct'))}%\n"
+        f"- 한 줄 설명: {action_hint}\n"
         f"- 유효시간(KST): {data.get('valid_from_kst')} ~ {data.get('valid_to_kst')}\n"
         f"- 허용 액션: buy={_as_bool_ko(allowed.get('buy'))}, sell={_as_bool_ko(allowed.get('sell'))}\n"
         f"- 활성화 상태: {activation_status} (decision={decision}, effective={decision_effective})\n"
-        f"- 런타임 실행 상태: {exec_state}\n"
+        f"- 런타임 실행 상태: {exec_state_title}\n"
+        f"- 실행 상태 설명: {exec_state_detail}\n"
         f"- 과매매 방지: cooldown={_as_int(data.get('cooldown_minutes'))}분, rebalance_band={_as_float(data.get('rebalance_band_pct'))}%\n"
         f"- 실행 제약: max_spread={_as_float(constraints.get('max_spread_bps'))}bps, max_slippage={_as_float(constraints.get('max_slippage_bps'))}bps, max_position={_as_float(constraints.get('max_position_pct'))}%\n"
         f"- 근거 요약: {_clip(data.get('rationale_summary'), 240)}\n"
