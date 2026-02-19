@@ -698,10 +698,20 @@ def run_agent_work_cycle(
     rules = load_rules("rules.yaml")
     alpha_cfg = load_alpha_score_config(rules_raw=rules_raw)
     universe = resolve_dynamic_universe(rules_raw=rules_raw, fallback_symbols=list(rules.universe.symbols))
-    allowed_symbols = [str(s).strip().upper() for s in list(rules.universe.symbols)]
+    static_symbols = [str(s).strip().upper() for s in list(rules.universe.symbols) if str(s).strip()]
     dynamic_symbols = [str(s).strip().upper() for s in list(universe.symbols or []) if str(s).strip()]
-    excluded_symbols = [s for s in dynamic_symbols if s not in set(allowed_symbols)]
-    symbols = [s for s in dynamic_symbols if s in set(allowed_symbols)] or list(allowed_symbols)
+    dyn_cfg = (
+        ((rules_raw.get("universe") or {}).get("dynamic") or {})
+        if isinstance(rules_raw, Mapping)
+        else {}
+    )
+    enforce_static_allowlist = bool(dyn_cfg.get("enforce_static_allowlist", False))
+    if enforce_static_allowlist:
+        excluded_symbols = [s for s in dynamic_symbols if s not in set(static_symbols)]
+        symbols = [s for s in dynamic_symbols if s in set(static_symbols)] or list(static_symbols)
+    else:
+        excluded_symbols = []
+        symbols = list(dict.fromkeys(dynamic_symbols or static_symbols))
     default_symbol = symbols[0]
     lookback_minutes = max(120, int(alpha_cfg.lookback_minutes))
 
@@ -901,6 +911,7 @@ def run_agent_work_cycle(
                     "total_krw_markets": universe.total_krw_markets,
                     "ranked_count": universe.ranked_count,
                     "symbols": symbols[:20],
+                    "enforce_static_allowlist": bool(enforce_static_allowlist),
                     "excluded_not_allowed": excluded_symbols[:50],
                     "top24h_turnover": universe.top24h_turnover[:10],
                 },
