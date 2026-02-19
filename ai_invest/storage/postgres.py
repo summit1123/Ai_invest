@@ -1291,6 +1291,35 @@ class PostgresRepo:
             )
         return out
 
+    def update_strategy_review(
+        self,
+        *,
+        review_id: str | uuid.UUID,
+        status: str | None = None,
+        evidence: Mapping[str, Any] | None = None,
+    ) -> None:
+        sets: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            sets.append("status=%s")
+            params.append(str(status))
+        if evidence is not None:
+            sets.append("evidence=coalesce(evidence, '{}'::jsonb) || %s::jsonb")
+            params.append(json_dumps(dict(evidence)))
+        if not sets:
+            return
+        params.append(str(review_id))
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                update strategy_reviews
+                set {", ".join(sets)}
+                where review_id=%s
+                """,
+                tuple(params),
+            )
+            conn.commit()
+
     def fetch_agent_opinions(
         self,
         *,
