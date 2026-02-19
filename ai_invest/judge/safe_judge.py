@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from ai_invest.config.rules_loader import RulesConfig
-from ai_invest.domain.reason_codes import ReasonCode, validate_reason_codes
+from ai_invest.domain.reason_codes import ReasonCode, parse_reason_code, validate_reason_codes
 
 
 class SafeJudgeContractError(ValueError):
@@ -84,6 +84,35 @@ def _opt_str(payload: Mapping[str, Any], path: str) -> str | None:
     return s or None
 
 
+def _extract_reason_codes(payload: Mapping[str, Any] | None) -> list[ReasonCode]:
+    if not isinstance(payload, Mapping):
+        return []
+    raw_items: list[Any] = []
+    for key in ("reason_codes", "selected_reasons"):
+        value = payload.get(key)
+        if isinstance(value, (list, tuple)):
+            raw_items.extend(value)
+    single = payload.get("reason_code")
+    if single is not None:
+        raw_items.append(single)
+    out: list[ReasonCode] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        try:
+            code = parse_reason_code(raw)
+        except Exception:
+            continue
+        if code.value in seen:
+            continue
+        seen.add(code.value)
+        out.append(code)
+    return out
+
+
+def _non_pass_reasons(codes: list[ReasonCode]) -> list[ReasonCode]:
+    return [c for c in codes if c != ReasonCode.RG_PASS]
+
+
 @dataclass(frozen=True)
 class SafeJudgeDecision:
     action: str  # BUY / SELL / HOLD / PAUSE
@@ -141,6 +170,10 @@ def safe_judge_decide(
             market_signal_target_pct = float((market or {}).get("signal_target_pct"))
         except Exception:
             market_signal_target_pct = None
+    market_reason_codes = _extract_reason_codes(market)
+    regime_reason_codes = _extract_reason_codes(regime)
+    risk_reason_codes = _extract_reason_codes(risk)
+    ops_reason_codes = _extract_reason_codes(ops)
 
     effective_target_pct: float | None
     plan_target_for_execution = (
@@ -176,6 +209,10 @@ def safe_judge_decide(
         "effective_target_pct": effective_target_pct,
         "current_position_pct": current_position_pct,
         "cash_krw": cash_krw,
+        "market_reason_codes": [c.value for c in market_reason_codes],
+        "regime_reason_codes": [c.value for c in regime_reason_codes],
+        "risk_reason_codes": [c.value for c in risk_reason_codes],
+        "ops_reason_codes": [c.value for c in ops_reason_codes],
     }
 
     # External agent opinions (optional but supported).
@@ -211,15 +248,14 @@ def safe_judge_decide(
         action = "PAUSE"
         reasons.append(ReasonCode.RG_DAILY_LOSS_LIMIT_HIT)
     elif ops_veto:
-        # Generic fail-closed ops veto until ops agent provides finer codes.
         action = "PAUSE"
-        reasons.append(ReasonCode.RG_DATA_BAD)
+        reasons.extend(_non_pass_reasons(ops_reason_codes) or [ReasonCode.RG_DATA_BAD])
     elif not regime_allowed:
         action = "HOLD"
-        reasons.append(ReasonCode.RG_REGIME_BLOCKED)
+        reasons.extend(_non_pass_reasons(regime_reason_codes) or [ReasonCode.RG_REGIME_BLOCKED])
     elif risk_veto:
         action = "HOLD"
-        reasons.append(ReasonCode.RG_RISK_VETO)
+        reasons.extend(_non_pass_reasons(risk_reason_codes) or [ReasonCode.RG_RISK_VETO])
     elif spread_bps > rules.cost_guard.max_spread_bps_entry:
         action = "HOLD"
         reasons.append(ReasonCode.RG_SPREAD_TOO_WIDE)
@@ -237,7 +273,10 @@ def safe_judge_decide(
             action = "SELL"
         else:
             action = "HOLD"
-        reasons.append(ReasonCode.RG_PASS)
+        if action == "HOLD":
+            reasons = _non_pass_reasons(market_reason_codes) or [ReasonCode.RG_PASS]
+        else:
+            reasons = [ReasonCode.RG_PASS]
 
         if action == "BUY" and trade_plan_buy_allowed is False:
             action = "HOLD"
@@ -271,6 +310,9 @@ def safe_judge_decide(
         micro_cfg = (rules.raw.get("governance") or {}) if isinstance(rules.raw, Mapping) else {}
         micro_cfg = (micro_cfg.get("micro_mode") or {}) if isinstance(micro_cfg, Mapping) else {}
         micro_enabled = bool(micro_cfg.get("enabled", False))
+        micro_entry_mode = str(micro_cfg.get("entry_mode") or "adaptive").strip().lower()
+        if micro_entry_mode not in {"adaptive", "market-led", "plan-led"}:
+            micro_entry_mode = "adaptive"
         micro_max_position_pct = float(micro_cfg.get("max_position_pct") or 3.0)
         micro_max_spread_bps = float(micro_cfg.get("max_spread_bps") or 1.0)
         micro_min_alpha = float(micro_cfg.get("min_alpha") or 0.7)
@@ -279,9 +321,14 @@ def safe_judge_decide(
         micro_plan_hold_only = bool(micro_cfg.get("plan_hold_only", True))
         micro_allow_plan_led_entry = bool(micro_cfg.get("allow_plan_led_entry", False))
         micro_require_market_long = bool(micro_cfg.get("require_market_long", True))
+        plan_gate_hard_block = _opt_bool(payload, "context.trade_plan.activation_gate.hard_plan_block")
+        plan_gate_soft_block = _opt_bool(payload, "context.trade_plan.activation_gate.soft_plan_block")
+        plan_gate_exec_block = _opt_bool(payload, "context.trade_plan.activation_gate.plan_execution_blocked")
+        plan_gate_passed = not bool(plan_gate_hard_block or plan_gate_soft_block or plan_gate_exec_block)
 
         gates["micro_mode_enabled"] = bool(micro_enabled)
         gates["micro_mode"] = {
+            "entry_mode": str(micro_entry_mode),
             "max_position_pct": float(micro_max_position_pct),
             "max_spread_bps": float(micro_max_spread_bps),
             "min_alpha": float(micro_min_alpha),
@@ -304,20 +351,50 @@ def safe_judge_decide(
         plan_allows_buy = bool(trade_plan_buy_allowed is not False)
         market_long_ok = bool(market_signal in {"BUY", "LONG"})
         signal_target_ok = bool(market_signal_target_pct is not None and float(market_signal_target_pct) > 0.0)
-        plan_led_ok = bool(micro_allow_plan_led_entry and plan_target_for_execution is not None and float(plan_target_for_execution) > 0.0)
-        trigger_ok = bool((market_long_ok and signal_target_ok) or plan_led_ok)
+        market_led_ok = bool(market_long_ok and signal_target_ok)
+        plan_led_ok = bool(
+            micro_allow_plan_led_entry
+            and market_signal not in {"SELL", "SHORT"}
+            and plan_target_for_execution is not None
+            and float(plan_target_for_execution) > 0.0
+            and plan_gate_passed
+        )
+        if micro_entry_mode == "market-led":
+            trigger_ok = bool(market_led_ok)
+            micro_entry_path = "market-led" if market_led_ok else "blocked"
+        elif micro_entry_mode == "plan-led":
+            trigger_ok = bool(plan_led_ok)
+            micro_entry_path = "plan-led" if plan_led_ok else "blocked"
+        else:
+            trigger_ok = bool(market_led_ok or plan_led_ok)
+            micro_entry_path = "market-led" if market_led_ok else ("plan-led" if plan_led_ok else "blocked")
         if micro_require_market_long:
-            trigger_ok = bool(market_long_ok and signal_target_ok)
+            trigger_ok = bool(market_led_ok)
+            micro_entry_path = "market-led" if market_led_ok else "blocked"
+        market_has_cooldown_block = any(c == ReasonCode.RG_COOLDOWN_ACTIVE for c in market_reason_codes)
+        market_has_edge_block = any(c == ReasonCode.RG_EDGE_TOO_LOW for c in market_reason_codes)
+        market_reason_blocked = bool(market_has_cooldown_block or market_has_edge_block)
 
-        micro_allowed_context = (
+        micro_candidate_context = (
             bool(micro_enabled)
             and action == "HOLD"
+            and market_signal not in {"SELL", "SHORT"}
             and bool(plan_allows_buy)
             and (plan_is_hold if micro_plan_hold_only else True)
-            and bool(trigger_ok)
         )
+        micro_allowed_context = bool(micro_candidate_context and bool(trigger_ok))
+        micro_block_reason: ReasonCode | None = None
+        if micro_candidate_context and (not bool(trigger_ok)):
+            micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_POLICY
+        if micro_allowed_context and market_reason_blocked:
+            if market_has_cooldown_block:
+                micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_COOLDOWN
+            elif market_has_edge_block:
+                micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_EDGE
+
         micro_pass = (
             micro_allowed_context
+            and not bool(market_reason_blocked)
             and (market_alpha is not None and float(market_alpha) >= float(micro_min_alpha))
             and float(spread_bps) <= float(micro_max_spread_bps)
             and float(daily_loss_pct) <= float(micro_max_daily_loss_pct)
@@ -328,6 +405,10 @@ def safe_judge_decide(
             and (current_position_pct is None or float(current_position_pct) < float(micro_max_position_pct) - 0.1)
         )
         gates["micro_mode_passed"] = bool(micro_pass)
+        gates["micro_mode_entry_mode"] = str(micro_entry_mode)
+        gates["micro_mode_entry_path"] = str(micro_entry_path)
+        gates["micro_mode_market_reason_blocked"] = bool(market_reason_blocked)
+        gates["micro_mode_plan_gate_passed"] = bool(plan_gate_passed)
 
         if micro_pass:
             action = "BUY"
@@ -338,8 +419,13 @@ def safe_judge_decide(
             effective_target_pct = float(max(0.0, micro_target))
             gates["effective_target_pct"] = float(effective_target_pct)
             reasons = [ReasonCode.RG_CAP_PROMOTED]
+        elif micro_candidate_context:
+            if micro_block_reason is None:
+                micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_POLICY
+            gates["micro_mode_block_reason_code"] = str(micro_block_reason.value)
+            reasons = [micro_block_reason]
 
-    selected_reason_codes = [c.value for c in validate_reason_codes(reasons, max_items=3)]
+    selected_reason_codes = [c.value for c in validate_reason_codes(reasons[:3], max_items=3)]
 
     score: float | None = None
     confidence: float | None = None
