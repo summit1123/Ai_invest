@@ -50,7 +50,7 @@ quant_backtest:
 strategy:
   alpha_score:
     enabled: true
-    entry_alpha: 0.7672
+    entry_alpha: 0.9
     strong_alpha: 0.65
     cooldown_override_alpha: 0.8
     cooldown_override_enabled: true
@@ -73,7 +73,7 @@ strategy:
     trail_atr_mult: 0.9
     time_stop_mom_minutes: 240
     time_stop_rev_minutes: 120
-    cooldown_minutes: 57
+    cooldown_minutes: 84
     atr_block_pct: 2.5
     daily_loss_entry_block_ratio: 0.8
     mom_weight_rsi: 0.2
@@ -129,7 +129,7 @@ governance:
   plan_continuity:
     enabled: true
     sticky_if_position_open: true
-    min_hold_minutes: 348
+    min_hold_minutes: 518
     switch_min_backtest_score_delta: 2.0
     switch_min_candidate_score_delta: 0.15
   micro_mode:
@@ -139,8 +139,8 @@ governance:
     allow_plan_led_entry: true
     require_market_long: false
     max_position_pct: 2.0
-    max_spread_bps: 1.968
-    min_alpha: 0.3411
+    max_spread_bps: 1.284
+    min_alpha: 0.4702
     max_daily_loss_pct: 0.5
     max_trades_per_day: 5
   default_target_position_pct: 10.0
@@ -342,12 +342,12 @@ llm:
       reasoning_effort: xhigh
       temperature: 0.2
     strategy_coordinator_weekly:
-      model: gpt-5.2-pro
+      model: gpt-5.2
       api_style: responses
       reasoning_effort: xhigh
       temperature: 0.1
     finance_tax_agent:
-      model: gpt-5.2-pro
+      model: gpt-5.2
       api_style: responses
       reasoning_effort: xhigh
       temperature: 0.1
