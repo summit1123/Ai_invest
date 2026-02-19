@@ -4,6 +4,7 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
@@ -214,6 +215,87 @@ class AgentWorkLoopTests(unittest.TestCase):
         findings = dict(captured.get("findings") or {})
         universe_selection = dict(findings.get("universe_selection") or {})
         assert "KRW-FAKE" in list(universe_selection.get("excluded_not_allowed") or [])
+
+    def test_run_cycle_research_web_search_settings_applied(self) -> None:
+        class Repo:
+            def fetch_pause_state(self):
+                return {"paused": False}
+
+            def fetch_latest_reconciliation(self):
+                return {"status": "OK"}
+
+            def fetch_ready_agent_tasks(self, *, agent_name: str, limit: int = 10):  # noqa: ARG002
+                return []
+
+        repo = Repo()
+        rules_raw = yaml.safe_load(Path("rules.yaml").read_text(encoding="utf-8"))
+        rules_raw["research"] = {
+            "headline_limit": 16,
+            "rss_timeout_sec": 7,
+            "web_search": {
+                "enabled": True,
+                "provider": "wqb",
+                "limit": 6,
+                "timeout_sec": 9,
+            },
+        }
+
+        captured: dict[str, object] = {}
+
+        def fake_fetch_crypto_headlines(**kwargs):  # noqa: ANN003
+            captured.update(kwargs)
+            return []
+
+        fake_brief = SimpleNamespace(
+            summary="summary",
+            key_findings=[],
+            llm_meta=None,
+            risk_watchlist=[],
+            next_actions=[],
+        )
+
+        with (
+            patch.object(
+                awl,
+                "resolve_dynamic_universe",
+                return_value=DynamicUniverseResult(
+                    symbols=["KRW-BTC"],
+                    source="test",
+                    ranked_count=1,
+                    total_krw_markets=1,
+                    top24h_turnover=[],
+                ),
+            ),
+            patch.object(
+                awl,
+                "_quant_candidate_rows",
+                return_value=[
+                    {
+                        "symbol": "KRW-BTC",
+                        "score": 0.7,
+                        "snapshot": {"last_price": 1.0, "mid_price": 1.0, "spread_bps": 1.0},
+                        "features": {"rsi_14": 55.0, "atr_pct": 1.2, "vol_zscore": 0.4},
+                    }
+                ],
+            ),
+            patch.object(awl, "fetch_crypto_headlines", side_effect=fake_fetch_crypto_headlines),
+            patch.object(awl, "research_agent_daily_brief", return_value=fake_brief),
+            patch.object(awl, "_store_report", return_value=uuid.uuid4()),
+        ):
+            awl.run_agent_work_cycle(
+                repo=repo,  # type: ignore[arg-type]
+                rules_raw=rules_raw,
+                meeting_context="test",
+                selected_agents=["research_agent"],
+            )
+
+        assert captured.get("symbol") == "KRW-BTC"
+        assert captured.get("limit") == 16
+        assert captured.get("include_web_search") is True
+        assert captured.get("web_search_provider") == "wqb"
+        assert captured.get("web_search_limit") == 6
+        assert captured.get("web_search_timeout_sec") == 9
+        assert captured.get("rss_timeout_sec") == 7
 
     def test_quant_feedback_adjustment_uses_trade_execution_outcomes(self) -> None:
         class Repo:
