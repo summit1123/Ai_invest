@@ -16,8 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+from ai_invest.config.llm_router import llm_route_for_agent  # noqa: E402
+from ai_invest.agents.strategy_coordinator_agent import propose_weekly_priority  # noqa: E402
 from ai_invest.notifications.service import NotificationService  # noqa: E402
-from ai_invest.storage.postgres import DbEvent, PostgresRepo  # noqa: E402
+from ai_invest.storage.postgres import DbEvent, DbStrategyReview, PostgresRepo  # noqa: E402
 
 KST = ZoneInfo("Asia/Seoul")
 WEEK_DAYS = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
@@ -78,6 +80,20 @@ def _parse_ts(v: Any) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        s = str(value).strip()
+        return float(s) if s else None
     except Exception:
         return None
 
@@ -148,6 +164,186 @@ def _weekly_trade_metrics(repo: PostgresRepo, *, ws: date, we: date) -> tuple[fl
     return pnl, win_rate, total
 
 
+def _close_finished_weekly_priorities(*, repo: PostgresRepo, now_kst: datetime) -> int:
+    """Close stale OPEN/IN_PROGRESS priorities with deterministic evidence."""
+
+    today = now_kst.date()
+    rows = repo.fetch_strategy_reviews(limit=260)
+    closed = 0
+    for row in rows:
+        status = str(row.get("status") or "").strip().upper()
+        if status not in {"OPEN", "IN_PROGRESS"}:
+            continue
+        ws = _parse_day(row.get("week_start"))
+        we = _parse_day(row.get("week_end"))
+        if ws is None or we is None:
+            continue
+        if we >= today:
+            continue
+
+        weekly_pnl, win_rate, trades = _weekly_trade_metrics(repo, ws=ws, we=we)
+        loss_tags_top3 = _top3_loss_tags(repo, ws=ws, we=we)
+        criteria = dict(row.get("success_criteria") or {})
+        checks: list[bool] = []
+
+        min_win_rate = _as_float(criteria.get("min_win_rate_pct"))
+        if min_win_rate is not None:
+            checks.append(float(win_rate) >= float(min_win_rate))
+
+        min_weekly_pnl = _as_float(criteria.get("min_weekly_pnl_krw"))
+        if min_weekly_pnl is not None:
+            checks.append(float(weekly_pnl) >= float(min_weekly_pnl))
+
+        min_trades = _as_float(criteria.get("min_trades_count"))
+        if min_trades is not None:
+            checks.append(int(trades) >= int(min_trades))
+
+        passed = all(checks) if checks else (int(trades) > 0 and float(weekly_pnl) >= 0.0)
+        next_status = "DONE" if passed else "CANCELED"
+        evidence = {
+            "closed_at_kst": now_kst.isoformat(),
+            "weekly_pnl": float(weekly_pnl),
+            "win_rate_pct": float(round(win_rate, 2)),
+            "trades_count": int(trades),
+            "loss_tags_top3": str(loss_tags_top3),
+            "checks_used": {
+                "min_win_rate_pct": min_win_rate,
+                "min_weekly_pnl_krw": min_weekly_pnl,
+                "min_trades_count": int(min_trades) if min_trades is not None else None,
+            },
+            "checks_passed": bool(passed),
+        }
+        review_id = str(row.get("review_id") or "").strip()
+        if not review_id:
+            continue
+
+        repo.update_strategy_review(
+            review_id=review_id,
+            status=next_status,
+            evidence=evidence,
+        )
+        repo.insert_event(
+            DbEvent(
+                event_id=uuid.uuid4(),
+                ts=_utcnow(),
+                event_type="WEEKLY_PRIORITY_CLOSED",
+                entity_type="strategy_reviews",
+                entity_id=review_id,
+                run_id=None,
+                rule_version_id=None,
+                payload={
+                    "review_id": review_id,
+                    "status": next_status,
+                    "week_start": ws.isoformat(),
+                    "week_end": we.isoformat(),
+                    "evidence": evidence,
+                },
+            )
+        )
+        closed += 1
+    return int(closed)
+
+
+def _has_weekly_priority(repo: PostgresRepo, *, week_start: str) -> bool:
+    for row in repo.fetch_strategy_reviews(limit=120):
+        if str(row.get("week_start") or "") == str(week_start):
+            return True
+    return False
+
+
+def _ensure_weekly_priority(
+    *,
+    repo: PostgresRepo,
+    notifier: NotificationService,
+    rules_raw: dict[str, Any],
+    week_start: str,
+    week_end: str,
+) -> bool:
+    if _has_weekly_priority(repo, week_start=week_start):
+        return False
+
+    ws = _parse_day(week_start)
+    we = _parse_day(week_end)
+    if ws is None or we is None:
+        return False
+
+    pnl = repo.fetch_pnl_daily(limit=30)
+    trades = repo.fetch_realized_trades(limit=500)
+    execm = repo.fetch_execution_metrics(limit=500)
+    recon = repo.fetch_reconciliation_checks(limit=500)
+    agents_cfg = ((rules_raw.get("llm") or {}).get("agents") or {}) if isinstance(rules_raw, dict) else {}
+    weekly_key_exists = isinstance(agents_cfg, dict) and ("strategy_coordinator_weekly" in agents_cfg)
+    route = llm_route_for_agent(
+        rules_raw=rules_raw,
+        agent_name=("strategy_coordinator_weekly" if weekly_key_exists else "strategy_coordinator"),
+    )
+    proposal = propose_weekly_priority(
+        today_kst=_now_kst().date(),
+        pnl_daily=pnl,
+        realized_trades=trades,
+        execution_metrics=execm,
+        reconciliation_checks=recon,
+        llm_route=route,
+    )
+    success_criteria = dict(proposal.success_criteria or {})
+    if proposal.deadline:
+        success_criteria["deadline"] = proposal.deadline
+    if proposal.llm_meta:
+        success_criteria["_llm_meta"] = dict(proposal.llm_meta)
+    if proposal.error:
+        success_criteria["_error"] = str(proposal.error)
+
+    review_id = uuid.uuid4()
+    repo.insert_strategy_review(
+        DbStrategyReview(
+            review_id=review_id,
+            week_start=ws,
+            week_end=we,
+            priority_title=str(proposal.weekly_priority),
+            hypothesis=str(proposal.hypothesis),
+            owner=str(proposal.owner or "strategy_coordinator"),
+            success_criteria=success_criteria,
+            status="OPEN",
+            evidence={},
+            run_id=None,
+        )
+    )
+
+    event_id = uuid.uuid4()
+    repo.insert_event(
+        DbEvent(
+            event_id=event_id,
+            ts=_utcnow(),
+            event_type="WEEKLY_PRIORITY_SET",
+            entity_type="strategy_reviews",
+            entity_id=str(review_id),
+            run_id=None,
+            rule_version_id=None,
+            payload={
+                "review_id": str(review_id),
+                "week_start": str(ws.isoformat()),
+                "week_end": str(we.isoformat()),
+                "priority_title": str(proposal.weekly_priority),
+                "hypothesis": str(proposal.hypothesis),
+                "owner": str(proposal.owner or "strategy_coordinator"),
+                "success_criteria": success_criteria,
+                "assistant_meta": {"used_llm": proposal.used_llm, **(proposal.llm_meta or {}), "error": proposal.error},
+            },
+        )
+    )
+    try:
+        notifier.notify_weekly_priority(
+            event_id=event_id,
+            week_label=f"{ws.isoformat()}~{we.isoformat()}",
+            priority_title=str(proposal.weekly_priority),
+            hypothesis=str(proposal.hypothesis),
+            owner=str(proposal.owner or "strategy_coordinator"),
+        )
+    except Exception:
+        pass
+    return True
+
+
 def send_daily_review(*, repo: PostgresRepo, notifier: NotificationService, now_kst: datetime, force: bool = False) -> bool:
     day = now_kst.date().isoformat()
     latest_payload = _latest_event_payload(repo, event_type="DAILY_REVIEW_SENT")
@@ -194,7 +390,14 @@ def send_daily_review(*, repo: PostgresRepo, notifier: NotificationService, now_
     return True
 
 
-def send_weekly_review(*, repo: PostgresRepo, notifier: NotificationService, now_kst: datetime, force: bool = False) -> bool:
+def send_weekly_review(
+    *,
+    repo: PostgresRepo,
+    notifier: NotificationService,
+    now_kst: datetime,
+    rules_raw: dict[str, Any],
+    force: bool = False,
+) -> bool:
     ws, we = _week_window(now_kst.date())
     week_start = ws.isoformat()
     week_label = f"{week_start}~{we.isoformat()}"
@@ -236,6 +439,13 @@ def send_weekly_review(*, repo: PostgresRepo, notifier: NotificationService, now
         loss_tags_top3=loss_tags_top3,
         rule_patch_status="자동 룰패치 미연결",
     )
+    _ensure_weekly_priority(
+        repo=repo,
+        notifier=notifier,
+        rules_raw=rules_raw,
+        week_start=week_start,
+        week_end=we.isoformat(),
+    )
     return True
 
 
@@ -248,7 +458,17 @@ def run_once(
     force_weekly: bool = False,
 ) -> dict[str, bool]:
     now = _now_kst()
+    _close_finished_weekly_priorities(repo=repo, now_kst=now)
     reporting = (rules_raw.get("reporting") or {}) if isinstance(rules_raw, dict) else {}
+    ws_curr, we_curr = _week_window(now.date())
+    # Weekly review 전송 시점과 무관하게, 현재 주 priority 레코드는 항상 1건 유지한다.
+    _ensure_weekly_priority(
+        repo=repo,
+        notifier=notifier,
+        rules_raw=rules_raw,
+        week_start=ws_curr.isoformat(),
+        week_end=we_curr.isoformat(),
+    )
 
     latest_daily = _latest_event_payload(repo, event_type="DAILY_REVIEW_SENT")
     latest_weekly = _latest_event_payload(repo, event_type="WEEKLY_REVIEW_SENT")
@@ -271,7 +491,17 @@ def run_once(
         weekly_time_kst=weekly_time,
         latest_sent_week_start=str(latest_weekly.get("week_start") or "") or None,
     )
-    sent_weekly = send_weekly_review(repo=repo, notifier=notifier, now_kst=now, force=bool(force_weekly)) if (force_weekly or do_weekly) else False
+    sent_weekly = (
+        send_weekly_review(
+            repo=repo,
+            notifier=notifier,
+            now_kst=now,
+            rules_raw=rules_raw,
+            force=bool(force_weekly),
+        )
+        if (force_weekly or do_weekly)
+        else False
+    )
 
     return {"daily": bool(sent_daily), "weekly": bool(sent_weekly)}
 
