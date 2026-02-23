@@ -1802,9 +1802,47 @@ def enforce_final_trade_plan(
     if sym not in allowed_symbols:
         sym = fallback_symbol if fallback_symbol in allowed_symbols else (next(iter(allowed_symbols), sym))
 
-    # Hard gate: ops/risk veto or ops window closed => disable BUY and flatten target.
+    raw_hint = (fact_pack.get("raw_rules_hint") or {}) if isinstance(fact_pack.get("raw_rules_hint"), Mapping) else {}
+    hint_universe = (raw_hint.get("universe") or {}) if isinstance(raw_hint.get("universe"), Mapping) else {}
+    hint_paper_mode = (raw_hint.get("paper_mode") or {}) if isinstance(raw_hint.get("paper_mode"), Mapping) else {}
+    hint_dc = (hint_paper_mode.get("data_collection") or {}) if isinstance(hint_paper_mode.get("data_collection"), Mapping) else {}
+    is_paper_mode = str(hint_universe.get("mode") or "paper").strip().lower() == "paper"
+    allow_soft_plan_block_bypass = bool(hint_dc.get("allow_soft_plan_block_bypass", False))
+    ops_state = (fact_pack.get("ops_state") or {}) if isinstance(fact_pack.get("ops_state"), Mapping) else {}
+    pause_state = bool(((ops_state.get("pause") or {}).get("paused") if isinstance(ops_state.get("pause"), Mapping) else False))
+    recon_status = str(
+        ((ops_state.get("latest_reconciliation") or {}).get("status") if isinstance(ops_state.get("latest_reconciliation"), Mapping) else "OK")
+        or "OK"
+    ).strip().upper()
+    hard_ops_block = bool(pause_state or recon_status == "FAIL")
+
+    # Hard gate: disable BUY when true hard blockers are present.
     buy_allowed = bool(plan.allowed_actions.buy) and bool(quant.allowed_actions.buy)
+    if hard_ops_block:
+        buy_allowed = False
+    # In paper autonomy mode, soft LLM vetoes are advisory and do not force-flat execution.
+    elif not (is_paper_mode and allow_soft_plan_block_bypass):
+        if bool(ops.veto) or bool(risk.veto) or not bool(ops.trade_window_allowed):
+            buy_allowed = False
+
+    if bool(is_paper_mode and allow_soft_plan_block_bypass and (bool(ops.veto) or bool(risk.veto) or not bool(ops.trade_window_allowed))):
+        conflict_note = "paper 자율모드: soft veto(ops/risk/window)는 참고로 기록하고 실행차단에는 사용하지 않음"
+    else:
+        conflict_note = ""
+
     if bool(ops.veto) or bool(risk.veto) or not bool(ops.trade_window_allowed):
+        if hard_ops_block:
+            conflict_note = "하드 게이트: pause/recon FAIL -> buy=false, target=0"
+        elif not (is_paper_mode and allow_soft_plan_block_bypass):
+            conflict_note = "하드 게이트: ops/risk veto 또는 trade_window 차단 -> buy=false, target=0"
+
+    if conflict_note:
+        conflict = list(plan.conflict_resolution or [])
+        conflict.append(conflict_note)
+    else:
+        conflict = list(plan.conflict_resolution or [])
+
+    if hard_ops_block:
         buy_allowed = False
 
     # Clamp target to risk max and hard max. If buy not allowed => target 0.
@@ -1833,11 +1871,13 @@ def enforce_final_trade_plan(
         **plan_constraints,
     }
 
-    conflict = list(plan.conflict_resolution or [])
     if sym != str(plan.symbol or "").strip():
         conflict.append(f"심볼 보정: allowed_symbols 밖 -> {sym}")
     if not buy_allowed and float(tgt2) == 0.0:
-        conflict.append("하드 게이트: ops/risk veto 또는 trade_window 차단 -> buy=false, target=0")
+        if hard_ops_block:
+            conflict.append("하드 게이트: pause/recon FAIL -> buy=false, target=0")
+        elif not (is_paper_mode and allow_soft_plan_block_bypass):
+            conflict.append("하드 게이트: ops/risk veto 또는 trade_window 차단 -> buy=false, target=0")
     if float(tgt2) != float(tgt):
         conflict.append(f"리스크 상한 적용: target {tgt:.1f}% -> {tgt2:.1f}% (max_pos={max_pos:.1f}%)")
 
@@ -2023,6 +2063,17 @@ def _default_fact_pack(
         "raw_rules_hint": {
             "signal": dict(rules_raw.get("signal") or {}),
             "governance": dict(rules_raw.get("governance") or {}),
+            "universe": {"mode": str(((rules_raw.get("universe") or {}).get("mode") or "paper"))},
+            "paper_mode": {
+                "data_collection": {
+                    "allow_soft_plan_block_bypass": bool(
+                        ((rules_raw.get("paper_mode") or {}).get("data_collection") or {}).get(
+                            "allow_soft_plan_block_bypass",
+                            False,
+                        )
+                    ),
+                }
+            },
         },
     }
 
@@ -3173,9 +3224,16 @@ def run_governance_meeting_now(
         data_collection_cfg = (
             (paper_mode_cfg.get("data_collection") or {}) if isinstance(paper_mode_cfg, Mapping) else {}
         )
+        is_paper_mode = str(((rules_raw.get("universe") or {}).get("mode") or "paper")).strip().lower() == "paper"
         force_plan_buy_allowed = bool(data_collection_cfg.get("force_plan_buy_allowed", True))
         force_plan_target_pct = float(_as_float(data_collection_cfg.get("force_plan_target_pct"), default=5.0))
+        allow_soft_plan_block_bypass = bool(data_collection_cfg.get("allow_soft_plan_block_bypass", False))
         hard_plan_block, hard_plan_block_reasons = _hard_plan_block_from_fact_pack(fact_pack=fact_pack)
+        paper_data_collection_candidate = bool(
+            activation_gate.get("paper_data_collection_mode")
+            and gate_reason_code == "POLICY_GATE_INSUFFICIENT_DATA"
+            and (not hard_plan_block)
+        )
         soft_plan_block_reasons: list[str] = []
         if bool(outputs.ops.veto):
             soft_plan_block_reasons.append("ops.veto=true")
@@ -3183,7 +3241,10 @@ def run_governance_meeting_now(
             soft_plan_block_reasons.append("risk.veto=true")
         if not bool(outputs.ops.trade_window_allowed):
             soft_plan_block_reasons.append("ops.trade_window_allowed=false")
-        soft_plan_block = bool(soft_plan_block_reasons)
+        soft_plan_block_raw = bool(soft_plan_block_reasons)
+        soft_plan_block = bool(soft_plan_block_raw)
+        if is_paper_mode and allow_soft_plan_block_bypass:
+            soft_plan_block = False
         plan_execution_blocked = bool(hard_plan_block or soft_plan_block)
         activation_decision = _activation_decision_from_gate(
             activation_gate=activation_gate,
@@ -3215,17 +3276,16 @@ def run_governance_meeting_now(
         activation_gate["live_execution_enabled"] = bool(live_execution_enabled)
         activation_gate["hard_plan_block"] = bool(hard_plan_block)
         activation_gate["hard_plan_block_reasons"] = list(hard_plan_block_reasons)
+        activation_gate["soft_plan_block_raw"] = bool(soft_plan_block_raw)
         activation_gate["soft_plan_block"] = bool(soft_plan_block)
         activation_gate["soft_plan_block_reasons"] = list(soft_plan_block_reasons)
+        activation_gate["soft_plan_block_bypassed"] = bool(soft_plan_block_raw and not soft_plan_block)
+        activation_gate["paper_soft_block_bypass_enabled"] = bool(allow_soft_plan_block_bypass)
         activation_gate["plan_execution_blocked"] = bool(plan_execution_blocked)
         activation_gate["hold_mode"] = str(hold_mode)
         activation_gate["conditional_activation"] = dict(conditional_activation_cfg)
         activation_gate["cap_runtime"] = dict(cap_runtime_seed)
-        paper_data_collection_applied = bool(
-            activation_gate.get("paper_data_collection_mode")
-            and gate_reason_code == "POLICY_GATE_INSUFFICIENT_DATA"
-            and (not hard_plan_block)
-        )
+        paper_data_collection_applied = bool(paper_data_collection_candidate)
 
         resolved_allowed_actions = outputs.final_plan.allowed_actions.model_dump()
         resolved_target_position_pct = float(outputs.final_plan.target_position_pct)
@@ -3254,10 +3314,11 @@ def run_governance_meeting_now(
             resolved_allowed_actions["buy"] = False
             resolved_target_position_pct = 0.0
             activation_gate = dict(activation_gate)
+            effective_soft_reasons = list(soft_plan_block_reasons) if bool(soft_plan_block) else []
             activation_gate["resolved_execution_blocked"] = True
             activation_gate["resolved_execution_blocked_reasons"] = [
                 *list(hard_plan_block_reasons),
-                *list(soft_plan_block_reasons),
+                *list(effective_soft_reasons),
             ]
 
         if str(activation_decision_effective).upper() == "HOLD":

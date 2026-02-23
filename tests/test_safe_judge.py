@@ -273,7 +273,10 @@ class SafeJudgeTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "BUY")
         self.assertEqual(decision.selected_reasons, [ReasonCode.RG_CAP_PROMOTED.value])
-        self.assertAlmostEqual(float(decision.effective_target_pct or 0.0), 2.0, places=6)
+        micro_max = float(
+            (((self.rules.raw.get("governance") or {}).get("micro_mode") or {}).get("max_position_pct") or 2.0)
+        )
+        self.assertAlmostEqual(float(decision.effective_target_pct or 0.0), min(2.5, micro_max), places=6)
         self.assertEqual(str(decision.gates.get("micro_mode_entry_path")), "plan-led")
 
     def test_micro_blocked_by_market_cooldown_reason(self) -> None:

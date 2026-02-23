@@ -115,6 +115,7 @@ def governance_risk_instructions() -> str:
             "recon FAIL, pause 등 하드 리스크는 veto를 우선 고려.",
             "max_position_pct, max_loss_per_trade_pct, max_daily_loss_pct를 명시.",
             "required_constraints에 spread/slippage 등 실행 제약 포함.",
+            "paper 테스트 모드(universe.mode=paper)에서는 이전 슬롯 buy=false 같은 계획 상태를 veto 근거로 사용하지 말고, 계좌/정합성/손실 한도 같은 하드 리스크 중심으로 판단한다.",
             "스키마 JSON만 출력.",
         ],
         output_schema=[
@@ -139,6 +140,7 @@ def governance_ops_instructions() -> str:
         ],
         hard_rules=[
             "reconciliation_status=FAIL이면 veto=true.",
+            "paper 테스트 모드(universe.mode=paper)에서는 live_execution_enabled=false를 차단 근거로 사용하지 않는다.",
             "required_ops_gates에 하드 게이트를 나열한다.",
             "data_quality_flags에 운영 이슈를 명시한다.",
             "스키마 JSON만 출력.",
@@ -147,7 +149,7 @@ def governance_ops_instructions() -> str:
             "OpsDraft 스키마를 따른다.",
             "필수 키: veto, trade_window_allowed, required_ops_gates, data_quality_flags, notes.",
         ],
-        failsafe=["정보가 부족하면 보수적으로 trade_window_allowed=false를 고려한다."],
+        failsafe=["정보가 부족하면 unknown/data_quality_flags로 남기고, pause/recon FAIL/429 폭주 같은 하드 이슈가 없으면 trade_window_allowed=true를 유지한다."],
         style_rules=["한국어로 작성한다."],
     )
 

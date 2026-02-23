@@ -373,7 +373,9 @@ def safe_judge_decide(
             micro_entry_path = "market-led" if market_led_ok else "blocked"
         market_has_cooldown_block = any(c == ReasonCode.RG_COOLDOWN_ACTIVE for c in market_reason_codes)
         market_has_edge_block = any(c == ReasonCode.RG_EDGE_TOO_LOW for c in market_reason_codes)
-        market_reason_blocked = bool(market_has_cooldown_block or market_has_edge_block)
+        # In plan-led micro entry, allow a lower-edge pilot in paper mode as long as alpha/risk/cost checks pass.
+        edge_block_applied = bool(market_has_edge_block and micro_entry_path != "plan-led")
+        market_reason_blocked = bool(market_has_cooldown_block or edge_block_applied)
 
         micro_candidate_context = (
             bool(micro_enabled)
@@ -389,7 +391,7 @@ def safe_judge_decide(
         if micro_allowed_context and market_reason_blocked:
             if market_has_cooldown_block:
                 micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_COOLDOWN
-            elif market_has_edge_block:
+            elif edge_block_applied:
                 micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_EDGE
 
         micro_pass = (
@@ -408,6 +410,7 @@ def safe_judge_decide(
         gates["micro_mode_entry_mode"] = str(micro_entry_mode)
         gates["micro_mode_entry_path"] = str(micro_entry_path)
         gates["micro_mode_market_reason_blocked"] = bool(market_reason_blocked)
+        gates["micro_mode_edge_block_applied"] = bool(edge_block_applied)
         gates["micro_mode_plan_gate_passed"] = bool(plan_gate_passed)
 
         if micro_pass:

@@ -33,6 +33,26 @@ function sum(nums: number[]): number {
   return nums.reduce((a, b) => a + b, 0)
 }
 
+const KST_DAY_FORMATTER = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Seoul',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+})
+
+function addDays(day: string, delta: number): string {
+  const base = new Date(`${day}T00:00:00Z`)
+  if (Number.isNaN(base.getTime())) return day
+  base.setUTCDate(base.getUTCDate() + delta)
+  return base.toISOString().slice(0, 10)
+}
+
+function toKstDay(ts: string): string {
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ''
+  return KST_DAY_FORMATTER.format(d)
+}
+
 export function WeeklyReviewPage() {
   const q = useQuery({
     queryKey: ['weekly-review'],
@@ -75,10 +95,20 @@ export function WeeklyReviewPage() {
   const priorities = qGov.data?.items ?? []
   const latestPriority = priorities[0] ?? null
 
-  const weeklyPnl = sum(pnl.map((r) => r.realized_pnl))
-  const wins = trades.filter((t) => t.realized_pnl > 1.0).length
-  const losses = trades.filter((t) => t.realized_pnl < -1.0).length
-  const winRate = trades.length ? (wins / trades.length) * 100 : 0
+  const latestDay = pnl.reduce((acc, row) => (row.day > acc ? row.day : acc), '')
+  const weeklyStartDay = latestDay ? addDays(latestDay, -6) : ''
+  const weeklyPnlRows = latestDay ? pnl.filter((r) => r.day >= weeklyStartDay && r.day <= latestDay) : []
+  const weeklyTrades = latestDay
+    ? trades.filter((t) => {
+        const closeDay = toKstDay(t.ts_close)
+        return !!closeDay && closeDay >= weeklyStartDay && closeDay <= latestDay
+      })
+    : []
+
+  const weeklyPnl = sum(weeklyPnlRows.map((r) => r.realized_pnl))
+  const wins = weeklyTrades.filter((t) => t.realized_pnl > 1.0).length
+  const losses = weeklyTrades.filter((t) => t.realized_pnl < -1.0).length
+  const winRate = weeklyTrades.length ? (wins / weeklyTrades.length) * 100 : 0
 
   return (
     <div className="page">
@@ -103,6 +133,9 @@ export function WeeklyReviewPage() {
                 {wins}/{losses}
               </div>
             </div>
+          </div>
+          <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>
+            집계 구간: <span className="mono">{weeklyStartDay && latestDay ? `${weeklyStartDay} ~ ${latestDay}` : '-'}</span>
           </div>
           {latestPriority ? (
             <div style={{ marginTop: 12 }} className="muted">
@@ -186,7 +219,7 @@ export function WeeklyReviewPage() {
         <div className="card">
           <div className="cardTitle">
             <h2>실현 거래</h2>
-            <span className="pill">{trades.length}건</span>
+            <span className="pill">{weeklyTrades.length}건</span>
           </div>
           <table className="table">
             <thead>
@@ -199,7 +232,7 @@ export function WeeklyReviewPage() {
               </tr>
             </thead>
             <tbody>
-              {trades.map((t) => (
+              {weeklyTrades.map((t) => (
                 <tr key={t.trade_id}>
                   <td className="mono">{t.symbol}</td>
                   <td className="mono">{fmtTsKst(t.ts_close)}</td>
