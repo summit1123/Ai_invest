@@ -4,6 +4,8 @@ import hashlib
 import json
 import math
 import os
+import queue
+import threading
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -91,6 +93,47 @@ def _as_int(value: Any, *, default: int) -> int:
 TIME_HORIZON_VALUES = {"intraday", "1d", "swing"}
 
 
+def _run_with_timeout(
+    *,
+    fn: Callable[[], Any],
+    timeout_sec: int | None,
+    label: str,
+) -> Any:
+    """Run callable with soft timeout.
+
+    On timeout, raise TimeoutError so caller can fail-closed/fallback.
+    Worker thread is daemonized to avoid blocking scheduler loop.
+    """
+
+    if timeout_sec is None or int(timeout_sec) <= 0:
+        return fn()
+
+    q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _target() -> None:
+        try:
+            out = fn()
+            try:
+                q.put_nowait((True, out))
+            except Exception:
+                return
+        except BaseException as exc:  # noqa: BLE001
+            try:
+                q.put_nowait((False, exc))
+            except Exception:
+                return
+
+    t = threading.Thread(target=_target, name=f"gov-timeout-{label}", daemon=True)
+    t.start()
+    try:
+        ok, payload = q.get(timeout=float(timeout_sec))
+    except queue.Empty as exc:
+        raise TimeoutError(f"{label} timeout after {int(timeout_sec)}s") from exc
+    if ok:
+        return payload
+    raise payload
+
+
 def _normalize_time_horizon(value: Any, *, default: str = "1d") -> str:
     v = str(value or "").strip().lower()
     if v in TIME_HORIZON_VALUES:
@@ -126,9 +169,20 @@ def _infer_time_horizon(*, fact_pack: Mapping[str, Any], symbol: str | None = No
     vol_z = _as_float(features.get("vol_zscore"), default=0.0)
 
     learning = (fact_pack.get("learning_context") or {}) if isinstance(fact_pack.get("learning_context"), Mapping) else {}
+    outcome_windows = (learning.get("outcome_windows") or {}) if isinstance(learning.get("outcome_windows"), Mapping) else {}
     outcomes = (learning.get("recent_outcomes") or {}) if isinstance(learning.get("recent_outcomes"), Mapping) else {}
-    total_trades = max(0, int(_as_float(outcomes.get("total_trades"), default=0.0)))
-    top_errors = [x for x in list(outcomes.get("top_error_types") or []) if isinstance(x, Mapping)]
+    short_outcomes = (
+        (outcome_windows.get("short") or {})
+        if isinstance(outcome_windows.get("short"), Mapping)
+        else outcomes
+    )
+    execution_outcomes = (
+        (outcome_windows.get("execution") or {})
+        if isinstance(outcome_windows.get("execution"), Mapping)
+        else outcomes
+    )
+    total_trades = max(0, int(_as_float(short_outcomes.get("total_trades"), default=_as_float(outcomes.get("total_trades"), default=0.0))))
+    top_errors = [x for x in list(short_outcomes.get("top_error_types") or []) if isinstance(x, Mapping)]
     cost_error_count = 0
     for row_err in top_errors:
         err = str(row_err.get("error_type") or "").strip().upper()
@@ -136,12 +190,18 @@ def _infer_time_horizon(*, fact_pack: Mapping[str, Any], symbol: str | None = No
             cost_error_count = max(0, int(_as_float(row_err.get("count"), default=0.0)))
             break
     cost_error_ratio = (float(cost_error_count) / float(total_trades)) if total_trades > 0 else 0.0
+    execution_win_rate = float(_as_float(execution_outcomes.get("win_rate_pct"), default=_as_float(outcomes.get("win_rate_pct"), default=0.0)))
 
     # Cost pain -> prefer slower horizon when microstructure is acceptable.
     if total_trades >= 12 and cost_error_ratio >= 0.30:
         if atr_pct <= 1.8 and spread_bps <= 6.0:
             return "swing"
         return "1d"
+
+    # 최근 실행창 성과가 약하고 변동성이 높지 않으면 빈도 낮춘다.
+    if int(_as_float(execution_outcomes.get("total_trades"), default=0.0)) >= 4 and execution_win_rate < 40.0:
+        if atr_pct <= 1.8 and spread_bps <= 6.5:
+            return "1d"
 
     # Very noisy tape -> shorter horizon.
     if atr_pct >= 2.4 or spread_bps >= 12.0:
@@ -882,6 +942,17 @@ def _contains_no_trade_language(text: str) -> bool:
     return any(n in src for n in needles)
 
 
+def _final_plan_declares_no_trade(*, final_plan: FinalTradePlan) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    if float(_as_float(final_plan.target_position_pct, default=0.0)) <= 0.0:
+        reasons.append("target_position_pct<=0")
+    if not bool(final_plan.allowed_actions.buy):
+        reasons.append("allowed_actions.buy=false")
+    if _contains_no_trade_language(str(final_plan.notes or "")):
+        reasons.append("notes_no_trade_language")
+    return bool(reasons), reasons
+
+
 def _build_plan_consistency_checks(
     *,
     hard_plan_block: bool,
@@ -893,6 +964,8 @@ def _build_plan_consistency_checks(
     allowed_actions: Mapping[str, Any],
     target_position_pct: float,
     notes: str,
+    no_trade_declared: bool = False,
+    no_trade_reasons: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     buy_allowed = bool((allowed_actions or {}).get("buy"))
     sell_allowed = bool((allowed_actions or {}).get("sell"))
@@ -934,6 +1007,19 @@ def _build_plan_consistency_checks(
             },
             "required": {"buy": False, "target_position_pct": 0.0} if notes_indicate_no_trade else None,
         },
+        {
+            "name": "final_no_trade_must_not_be_promoted",
+            "passed": not (bool(no_trade_declared) and bool(paper_data_collection_applied) and (buy_allowed or target_pct > 0.0)),
+            "actual": {
+                "final_no_trade_declared": bool(no_trade_declared),
+                "paper_data_collection_applied": bool(paper_data_collection_applied),
+                "buy": bool(buy_allowed),
+                "target_position_pct": float(target_pct),
+            },
+            "required": {"buy": False, "target_position_pct": 0.0}
+            if bool(no_trade_declared)
+            else None,
+        },
     ]
 
     failed = [str(c.get("name") or "") for c in checks if not bool(c.get("passed"))]
@@ -947,6 +1033,8 @@ def _build_plan_consistency_checks(
         "soft_plan_block_reasons": [str(x) for x in list(soft_plan_block_reasons or []) if str(x).strip()],
         "activation_decision_effective": str(activation_decision_effective or ""),
         "paper_data_collection_applied": bool(paper_data_collection_applied),
+        "final_no_trade_declared": bool(no_trade_declared),
+        "final_no_trade_reasons": [str(x) for x in list(no_trade_reasons or []) if str(x).strip()],
         "resolved_execution": {
             "buy": bool(buy_allowed),
             "sell": bool(sell_allowed),
@@ -1127,7 +1215,11 @@ def _build_execution_plan(
 
     capital_cap = _as_float(capital_profile.get("max_target_position_pct"), default=100.0)
     hard_cap = min(float(capital_cap), float(rules.risk.max_position_pct_per_symbol), float(risk_max_position_pct))
-    chosen_target = min(float(tgt_hi), float(hard_cap))
+    # Keep execution target anchored to the resolved plan target.
+    # (The range is for policy bounds, not for implicit +30% promotion.)
+    base_target = _as_float(final_plan.target_position_pct, default=float(tgt_hi))
+    base_target = min(max(float(base_target), float(tgt_lo)), float(tgt_hi))
+    chosen_target = min(float(base_target), float(hard_cap))
     chosen_target = max(0.0, float(chosen_target))
     if chosen_target < float(tgt_lo) and float(tgt_lo) <= float(hard_cap):
         chosen_target = float(tgt_lo)
@@ -1900,6 +1992,41 @@ def _llm_enabled_for(route: LLMRoute | None) -> bool:
     return bool(os.environ.get("OPENAI_API_KEY", "").strip())
 
 
+def _governance_llm_call_timeout_sec(
+    *,
+    rules_raw: Mapping[str, Any],
+    route: LLMRoute | None,
+) -> int | None:
+    gov_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    env_raw = str(os.environ.get("GOVERNANCE_LLM_CALL_TIMEOUT_SEC", "")).strip()
+    env_timeout = _as_int(env_raw, default=0) if env_raw else 0
+    cfg_timeout = _as_int(gov_cfg.get("llm_call_timeout_sec"), default=45)
+    hard_cap = env_timeout if env_timeout > 0 else cfg_timeout
+    if hard_cap <= 0:
+        hard_cap = 45
+
+    route_timeout = None
+    if route is not None and route.timeout_sec is not None:
+        route_timeout = max(1, int(route.timeout_sec))
+
+    if route_timeout is None:
+        return int(hard_cap)
+    return int(min(route_timeout, hard_cap))
+
+
+def _governance_protocol_timeout_sec(*, rules_raw: Mapping[str, Any]) -> int | None:
+    gov_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    env_raw = str(os.environ.get("GOVERNANCE_PROTOCOL_TIMEOUT_SEC", "")).strip()
+    if env_raw:
+        env_v = _as_int(env_raw, default=0)
+        if env_v > 0:
+            return int(env_v)
+    cfg_v = _as_int(gov_cfg.get("protocol_timeout_sec"), default=300)
+    if cfg_v <= 0:
+        cfg_v = 300
+    return int(cfg_v)
+
+
 def _agents_sdk_available() -> bool:
     try:
         import agents  # noqa: F401
@@ -1929,6 +2056,7 @@ def _run_agent_typed(
     output_type: type[BaseModel],
     input_payload: Mapping[str, Any],
     route: LLMRoute,
+    timeout_sec: int | None,
     strict_json_schema: bool = True,
 ) -> tuple[BaseModel, AgentRunMeta]:
     from agents import Agent, AgentOutputSchema, Runner
@@ -1944,7 +2072,11 @@ def _run_agent_typed(
 
     text_in = "입력(Fact Pack) JSON:\n" + _safe_json(dict(input_payload))
     try:
-        res = Runner.run_sync(agent, text_in, max_turns=4)
+        res = _run_with_timeout(
+            fn=lambda: Runner.run_sync(agent, text_in, max_turns=4),
+            timeout_sec=timeout_sec,
+            label=f"{name}_typed",
+        )
         out = res.final_output_as(output_type, raise_if_incorrect_type=True)
         return out, AgentRunMeta(used_llm=True, model=str(route.model), response_id=res.last_response_id, error=None)
     except Exception as exc:
@@ -1957,6 +2089,7 @@ def _run_agent_text(
     instructions: str,
     input_payload: Mapping[str, Any],
     route: LLMRoute,
+    timeout_sec: int | None,
 ) -> tuple[str, AgentRunMeta]:
     from agents import Agent, Runner
 
@@ -1968,7 +2101,11 @@ def _run_agent_text(
     )
     text_in = "입력(JSON):\n" + _safe_json(dict(input_payload))
     try:
-        res = Runner.run_sync(agent, text_in, max_turns=3)
+        res = _run_with_timeout(
+            fn=lambda: Runner.run_sync(agent, text_in, max_turns=3),
+            timeout_sec=timeout_sec,
+            label=f"{name}_text",
+        )
         out = str(res.final_output or "").strip()
         if not out:
             raise RuntimeError("empty output")
@@ -2240,19 +2377,43 @@ def run_governance_protocol(
         if isinstance(learning_ctx.get("recent_outcomes"), Mapping)
         else {}
     )
+    outcome_windows = (
+        (learning_ctx.get("outcome_windows") or {})
+        if isinstance(learning_ctx.get("outcome_windows"), Mapping)
+        else {}
+    )
+    execution_outcomes = (
+        (outcome_windows.get("execution") or {})
+        if isinstance(outcome_windows.get("execution"), Mapping)
+        else recent_outcomes
+    )
+    short_outcomes = (
+        (outcome_windows.get("short") or {})
+        if isinstance(outcome_windows.get("short"), Mapping)
+        else recent_outcomes
+    )
     latest_priority = (
         (learning_ctx.get("latest_weekly_priority") or {})
         if isinstance(learning_ctx.get("latest_weekly_priority"), Mapping)
         else {}
     )
+    meeting_lessons = [x for x in list(learning_ctx.get("recent_meeting_lessons") or []) if isinstance(x, Mapping)]
+    latest_meeting_lesson = meeting_lessons[0] if meeting_lessons else {}
+    latest_meeting_summary = _clip(str((latest_meeting_lesson or {}).get("summary") or "").strip(), 220)
     recent_trades = int(_as_float(recent_outcomes.get("total_trades"), default=0.0))
     recent_win_rate = float(_as_float(recent_outcomes.get("win_rate_pct"), default=0.0))
-    top_error_items = [x for x in list(recent_outcomes.get("top_error_types") or []) if isinstance(x, Mapping)]
+    execution_trades = int(_as_float(execution_outcomes.get("total_trades"), default=0.0))
+    execution_win_rate = float(_as_float(execution_outcomes.get("win_rate_pct"), default=0.0))
+    short_trades = int(_as_float(short_outcomes.get("total_trades"), default=0.0))
+    short_win_rate = float(_as_float(short_outcomes.get("win_rate_pct"), default=0.0))
+    top_error_items = [x for x in list(short_outcomes.get("top_error_types") or []) if isinstance(x, Mapping)]
     top_error_txt = ", ".join(
         f"{str(x.get('error_type') or '').strip()}:{int(_as_float(x.get('count'), default=0.0))}"
         for x in top_error_items[:3]
         if str(x.get("error_type") or "").strip()
     )
+    execution_window_label = str(execution_outcomes.get("window_label") or "execution")
+    short_window_label = str(short_outcomes.get("window_label") or "short")
 
     # Research deterministic
     headlines = (fact_pack.get("research_brief") or {}).get("headlines") if isinstance(fact_pack.get("research_brief"), Mapping) else None
@@ -2277,12 +2438,18 @@ def run_governance_protocol(
         det_risks.append("시스템 PAUSE 상태(실행 차단 가능)")
     if recon_status == "FAIL":
         det_risks.append("정합성 FAIL(운영 리스크)")
-    if recent_trades >= 5:
+    if short_trades >= 5:
         det_risks.append(
-            f"최근 {int(recent_outcomes.get('window_days') or 3)}일 성과: trades={recent_trades}, win_rate={recent_win_rate:.1f}%"
+            f"학습요약(단기 {short_window_label}): trades={short_trades}, win_rate={short_win_rate:.1f}%"
         )
         if top_error_txt:
-            det_risks.append(f"최근 반복 에러유형: {top_error_txt}")
+            det_risks.append(f"반복 실패유형(단기): {top_error_txt}")
+    if execution_trades >= 3:
+        det_risks.append(
+            f"최근 실행창({execution_window_label}) 성과: trades={execution_trades}, win_rate={execution_win_rate:.1f}%"
+        )
+    if latest_meeting_summary:
+        det_risks.append(f"최근 회의 교훈: {latest_meeting_summary}")
     if not det_risks:
         det_risks.append("특이 운영 리스크 없음(기계적 체크 기준)")
     det_research = ResearchGovOutput(
@@ -2323,6 +2490,7 @@ def run_governance_protocol(
         notes=(
             "deterministic 초안: 점수 상위 심볼을 기본 비중으로 채택 "
             f"(capital_tier={cap_tier}, recent_win_rate={recent_win_rate:.1f}%, top_errors={top_error_txt or '없음'})"
+            + (f", latest_meeting_lesson={latest_meeting_summary}" if latest_meeting_summary else "")
         ),
     )
 
@@ -2484,6 +2652,12 @@ def run_governance_protocol(
     ops_route = _route("governance_ops_manager")
     coord_route = _route("governance_coordinator")
     sec_route = _route("governance_secretary")
+    research_timeout = _governance_llm_call_timeout_sec(rules_raw=rules_raw, route=research_route)
+    quant_timeout = _governance_llm_call_timeout_sec(rules_raw=rules_raw, route=quant_route)
+    risk_timeout = _governance_llm_call_timeout_sec(rules_raw=rules_raw, route=risk_route)
+    ops_timeout = _governance_llm_call_timeout_sec(rules_raw=rules_raw, route=ops_route)
+    coord_timeout = _governance_llm_call_timeout_sec(rules_raw=rules_raw, route=coord_route)
+    sec_timeout = _governance_llm_call_timeout_sec(rules_raw=rules_raw, route=sec_route)
 
     def _ensure_symbol(sym: str) -> str:
         sym2 = str(sym or "").strip()
@@ -2498,6 +2672,7 @@ def run_governance_protocol(
             output_type=ResearchGovOutput,
             input_payload=fact_pack,
             route=research_route,
+            timeout_sec=research_timeout,
         )
         llm_meta["research_agent"] = m_research
     except Exception as exc:
@@ -2512,6 +2687,7 @@ def run_governance_protocol(
             output_type=QuantPlanDraft,
             input_payload=fact_pack,
             route=quant_route,
+            timeout_sec=quant_timeout,
         )
         r1_quant = r1_quant.model_copy(update={"symbol": _ensure_symbol(r1_quant.symbol)})
         llm_meta["quant_strategist"] = m_quant
@@ -2527,6 +2703,7 @@ def run_governance_protocol(
             output_type=RiskDraft,
             input_payload=fact_pack,
             route=risk_route,
+            timeout_sec=risk_timeout,
             strict_json_schema=False,
         )
         llm_meta["risk_manager"] = m_risk
@@ -2542,6 +2719,7 @@ def run_governance_protocol(
             output_type=OpsDraft,
             input_payload=fact_pack,
             route=ops_route,
+            timeout_sec=ops_timeout,
         )
         llm_meta["ops_manager"] = m_ops
     except Exception as exc:
@@ -2572,6 +2750,7 @@ def run_governance_protocol(
                 output_type=CritiqueOutput,
                 input_payload=critique_input,
                 route=route,
+                timeout_sec=_governance_llm_call_timeout_sec(rules_raw=rules_raw, route=route),
             )
             critiques[agent_key] = c
             llm_meta[f"{agent_key}_critique"] = mc
@@ -2592,6 +2771,7 @@ def run_governance_protocol(
             output_type=FinalTradePlan,
             input_payload=final_input,
             route=coord_route,
+            timeout_sec=coord_timeout,
             strict_json_schema=False,
         )
         final_plan = final_plan.model_copy(update={"symbol": _ensure_symbol(final_plan.symbol)})
@@ -2640,6 +2820,7 @@ def run_governance_protocol(
             instructions=governance_secretary_instructions(),
             input_payload=secretary_input,
             route=sec_route,
+            timeout_sec=sec_timeout,
         )
         llm_meta["secretary_agent"] = m_minutes
     except Exception as exc:
@@ -2775,15 +2956,25 @@ def _as_kst_dt(value: Any) -> datetime | None:
     return None
 
 
-def _summarize_recent_outcomes(*, repo: PostgresRepo, now_kst: datetime, days: int = 3) -> dict[str, Any]:
-    since = now_kst - timedelta(days=max(1, int(days)))
-    rows = repo.fetch_decision_outcomes(limit=1200)
+def _summarize_recent_outcomes(
+    *,
+    repo: PostgresRepo,
+    now_kst: datetime,
+    days: int = 3,
+    hours: int | None = None,
+    rows: Sequence[Mapping[str, Any]] | None = None,
+    window_name: str | None = None,
+) -> dict[str, Any]:
+    window_hours = int(max(1, int(hours))) if hours is not None else None
+    window_days = int(max(1, int(days))) if hours is None else None
+    since = now_kst - (timedelta(hours=window_hours) if window_hours is not None else timedelta(days=window_days or 3))
+    source_rows = [r for r in list(rows or []) if isinstance(r, Mapping)] if rows is not None else repo.fetch_decision_outcomes(limit=1200)
     total = 0
     labels: dict[str, int] = {}
     errors: dict[str, int] = {}
-    for r in rows:
-        close_kst = _as_kst_dt(r.get("ts_close"))
-        if close_kst is not None and close_kst < since:
+    for r in source_rows:
+        close_kst = _as_kst_dt(r.get("ts_close")) or _as_kst_dt(r.get("reviewed_at"))
+        if close_kst is None or close_kst < since:
             continue
         total += 1
         lb = str(r.get("outcome_label") or "").strip().upper() or "UNKNOWN"
@@ -2795,13 +2986,167 @@ def _summarize_recent_outcomes(*, repo: PostgresRepo, now_kst: datetime, days: i
     win = int(labels.get("WIN") or 0)
     win_rate = (float(win) / float(total) * 100.0) if total > 0 else 0.0
     top_errors = sorted(errors.items(), key=lambda x: x[1], reverse=True)[:5]
+    label = str(window_name or ("execution" if window_hours is not None else "short")).strip().lower()
+    window_label = f"{window_hours}h" if window_hours is not None else f"{window_days}d"
     return {
-        "window_days": int(max(1, int(days))),
+        "window_name": str(label),
+        "window_label": str(window_label),
+        "window_days": int(window_days or 0),
+        "window_hours": int(window_hours or 0),
         "total_trades": int(total),
         "win_rate_pct": float(round(win_rate, 2)),
         "labels": {k: int(v) for k, v in labels.items()},
         "top_error_types": [{"error_type": str(k), "count": int(v)} for k, v in top_errors],
         "loss_count": int(loss),
+    }
+
+
+def _meeting_summary_text(summary: Any) -> str:
+    if isinstance(summary, str):
+        return str(summary).strip()
+    if isinstance(summary, Mapping):
+        for key in ("assistant_minutes", "summary", "text", "notes"):
+            value = summary.get(key)
+            text = str(value or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _build_recent_meeting_lessons(
+    *,
+    repo: PostgresRepo,
+    now_kst: datetime,
+    lookback_days: int,
+    max_sessions: int,
+    summary_max_chars: int,
+) -> list[dict[str, Any]]:
+    since = now_kst - timedelta(days=max(1, int(lookback_days)))
+    rows = repo.fetch_meeting_sessions(limit=max(30, int(max_sessions) * 8))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if len(out) >= int(max_sessions):
+            break
+        if str(row.get("meeting_type") or "").upper() != "DAILY_STRATEGY":
+            continue
+        status = str(row.get("status") or "").upper()
+        if status == "OPEN":
+            continue
+        ended_kst = _as_kst_dt(row.get("ended_at")) or _as_kst_dt(row.get("started_at"))
+        if ended_kst is None or ended_kst < since:
+            continue
+        summary_text = _clip(_meeting_summary_text(row.get("summary")), int(summary_max_chars))
+        if not summary_text:
+            continue
+        decisions = row.get("decisions") if isinstance(row.get("decisions"), Mapping) else {}
+        final_plan = decisions.get("final_plan") if isinstance(decisions.get("final_plan"), Mapping) else {}
+        symbol = str((final_plan or {}).get("symbol") or "").strip()
+        target_pct = _as_float((final_plan or {}).get("target_position_pct"), default=0.0)
+        activation_status = str((decisions or {}).get("activation_status") or "").strip()
+        out.append(
+            {
+                "meeting_id": str(row.get("meeting_id") or ""),
+                "slot_key": str((decisions or {}).get("slot_key") or "").strip(),
+                "ended_at_kst": ended_kst.isoformat(),
+                "symbol": symbol,
+                "target_position_pct": float(target_pct),
+                "activation_status": activation_status,
+                "summary": summary_text,
+            }
+        )
+    return out
+
+
+def _build_learning_context(*, repo: PostgresRepo, now_kst: datetime, rules_raw: Mapping[str, Any]) -> dict[str, Any]:
+    governance_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    learning_cfg = (governance_cfg.get("learning_context") or {}) if isinstance(governance_cfg, Mapping) else {}
+    windows_cfg = (learning_cfg.get("outcome_windows") or {}) if isinstance(learning_cfg, Mapping) else {}
+    meeting_cfg = (learning_cfg.get("meeting_memory") or {}) if isinstance(learning_cfg, Mapping) else {}
+    execution_hours = int(_as_float(windows_cfg.get("execution_hours"), default=6.0))
+    short_days = int(_as_float(windows_cfg.get("short_days"), default=14.0))
+    medium_days = int(_as_float(windows_cfg.get("medium_days"), default=90.0))
+    anchor_days = int(_as_float(windows_cfg.get("anchor_days"), default=270.0))
+    max_rows = int(_as_float(learning_cfg.get("max_outcome_rows"), default=6000.0))
+    min_recent_trades = int(_as_float(learning_cfg.get("recent_window_fallback_min_trades"), default=5.0))
+    meeting_memory_enabled = bool(meeting_cfg.get("enabled", True))
+    meeting_lookback_days = int(_as_float(meeting_cfg.get("lookback_days"), default=14.0))
+    meeting_max_sessions = int(_as_float(meeting_cfg.get("max_sessions"), default=6.0))
+    meeting_summary_max_chars = int(_as_float(meeting_cfg.get("summary_max_chars"), default=280.0))
+
+    execution_hours = max(1, execution_hours)
+    short_days = max(3, short_days)
+    medium_days = max(short_days, medium_days)
+    anchor_days = max(medium_days, anchor_days)
+    max_rows = max(500, max_rows)
+    min_recent_trades = max(1, min_recent_trades)
+    meeting_lookback_days = max(1, meeting_lookback_days)
+    meeting_max_sessions = max(1, meeting_max_sessions)
+    meeting_summary_max_chars = max(120, meeting_summary_max_chars)
+
+    rows = repo.fetch_decision_outcomes(limit=max_rows)
+    outcome_windows = {
+        "execution": _summarize_recent_outcomes(
+            repo=repo,
+            now_kst=now_kst,
+            hours=execution_hours,
+            rows=rows,
+            window_name="execution",
+        ),
+        "short": _summarize_recent_outcomes(
+            repo=repo,
+            now_kst=now_kst,
+            days=short_days,
+            rows=rows,
+            window_name="short",
+        ),
+        "medium": _summarize_recent_outcomes(
+            repo=repo,
+            now_kst=now_kst,
+            days=medium_days,
+            rows=rows,
+            window_name="medium",
+        ),
+        "anchor": _summarize_recent_outcomes(
+            repo=repo,
+            now_kst=now_kst,
+            days=anchor_days,
+            rows=rows,
+            window_name="anchor",
+        ),
+    }
+    execution_outcomes = outcome_windows["execution"]
+    short_outcomes = outcome_windows["short"]
+    recent_outcomes = execution_outcomes if int(execution_outcomes.get("total_trades") or 0) >= min_recent_trades else short_outcomes
+    recent_meeting_lessons = (
+        _build_recent_meeting_lessons(
+            repo=repo,
+            now_kst=now_kst,
+            lookback_days=meeting_lookback_days,
+            max_sessions=meeting_max_sessions,
+            summary_max_chars=meeting_summary_max_chars,
+        )
+        if meeting_memory_enabled
+        else []
+    )
+    return {
+        "recent_outcomes": dict(recent_outcomes),
+        "outcome_windows": {k: dict(v) for k, v in outcome_windows.items()},
+        "recent_meeting_lessons": list(recent_meeting_lessons),
+        "latest_weekly_priority": _latest_weekly_priority_snapshot(repo=repo),
+        "settings": {
+            "execution_hours": int(execution_hours),
+            "short_days": int(short_days),
+            "medium_days": int(medium_days),
+            "anchor_days": int(anchor_days),
+            "max_outcome_rows": int(max_rows),
+            "recent_window_fallback_min_trades": int(min_recent_trades),
+            "meeting_memory": {
+                "enabled": bool(meeting_memory_enabled),
+                "lookback_days": int(meeting_lookback_days),
+                "max_sessions": int(meeting_max_sessions),
+                "summary_max_chars": int(meeting_summary_max_chars),
+            },
+        },
     }
 
 
@@ -2827,12 +3172,17 @@ def _close_or_skip_open_meeting(
     repo: PostgresRepo,
     rules_raw: Mapping[str, Any],
     emit: Callable[[str, Mapping[str, Any]], None] | None,
+    incoming_slot_key: str | None = None,
 ) -> bool:
     """Return True when a currently running meeting should block a new one."""
 
     governance_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
-    stale_min = int(governance_cfg.get("max_open_meeting_minutes") or 45)
+    window_min = int(_as_float(governance_cfg.get("meeting_window_min"), default=5.0))
+    default_stale_min = max(10, window_min * 3)
+    stale_min = int(_as_float(governance_cfg.get("max_open_meeting_minutes"), default=float(default_stale_min)))
     now_kst = _now_kst()
+    incoming_slot_key_norm = str(incoming_slot_key or "").strip()
+    incoming_slot_dt = _slot_dt_from_key_kst(incoming_slot_key_norm) if incoming_slot_key_norm else None
 
     sessions = repo.fetch_meeting_sessions(limit=30)
     for s in sessions:
@@ -2845,6 +3195,64 @@ def _close_or_skip_open_meeting(
         age_min = None
         if started_kst is not None:
             age_min = max(0.0, (now_kst - started_kst).total_seconds() / 60.0)
+        agenda = s.get("agenda")
+        agenda_map = agenda if isinstance(agenda, Mapping) else {}
+        session_slot_key = str(agenda_map.get("slot_key") or "").strip()
+        session_slot_dt = _slot_dt_from_key_kst(session_slot_key) if session_slot_key else None
+
+        # 이전 슬롯의 orphan OPEN 회의는 짧은 유예 후 자동 종료해 정시 슬롯을 우선한다.
+        superseded_slot = False
+        if incoming_slot_key_norm and session_slot_key and incoming_slot_key_norm != session_slot_key:
+            if incoming_slot_dt is not None and session_slot_dt is not None:
+                superseded_slot = session_slot_dt < incoming_slot_dt
+            else:
+                superseded_slot = True
+        if superseded_slot and age_min is not None and age_min >= float(window_min):
+            ended_at = _utcnow()
+            repo.update_meeting_session(
+                meeting_id=mid,
+                status="CLOSED",
+                ended_at=ended_at,
+                summary=_clip(f"자동 종료: 이전 슬롯 OPEN 회의 정리({age_min:.1f}분)", 900),
+                decisions={
+                    "error": "MEETING_SUPERSEDED_BY_NEW_SLOT",
+                    "auto_closed": True,
+                    "age_min": age_min,
+                    "open_slot_key": session_slot_key,
+                    "incoming_slot_key": incoming_slot_key_norm,
+                },
+                action_items={"items": []},
+            )
+            repo.insert_event(
+                DbEvent(
+                    event_id=uuid.uuid4(),
+                    ts=ended_at,
+                    event_type="MEETING_AUTO_CLOSED",
+                    entity_type="meeting_sessions",
+                    entity_id=mid,
+                    run_id=None,
+                    rule_version_id=None,
+                    payload={
+                        "meeting_id": mid,
+                        "reason_code": "MEETING_SUPERSEDED_BY_NEW_SLOT",
+                        "age_min": age_min,
+                        "open_slot_key": session_slot_key,
+                        "incoming_slot_key": incoming_slot_key_norm,
+                    },
+                )
+            )
+            if emit is not None:
+                emit(
+                    "run_warning",
+                    {
+                        "meeting_id": mid,
+                        "reason": "superseded_open_auto_closed",
+                        "age_min": age_min,
+                        "open_slot_key": session_slot_key,
+                        "incoming_slot_key": incoming_slot_key_norm,
+                    },
+                )
+            continue
 
         # 오래된 OPEN 회의는 자동 종료해서 다음 슬롯이 막히지 않게 한다.
         if age_min is not None and age_min >= float(stale_min):
@@ -2879,7 +3287,13 @@ def _close_or_skip_open_meeting(
         if emit is not None:
             emit(
                 "run_skipped",
-                {"reason": "another_meeting_open", "meeting_id": mid, "age_min": age_min},
+                {
+                    "reason": "another_meeting_open",
+                    "meeting_id": mid,
+                    "age_min": age_min,
+                    "open_slot_key": session_slot_key,
+                    "incoming_slot_key": incoming_slot_key_norm or None,
+                },
             )
         return True
     return False
@@ -2905,7 +3319,12 @@ def run_governance_meeting_now(
     times = get_meeting_times_kst(rules_raw)
     slot_key = force_slot_key or f"{now_kst.date().isoformat()} LIVE {now_kst.strftime('%H:%M:%S')}"
 
-    if _close_or_skip_open_meeting(repo=repo, rules_raw=rules_raw, emit=emit):
+    if _close_or_skip_open_meeting(
+        repo=repo,
+        rules_raw=rules_raw,
+        emit=emit,
+        incoming_slot_key=slot_key,
+    ):
         return slot_key
 
     # Governance meeting must consume DB prework outputs (no live universe scan here).
@@ -3135,10 +3554,7 @@ def run_governance_meeting_now(
             research_brief=research_brief,
             account_state=account_state,
         )
-        fact_pack["learning_context"] = {
-            "recent_outcomes": _summarize_recent_outcomes(repo=repo, now_kst=now_kst, days=3),
-            "latest_weekly_priority": _latest_weekly_priority_snapshot(repo=repo),
-        }
+        fact_pack["learning_context"] = _build_learning_context(repo=repo, now_kst=now_kst, rules_raw=rules_raw)
         fact_pack["prework_reports"] = dict((prework or {}).get("reports") or {})
         fact_pack["prework_status"] = {
             "require_prework_reports": bool(require_prework_reports),
@@ -3206,7 +3622,13 @@ def run_governance_meeting_now(
             )
 
         # Protocol run (LLM or fallback). Messages are persisted/streamed via `on_step`.
-        outputs = run_governance_protocol(fact_pack=fact_pack, rules_raw=rules_raw, on_step=on_step)
+        # Guard total runtime so a single blocked LLM call does not freeze the scheduler loop.
+        protocol_timeout_sec = _governance_protocol_timeout_sec(rules_raw=rules_raw)
+        outputs = _run_with_timeout(
+            fn=lambda: run_governance_protocol(fact_pack=fact_pack, rules_raw=rules_raw, on_step=on_step),
+            timeout_sec=protocol_timeout_sec,
+            label="governance_protocol",
+        )
 
         ended_at = _utcnow()
         activation_gate = evaluate_policy_activation_gate(
@@ -3246,6 +3668,9 @@ def run_governance_meeting_now(
         if is_paper_mode and allow_soft_plan_block_bypass:
             soft_plan_block = False
         plan_execution_blocked = bool(hard_plan_block or soft_plan_block)
+        final_plan_no_trade, final_plan_no_trade_reasons = _final_plan_declares_no_trade(
+            final_plan=outputs.final_plan
+        )
         activation_decision = _activation_decision_from_gate(
             activation_gate=activation_gate,
             hard_plan_block=hard_plan_block,
@@ -3285,10 +3710,19 @@ def run_governance_meeting_now(
         activation_gate["hold_mode"] = str(hold_mode)
         activation_gate["conditional_activation"] = dict(conditional_activation_cfg)
         activation_gate["cap_runtime"] = dict(cap_runtime_seed)
-        paper_data_collection_applied = bool(paper_data_collection_candidate)
+        if final_plan_no_trade:
+            activation_gate["final_plan_no_trade_declared"] = True
+            activation_gate["final_plan_no_trade_reasons"] = list(final_plan_no_trade_reasons)
+        paper_data_collection_applied = bool(paper_data_collection_candidate and (not final_plan_no_trade))
+        if bool(paper_data_collection_candidate) and final_plan_no_trade:
+            activation_gate["paper_data_collection_suppressed"] = True
+            activation_gate["paper_data_collection_suppressed_reason"] = "FINAL_PLAN_NO_TRADE"
 
         resolved_allowed_actions = outputs.final_plan.allowed_actions.model_dump()
         resolved_target_position_pct = float(outputs.final_plan.target_position_pct)
+        if final_plan_no_trade:
+            resolved_allowed_actions["buy"] = False
+            resolved_target_position_pct = 0.0
         if paper_data_collection_applied:
             resolved_allowed_actions["buy"] = bool(force_plan_buy_allowed)
             # 데이터 수집 모드에서는 리스크 감축(SELL) 경로를 항상 열어 둔다.
@@ -3433,6 +3867,8 @@ def run_governance_meeting_now(
             allowed_actions=resolved_allowed_actions,
             target_position_pct=float(resolved_target_position_pct),
             notes=str(plan_notes),
+            no_trade_declared=bool(final_plan_no_trade),
+            no_trade_reasons=list(final_plan_no_trade_reasons),
         )
         resolved_final_plan = outputs.final_plan.model_copy(
             update={
