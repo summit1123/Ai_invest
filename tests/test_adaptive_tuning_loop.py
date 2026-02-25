@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -52,6 +53,7 @@ class AdaptiveTuningLoopTests(unittest.TestCase):
         cfg = {
             "max_step_pct": 10.0,
             "target_trades_in_execution_window": 3,
+            "preserve_exploration_on_low_activity": False,
             "whitelist_paths": [
                 "strategy.alpha_score.entry_alpha",
                 "strategy.alpha_score.cooldown_minutes",
@@ -105,6 +107,71 @@ class AdaptiveTuningLoopTests(unittest.TestCase):
         )
         self.assertTrue(bool(out_dd["should_rollback"]))
         self.assertTrue(bool(out_dd["drawdown_degraded"]))
+
+    def test_build_tuning_patch_does_not_tighten_when_activity_low(self) -> None:
+        mod = _load_module()
+        rules_raw = {
+            "strategy": {"alpha_score": {"entry_alpha": 0.62, "cooldown_minutes": 120}},
+            "governance": {
+                "micro_mode": {"min_alpha": 0.72, "max_spread_bps": 1.5},
+                "plan_continuity": {"min_hold_minutes": 120},
+            },
+        }
+        cfg = {
+            "max_step_pct": 10.0,
+            "target_trades_in_execution_window": 6,
+            "preserve_exploration_on_low_activity": True,
+            "whitelist_paths": [
+                "strategy.alpha_score.entry_alpha",
+                "strategy.alpha_score.cooldown_minutes",
+                "governance.micro_mode.min_alpha",
+                "governance.micro_mode.max_spread_bps",
+                "governance.plan_continuity.min_hold_minutes",
+            ],
+        }
+        m = mod.WindowMetrics
+        metrics = {
+            "execution": m(0, 10.0, -1200.0, -1200.0, 3.0, 2000.0, 0.35, 0.4, 4),
+            "short": m(10, 30.0, -500.0, -5000.0, 6.0, 5000.0, 0.25, 0.3, 4),
+            "medium": m(60, 44.0, -120.0, -7200.0, 10.0, 8000.0, 0.2, 0.2, 5),
+            "anchor": m(180, 48.0, -30.0, -5400.0, 14.0, 9000.0, 0.2, 0.2, 6),
+        }
+        patch, _diag = mod._build_tuning_patch(
+            rules_raw=rules_raw,
+            tuning_cfg=cfg,
+            metrics=metrics,
+            regime="SHOCK",
+            composite_score=-1.0,
+        )
+        self.assertLessEqual(float(patch.get("strategy.alpha_score.entry_alpha", 0.62)), 0.62)
+        self.assertLessEqual(float(patch.get("governance.micro_mode.min_alpha", 0.72)), 0.72)
+        self.assertLessEqual(float(patch.get("strategy.alpha_score.cooldown_minutes", 120)), 120)
+        self.assertLessEqual(float(patch.get("governance.plan_continuity.min_hold_minutes", 120)), 120)
+        self.assertGreaterEqual(float(patch.get("governance.micro_mode.max_spread_bps", 1.5)), 1.5)
+
+    def test_should_skip_patch_for_min_interval(self) -> None:
+        mod = _load_module()
+
+        class _Repo:
+            def __init__(self, ts: datetime) -> None:
+                self._ts = ts
+
+            def fetch_latest_event(self, *, event_type: str):  # type: ignore[no-untyped-def]
+                return {
+                    "event_id": "evt-1",
+                    "event_type": event_type,
+                    "ts": self._ts,
+                }
+
+        now = datetime.now(timezone.utc)
+        repo = _Repo(now - timedelta(hours=2))
+        skip, info = mod._should_skip_patch_for_min_interval(
+            repo=repo,
+            tuning_cfg={"min_apply_interval_hours": 6},
+            now=now,
+        )
+        self.assertTrue(skip)
+        self.assertEqual(str(info.get("reason")), "min_apply_interval_not_elapsed")
 
 
 if __name__ == "__main__":
