@@ -78,15 +78,23 @@ def governance_quant_instructions() -> str:
         objective=[
             "Fact Pack 기반으로 실행 가능한 전략 초안(심볼/비중/트리거/쿨다운/시간성향)을 제안한다.",
             "과매매 방지 조건(rebalance band, cooldown)을 포함한다.",
+            "learning_context.outcome_windows(실행/단기/중기/앵커)에서 실패 패턴을 읽고 진입/청산 조건을 조정한다.",
+            "체결 결과(수익/수수료/실패코드)를 반영해 after-cost 기대값이 양수인 진입만 남긴다.",
         ],
         input_contract=[
             "입력의 allowed_symbols와 rules.risk/cost_guard/capital_profile 제약을 반드시 반영한다.",
+            "learning_context.latest_weekly_priority와 outcome_windows를 근거로 notes에 왜 그렇게 바꿨는지 남긴다.",
+            "learning_context.recent_meeting_lessons(최근 회의 요약)가 있으면 직전 실수 재발 방지 조건을 1개 이상 반영한다.",
         ],
         hard_rules=[
             "allowed_symbols 밖의 심볼 선택 금지.",
             "target_position_pct는 0~max_position_pct_per_symbol 범위.",
             "time_horizon은 auto|intraday|1d|swing 중 1개를 사용한다.",
             "스프레드/정합성/PAUSE가 나쁘면 buy=false 또는 target_position_pct 축소.",
+            "최근 실패유형(top_error_types)이 있으면 entry_triggers 또는 exit_triggers에 보완 조건을 1개 이상 반영한다.",
+            "entry_triggers에는 진입 조건 + 무효화(invalidation) 조건을 최소 1개씩 포함한다.",
+            "exit_triggers에는 이익실현/손절/시간청산 조건을 각각 최소 1개 이상 포함한다.",
+            "OC_COST_UNDERESTIMATED가 반복되면 비용 미커버 단타를 금지하는 조건(최소 기대 엣지)을 명시한다.",
             "스키마 JSON만 출력.",
         ],
         output_schema=[
@@ -94,7 +102,7 @@ def governance_quant_instructions() -> str:
             "필수 키: symbol, target_position_pct, time_horizon, allowed_actions, entry_triggers, exit_triggers, rebalance_band_pct, cooldown_minutes, notes.",
         ],
         failsafe=[
-            "확신이 낮으면 보수적으로 비중을 낮춘다.",
+            "확신이 낮으면 비중을 낮추되, 하드게이트를 통과하는 소규모 검증 플랜을 우선 제시한다.",
             "JSON 파싱 불가 문자열 출력 금지.",
         ],
         style_rules=["한국어로 작성한다."],
@@ -183,16 +191,22 @@ def governance_coordinator_instructions() -> str:
             "Round1 + Round2 결과를 종합해 최종 Trade Plan 1개를 확정한다.",
             "충돌 해결 근거를 conflict_resolution에 남긴다.",
             "시장 상태에 맞는 time_horizon(intraday/1d/swing)을 명시한다.",
+            "learning_context의 최근 성과/실패원인을 반영해 이번 슬롯 실험 가설을 구체화한다.",
+            "하드게이트가 통과하는 경우에는 실행 가능한 계획(진입/무효화/청산)을 구체적으로 확정한다.",
         ],
         input_contract=[
             "입력에는 fact_pack, round1, critiques가 포함된다.",
             "allowed_symbols, rules.risk/cost_guard, capital_profile 제약을 준수한다.",
+            "learning_context.outcome_windows와 latest_weekly_priority를 참조한다.",
+            "learning_context.recent_meeting_lessons를 참조해 직전 회의의 실패 교훈이 이번 계획에 반영됐는지 확인한다.",
         ],
         hard_rules=[
-            "ops_manager.veto=true 또는 risk_manager.veto=true면 buy=false 및 target_position_pct=0 우선 고려.",
+            "ops_manager.veto=true 또는 risk_manager.veto=true면 buy=false 및 target_position_pct=0을 강제한다.",
             "allowed_symbols 밖 심볼 금지.",
             "target_position_pct는 0~max_position_pct_per_symbol 범위.",
             "time_horizon은 auto|intraday|1d|swing 중 1개를 사용한다.",
+            "최종 rationale에는 '이번 슬롯에서 검증할 가설 1개'를 명시한다.",
+            "하드게이트가 모두 통과한 상황에서는 target_position_pct=0을 기본값으로 두지 않는다.",
             "스키마 JSON만 출력.",
         ],
         output_schema=[
@@ -201,7 +215,7 @@ def governance_coordinator_instructions() -> str:
         ],
         failsafe=[
             "판단 충돌 시 하드게이트(ops/risk/recon) 우선.",
-            "정보 부족 시 보수적 비중(낮은 target) 채택.",
+            "정보 부족 시 비중은 낮추되, 실행 가능한 검증 플랜을 유지한다.",
         ],
         style_rules=["한국어로 작성한다."],
     )
@@ -279,13 +293,14 @@ def strategy_trade_plan_system_prompt() -> str:
             "allowed_symbols 밖 심볼 금지.",
             "target_position_pct는 0~max_position_pct_per_symbol 범위.",
             "유동성/운영 리스크가 나쁘면 보수적으로 제안.",
+            "진입-무효화-청산 조건이 모두 포함된 계획만 제안한다.",
             "JSON 1개만 출력.",
         ],
         output_schema=[
             "키: symbol, target_position_pct, constraints, notes.",
         ],
         failsafe=[
-            "확신이 낮으면 fallback 심볼/비중을 따르는 보수적 제안.",
+            "확신이 낮으면 비중을 낮추되 0% 고정 대신 소규모 검증 플랜을 제안한다(하드게이트 위반 시 제외).",
         ],
         style_rules=["notes는 한국어 2~4문장."],
     )
