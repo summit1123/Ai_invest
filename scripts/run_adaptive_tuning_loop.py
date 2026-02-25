@@ -373,6 +373,17 @@ def _resolve_bounds(cfg: Mapping[str, Any], *, path: str, default_lo: float, def
     return float(default_lo), float(default_hi)
 
 
+def _is_tightening_path(path: str, *, base: float, proposed: float) -> bool:
+    p = str(path)
+    if p.endswith("entry_alpha") or p.endswith("min_alpha"):
+        return float(proposed) > float(base)
+    if p.endswith("cooldown_minutes") or p.endswith("min_hold_minutes"):
+        return float(proposed) > float(base)
+    if p.endswith("max_spread_bps"):
+        return float(proposed) < float(base)
+    return False
+
+
 def _build_tuning_patch(
     *,
     rules_raw: Mapping[str, Any],
@@ -384,8 +395,10 @@ def _build_tuning_patch(
     max_step_pct = _as_float(tuning_cfg.get("max_step_pct"), default=10.0)
     max_step_pct = _clamp(max_step_pct, 1.0, 25.0)
     target_trades_exec = max(1, _as_int(tuning_cfg.get("target_trades_in_execution_window"), default=3))
+    preserve_exploration_on_low_activity = bool(tuning_cfg.get("preserve_exploration_on_low_activity", True))
     execution_m = metrics.get("execution") or WindowMetrics(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
     activity_gap = _clamp((float(target_trades_exec) - float(execution_m.trades_count)) / float(target_trades_exec), 0.0, 1.0)
+    low_activity = bool(execution_m.trades_count < target_trades_exec)
 
     risk_pressure = _clamp(-float(composite_score), 0.0, 1.0)
     explore_pressure = _clamp(float(composite_score), 0.0, 1.0) * float(activity_gap)
@@ -423,6 +436,15 @@ def _build_tuning_patch(
         "governance.plan_continuity.min_hold_minutes": current.get("governance.plan_continuity.min_hold_minutes", 0.0)
         * (1.0 + 0.10 * risk_pressure - 0.08 * explore_pressure),
     }
+
+    if preserve_exploration_on_low_activity and low_activity:
+        # If trading activity is already below target, do not tighten entry gates further.
+        for path, base in current.items():
+            if path not in candidates:
+                continue
+            proposed = _as_float(candidates.get(path), default=float(base))
+            if _is_tightening_path(path, base=float(base), proposed=float(proposed)):
+                candidates[path] = float(base)
 
     patch: dict[str, Any] = {}
     for path in whitelist:
@@ -464,6 +486,8 @@ def _build_tuning_patch(
         "target_trades_in_execution_window": int(target_trades_exec),
         "execution_trades_count": int(execution_m.trades_count),
         "activity_gap": float(round(activity_gap, 6)),
+        "low_activity": bool(low_activity),
+        "preserve_exploration_on_low_activity": bool(preserve_exploration_on_low_activity),
         "risk_pressure": float(round(risk_pressure, 6)),
         "explore_pressure": float(round(explore_pressure, 6)),
         "regime": str(regime),
@@ -713,6 +737,36 @@ def _maybe_auto_rollback(
     }
 
 
+def _should_skip_patch_for_min_interval(
+    *,
+    repo: PostgresRepo,
+    tuning_cfg: Mapping[str, Any],
+    now: datetime,
+) -> tuple[bool, dict[str, Any]]:
+    min_hours = max(0.0, _as_float(tuning_cfg.get("min_apply_interval_hours"), default=6.0))
+    if min_hours <= 0.0:
+        return False, {"reason": "min_apply_interval_disabled", "min_apply_interval_hours": float(min_hours)}
+    last_apply = repo.fetch_latest_event(event_type="DYNAMIC_RULE_PATCH_APPLIED")
+    if not last_apply:
+        return False, {"reason": "no_prior_patch", "min_apply_interval_hours": float(min_hours)}
+    ts = last_apply.get("ts")
+    if not isinstance(ts, datetime):
+        return False, {"reason": "invalid_last_patch_ts", "min_apply_interval_hours": float(min_hours)}
+    age_hours = max(0.0, (now - ts.astimezone(timezone.utc)).total_seconds() / 3600.0)
+    if age_hours < float(min_hours):
+        return True, {
+            "reason": "min_apply_interval_not_elapsed",
+            "min_apply_interval_hours": float(min_hours),
+            "age_hours": float(round(age_hours, 4)),
+            "last_patch_event_id": str(last_apply.get("event_id") or ""),
+        }
+    return False, {
+        "reason": "min_apply_interval_elapsed",
+        "min_apply_interval_hours": float(min_hours),
+        "age_hours": float(round(age_hours, 4)),
+    }
+
+
 def run_adaptive_tuning_cycle(*, repo: PostgresRepo, rules_path: Path) -> dict[str, Any]:
     now = _utcnow()
     rules_raw = _load_rules_yaml(rules_path)
@@ -731,6 +785,16 @@ def run_adaptive_tuning_cycle(*, repo: PostgresRepo, rules_path: Path) -> dict[s
     )
     if rolled_back:
         return {"status": "reverted", **dict(rollback_info)}
+
+    skip_interval, interval_info = _should_skip_patch_for_min_interval(
+        repo=repo,
+        tuning_cfg=tuning_cfg,
+        now=now,
+    )
+    if skip_interval:
+        payload = {"status": "skipped", **dict(interval_info)}
+        _emit_event(repo, event_type="DYNAMIC_RULE_PATCH_SKIPPED", payload=payload)
+        return payload
 
     metrics = _collect_multi_window_metrics(repo, now=now, cfg=tuning_cfg)
     regime = _determine_regime(metrics["short"])
