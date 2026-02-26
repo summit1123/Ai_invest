@@ -7,7 +7,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 from zoneinfo import ZoneInfo
@@ -162,6 +162,143 @@ def _weekly_trade_metrics(repo: PostgresRepo, *, ws: date, we: date) -> tuple[fl
             wins += 1
     win_rate = (wins / total * 100.0) if total > 0 else 0.0
     return pnl, win_rate, total
+
+
+def _daily_trade_snapshot(repo: PostgresRepo, *, day: date) -> dict[str, Any]:
+    rows = repo.fetch_realized_trades(limit=5000)
+    trades = 0
+    wins = 0
+    realized_sum = 0.0
+    fees_sum = 0.0
+    hold_minutes_sum = 0.0
+    for r in rows:
+        close_ts = _parse_ts(r.get("ts_close"))
+        if close_ts is None or close_ts.astimezone(KST).date() != day:
+            continue
+        trades += 1
+        realized = float(r.get("realized_pnl") or 0.0)
+        fees = float(r.get("fees_total") or 0.0)
+        realized_sum += realized
+        fees_sum += fees
+        if realized > 0.0:
+            wins += 1
+        open_ts = _parse_ts(r.get("ts_open"))
+        if open_ts is not None:
+            hold_minutes_sum += max(0.0, (close_ts - open_ts).total_seconds() / 60.0)
+    avg_hold_minutes = (hold_minutes_sum / float(trades)) if trades > 0 else 0.0
+    win_rate_pct = (float(wins) / float(trades) * 100.0) if trades > 0 else 0.0
+    net_pnl = float(realized_sum - fees_sum)
+    return {
+        "trades_count": int(trades),
+        "wins_count": int(wins),
+        "win_rate_pct": float(round(win_rate_pct, 2)),
+        "realized_pnl": float(realized_sum),
+        "fees_paid": float(fees_sum),
+        "net_pnl_after_fees": float(net_pnl),
+        "avg_hold_minutes": float(round(avg_hold_minutes, 2)),
+    }
+
+
+def _daily_outcome_snapshot(repo: PostgresRepo, *, day: date) -> dict[str, Any]:
+    rows = repo.fetch_decision_outcomes(limit=5000)
+    total = 0
+    counter: dict[str, int] = {}
+    for r in rows:
+        reviewed_ts = _parse_ts(r.get("reviewed_at")) or _parse_ts(r.get("ts_close"))
+        if reviewed_ts is None or reviewed_ts.astimezone(KST).date() != day:
+            continue
+        total += 1
+        error_type = str(r.get("error_type") or "").strip().upper()
+        if error_type:
+            counter[error_type] = counter.get(error_type, 0) + 1
+    top = sorted(counter.items(), key=lambda x: x[1], reverse=True)[:5]
+    return {
+        "outcomes_count": int(total),
+        "top_error_types": [{"error_type": str(k), "count": int(v)} for k, v in top],
+    }
+
+
+def _daily_improvement_advice(
+    *,
+    day: date,
+    daily_metrics: Mapping[str, Any],
+    outcome_metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    trades = int(daily_metrics.get("trades_count") or 0)
+    realized = float(daily_metrics.get("realized_pnl") or 0.0)
+    fees = float(daily_metrics.get("fees_paid") or 0.0)
+    net = float(daily_metrics.get("net_pnl_after_fees") or (realized - fees))
+    avg_hold = float(daily_metrics.get("avg_hold_minutes") or 0.0)
+    top_errors = [x for x in list(outcome_metrics.get("top_error_types") or []) if isinstance(x, Mapping)]
+    top_error_codes = [str(x.get("error_type") or "").strip().upper() for x in top_errors if str(x.get("error_type") or "").strip()]
+    cost_error = 0
+    latency_error = 0
+    for row in top_errors:
+        code = str(row.get("error_type") or "").strip().upper()
+        cnt = int(_as_float(row.get("count")) or 0.0)
+        if code == "OC_COST_UNDERESTIMATED":
+            cost_error = cnt
+        if code == "OC_EXECUTION_LATENCY":
+            latency_error = cnt
+
+    title = "오늘은 규칙 유지"
+    reason = f"{day.isoformat()} 데이터 기준으로 치명적인 구조 이슈가 크지 않습니다."
+    changes: list[str] = [
+        "현재 값을 유지하고 동일 로직으로 하루 더 데이터 수집",
+    ]
+
+    fee_heavy = bool(trades >= 5 and fees > max(1000.0, abs(realized) * 0.7))
+    if fee_heavy or cost_error >= 2:
+        title = "수수료 누수 차단이 1순위"
+        reason = (
+            f"거래 {trades}건에서 수수료 {fees:,.0f} KRW가 손익을 잠식 중입니다."
+            f" (순손익 {net:,.0f} KRW, OC_COST_UNDERESTIMATED={cost_error}건)"
+        )
+        changes = [
+            "`rules.yaml` `strategy.alpha_score.entry_alpha`를 +0.03~0.05 상향",
+            "`rules.yaml` `governance.micro_mode.min_alpha`를 +0.02~0.04 상향",
+            "`rules.yaml` `governance.micro_mode.max_spread_bps`를 -0.2~-0.5 축소(하한 1.0 유지)",
+            "`rules.yaml` `strategy.alpha_score.cooldown_minutes`를 +30~60분 상향",
+        ]
+    elif latency_error >= 2:
+        title = "체결 지연 대응이 1순위"
+        reason = f"OC_EXECUTION_LATENCY가 {latency_error}건 발생해 체결 품질 보정이 필요합니다."
+        changes = [
+            "`rules.yaml` `governance.micro_mode.max_spread_bps`를 보수적으로 축소",
+            "`rules.yaml` `cost_guard.max_predicted_slippage_bps`를 -1~-2 bps 조정",
+            "`rules.yaml` `execution.reprice_interval_sec`를 1~2초 단축",
+        ]
+    elif trades == 0:
+        title = "신호 부족 구간 점검"
+        reason = "오늘 체결이 없어 샘플이 부족합니다. 게이트가 과도한지 확인이 필요합니다."
+        changes = [
+            "`rules.yaml` `strategy.alpha_score.entry_alpha`를 -0.02~-0.04 완화 검토",
+            "`rules.yaml` `governance.micro_mode.min_alpha`를 -0.02~-0.03 완화 검토",
+            "완화 전 `SAFE_DECISION` 차단 사유 상위 3개를 먼저 확인",
+        ]
+    elif trades >= 8 and avg_hold <= 6.0:
+        title = "과도한 단타 완화"
+        reason = f"평균 보유시간 {avg_hold:.1f}분으로 너무 짧아 수수료 민감도가 큽니다."
+        changes = [
+            "`rules.yaml` `strategy.alpha_score.cooldown_minutes`를 +30분 상향",
+            "`rules.yaml` `strategy.alpha_score.time_stop_rev_minutes`를 +30~60분 상향",
+            "회의 플랜에서 `exit_triggers`의 즉시 청산 조건을 줄이고 무효화 조건을 강화",
+        ]
+
+    return {
+        "day": day.isoformat(),
+        "improvement_title": str(title),
+        "improvement_reason": str(reason),
+        "suggested_changes": [str(x) for x in changes if str(x).strip()][:5],
+        "diagnostics": {
+            "trades_count": int(trades),
+            "realized_pnl": float(realized),
+            "fees_paid": float(fees),
+            "net_pnl_after_fees": float(net),
+            "avg_hold_minutes": float(avg_hold),
+            "top_error_codes": top_error_codes[:5],
+        },
+    }
 
 
 def _close_finished_weekly_priorities(*, repo: PostgresRepo, now_kst: datetime) -> int:
@@ -359,6 +496,19 @@ def send_daily_review(*, repo: PostgresRepo, notifier: NotificationService, now_
     fees = float((row or {}).get("fees_paid") or 0.0)
     trades = int((row or {}).get("trades_count") or 0)
     mdd = (row or {}).get("max_drawdown")
+    day_dt = now_kst.date()
+    trade_snapshot = _daily_trade_snapshot(repo, day=day_dt)
+    outcome_snapshot = _daily_outcome_snapshot(repo, day=day_dt)
+    advice = _daily_improvement_advice(
+        day=day_dt,
+        daily_metrics={
+            **dict(trade_snapshot),
+            "realized_pnl": float(realized),
+            "fees_paid": float(fees),
+            "trades_count": int(trades),
+        },
+        outcome_metrics=outcome_snapshot,
+    )
 
     event_id = uuid.uuid4()
     repo.insert_event(
@@ -376,6 +526,7 @@ def send_daily_review(*, repo: PostgresRepo, notifier: NotificationService, now_
                 "fees_paid": fees,
                 "trades_count": trades,
                 "max_drawdown": mdd,
+                "improvement_advice": dict(advice),
             },
         )
     )
@@ -386,6 +537,9 @@ def send_daily_review(*, repo: PostgresRepo, notifier: NotificationService, now_
         fees_paid=fees,
         trades_count=trades,
         max_drawdown=float(mdd) if mdd is not None else None,
+        improvement_title=str(advice.get("improvement_title") or ""),
+        improvement_reason=str(advice.get("improvement_reason") or ""),
+        suggested_changes=[str(x) for x in list(advice.get("suggested_changes") or []) if str(x).strip()][:5],
     )
     return True
 
@@ -408,6 +562,22 @@ def send_weekly_review(
 
     weekly_pnl, win_rate, total = _weekly_trade_metrics(repo, ws=ws, we=we)
     loss_tags_top3 = _top3_loss_tags(repo, ws=ws, we=we)
+    tuning_cfg = (rules_raw.get("adaptive_tuning") or {}) if isinstance(rules_raw, dict) else {}
+    tuning_enabled = bool(tuning_cfg.get("enabled", False))
+    if not tuning_enabled:
+        rule_patch_status = "adaptive_tuning 비활성"
+    else:
+        last_apply = repo.fetch_latest_event(event_type="DYNAMIC_RULE_PATCH_APPLIED")
+        if isinstance(last_apply, dict) and isinstance(last_apply.get("ts"), datetime):
+            ts_kst = last_apply["ts"].astimezone(KST).strftime("%Y-%m-%d %H:%M")
+            payload = last_apply.get("payload") if isinstance(last_apply.get("payload"), dict) else {}
+            regime = str(payload.get("regime") or "").strip().upper()
+            if regime:
+                rule_patch_status = f"adaptive_tuning 활성 (최근 패치 {ts_kst} KST, regime={regime})"
+            else:
+                rule_patch_status = f"adaptive_tuning 활성 (최근 패치 {ts_kst} KST)"
+        else:
+            rule_patch_status = "adaptive_tuning 활성 (최근 패치 이력 없음)"
 
     event_id = uuid.uuid4()
     repo.insert_event(
@@ -427,7 +597,7 @@ def send_weekly_review(
                 "win_rate": win_rate,
                 "trades_count": total,
                 "loss_tags_top3": loss_tags_top3,
-                "rule_patch_status": "자동 룰패치 미연결",
+                "rule_patch_status": str(rule_patch_status),
             },
         )
     )
@@ -437,7 +607,7 @@ def send_weekly_review(
         weekly_pnl=weekly_pnl,
         win_rate=win_rate,
         loss_tags_top3=loss_tags_top3,
-        rule_patch_status="자동 룰패치 미연결",
+        rule_patch_status=str(rule_patch_status),
     )
     _ensure_weekly_priority(
         repo=repo,

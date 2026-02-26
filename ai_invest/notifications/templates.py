@@ -33,6 +33,25 @@ def _as_bool_ko(value: Any) -> str:
     return "-"
 
 
+def _as_krw(value: Any) -> str:
+    try:
+        if value is None:
+            return "-"
+        return f"{float(value):,.0f} KRW"
+    except Exception:
+        return "-"
+
+
+def _as_pct(value: Any, *, digits: int = 2) -> str:
+    s = _as_float(value, digits=digits)
+    return "-" if s == "-" else f"{s}%"
+
+
+def _as_bps(value: Any, *, digits: int = 2) -> str:
+    s = _as_float(value, digits=digits)
+    return "-" if s == "-" else f"{s} bps"
+
+
 def _clip(text: Any, max_len: int) -> str:
     s = str(text or "").strip()
     if len(s) <= max_len:
@@ -88,21 +107,78 @@ def _human_trade_action_hint(*, action: str, buy: Any, sell: Any) -> str:
     return "-"
 
 
+def _reason_text(codes: Any) -> str:
+    if not isinstance(codes, list):
+        return "사유 정보가 없습니다."
+    return format_reason_codes_ko([str(x) for x in list(codes or [])]) or "사유 정보가 없습니다."
+
+
+def _market_and_gate_summary(ctx: Mapping[str, Any]) -> tuple[str, str]:
+    spread = _as_bps(ctx.get("spread_bps"), digits=2)
+    rsi = _as_float(ctx.get("rsi_14"), digits=1)
+    atr = _as_pct(ctx.get("atr_pct"), digits=2)
+    volz = _as_float(ctx.get("vol_zscore"), digits=2)
+    market_line = f"시장 상태: 스프레드 {spread}, RSI {rsi}, ATR {atr}, 거래량 z-score {volz}"
+
+    flags: list[str] = []
+    if _to_bool(ctx.get("pause_state")) is True:
+        flags.append("시스템 일시중지")
+    if str(ctx.get("reconciliation_status") or "").upper() == "FAIL":
+        flags.append("정합성 점검 실패")
+    if _to_bool(ctx.get("ops_veto")) is True:
+        flags.append("운영 게이트 차단")
+    if _to_bool(ctx.get("risk_veto")) is True:
+        flags.append("리스크 게이트 차단")
+    if _to_bool(ctx.get("regime_trade_allowed")) is False:
+        flags.append("시장 레짐 비허용")
+    try:
+        spread_now = float(ctx.get("spread_bps"))
+        spread_lim = float(ctx.get("max_spread_bps_entry"))
+        if spread_now > spread_lim:
+            flags.append("스프레드 과다")
+    except Exception:
+        pass
+    gate_line = "게이트 상태: " + (", ".join(flags) if flags else "차단 조건 없음")
+    return market_line, gate_line
+
+
+def _activation_mode_line(activation_status: str, activation_gate: Mapping[str, Any]) -> str:
+    status = str(activation_status or "").strip().upper()
+    decision = str(activation_gate.get("decision") or "").strip().upper()
+    effective = str(activation_gate.get("decision_effective") or "").strip().upper()
+    if status:
+        if status == "ACTIVE":
+            return "실행 모드: 현재 플랜이 활성 상태입니다."
+        if status == "PAPER_ONLY":
+            return "실행 모드: 페이퍼 실행 전용입니다. 실거래는 하지 않습니다."
+        if status == "HOLD":
+            return "실행 모드: 관망 상태입니다. 조건이 맞을 때만 제한적으로 진입합니다."
+    if effective == "LIVE":
+        return "실행 모드: LIVE 조건이 충족된 상태입니다."
+    if effective == "PAPER":
+        return "실행 모드: PAPER 조건으로 운영 중입니다."
+    if effective == "HOLD" or decision == "HOLD":
+        return "실행 모드: HOLD(관망) 상태입니다."
+    return "실행 모드: 정책 게이트 기준으로 실시간 평가 중입니다."
+
+
 def _plain_exec_state(activation_gate: Mapping[str, Any]) -> tuple[str, str]:
-    reason_code = str(activation_gate.get("reason_code") or "").strip()
+    reason_code = str(activation_gate.get("reason_code") or "").strip().upper()
     hard_block = bool(activation_gate.get("hard_plan_block"))
     soft_block = bool(activation_gate.get("soft_plan_block"))
-    hard_reasons = [str(x).strip() for x in list(activation_gate.get("hard_plan_block_reasons") or []) if str(x).strip()]
-    soft_reasons = [str(x).strip() for x in list(activation_gate.get("soft_plan_block_reasons") or []) if str(x).strip()]
+    hard_reasons = [str(x).strip().upper() for x in list(activation_gate.get("hard_plan_block_reasons") or []) if str(x).strip()]
+    soft_reasons = [str(x).strip().upper() for x in list(activation_gate.get("soft_plan_block_reasons") or []) if str(x).strip()]
 
     if hard_block:
-        why = _join_nonempty(hard_reasons[:3], fallback="하드 게이트 미충족")
-        return "실행 차단", why
+        why = _reason_text(hard_reasons[:3])
+        return "실행 차단", why if why != "사유 정보가 없습니다." else "핵심 하드 게이트를 통과하지 못했습니다."
     if soft_block:
-        why = _join_nonempty(soft_reasons[:3], fallback="소프트 게이트 제한")
-        return "조건부 제한", f"{why} (실시간 게이트 재평가)"
+        why = _reason_text(soft_reasons[:3])
+        if why == "사유 정보가 없습니다.":
+            why = "보수 정책으로 제한 중입니다."
+        return "조건부 제한", f"{why} (다음 판단 주기에서 재평가)"
     if reason_code:
-        return "실행 가능", f"정책 상태: {reason_code}"
+        return "실행 가능", _reason_text([reason_code])
     return "실행 가능", "실시간 Safe Judge 게이트 적용"
 
 
@@ -119,22 +195,22 @@ def _operator_hint_for_action(action: str) -> str:
 
 def tpl_pause_critical(data: Mapping[str, Any]) -> str:
     return (
-        "[운영][치명] 거래 중단 (PAUSE)\n"
+        "[운영 경보] 자동매매 일시중지\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- 사유: {data.get('reason_type')}\n"
-        f"- 심볼: {data.get('symbol')}\n"
-        f"- 실행ID: {data.get('run_id')}\n"
-        "- 운영자 확인: 정합성/지연/레이트리밋 상태를 확인하세요.\n"
+        f"- 중지 사유: {data.get('reason_type')}\n"
+        f"- 관련 종목: {data.get('symbol')}\n"
+        f"- 실행 ID: {data.get('run_id')}\n"
+        "- 조치 안내: 정합성/네트워크/레이트리밋 상태를 먼저 확인해 주세요.\n"
     )
 
 
 def tpl_recon_fail(data: Mapping[str, Any]) -> str:
     return (
-        "[운영][치명] 정합성 실패 (RECON_FAIL)\n"
+        "[운영 경보] 정합성 점검 실패\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- 심볼: {data.get('symbol')}\n"
-        f"- 요약: {data.get('diff_summary')}\n"
-        "- 운영자 확인: 원장/포지션/체결 정합성을 우선 점검하세요.\n"
+        f"- 종목: {data.get('symbol')}\n"
+        f"- 상세 요약: {data.get('diff_summary')}\n"
+        "- 조치 안내: 원장/보유수량/체결내역 일치 여부를 우선 확인해 주세요.\n"
     )
 
 
@@ -147,46 +223,56 @@ def tpl_safe_decision(data: Mapping[str, Any]) -> str:
         buy=ctx.get("trade_plan_buy_allowed"),
         sell=ctx.get("trade_plan_sell_allowed"),
     )
+    market_line, gate_line = _market_and_gate_summary(ctx)
+    reason_line = _reason_text(reasons)
+    signal = str(ctx.get("market_signal") or "-").strip().upper()
+    signal_conf = _as_float(ctx.get("market_confidence"), digits=2)
+    target = _as_pct(ctx.get("trade_plan_target_pct"), digits=2)
+    tier = str(ctx.get("capital_tier") or "-")
+    cap = _as_pct(ctx.get("capital_target_cap_pct"), digits=2)
     return (
-        "[거래] Safe 결정\n"
-        f"- 한 줄 요약: {data.get('symbol')} {action} ({format_reason_codes_ko(reasons)})\n"
-        f"- 지금 판단 뜻: {simple_hint}\n"
+        "[거래 판단 보고]\n"
+        f"- 결론: {data.get('symbol')} → {action}\n"
+        f"- 이유: {reason_line}\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- 핵심지표: spread={_as_float(ctx.get('spread_bps'))}bps, rsi={_as_float(ctx.get('rsi_14'))}, atr={_as_float(ctx.get('atr_pct'))}%, vol_z={_as_float(ctx.get('vol_zscore'))}\n"
-        f"- 게이트상태: regime_trade_allowed={_as_bool_ko(ctx.get('regime_trade_allowed'))}, risk_veto={_as_bool_ko(ctx.get('risk_veto'))}, ops_veto={_as_bool_ko(ctx.get('ops_veto'))}, recon={ctx.get('reconciliation_status')}\n"
-        f"- 시장신호: market={ctx.get('market_signal')} ({_as_float(ctx.get('market_confidence'))})\n"
-        f"- 적용플랜: slot={ctx.get('trade_plan_slot_key')}, target={_as_float(ctx.get('trade_plan_target_pct'))}%\n"
-        f"- 자본정책: tier={ctx.get('capital_tier')}, target_cap={_as_float(ctx.get('capital_target_cap_pct'))}%\n"
-        f"- 운영자 확인: {_operator_hint_for_action(action)}\n"
+        f"- {market_line}\n"
+        f"- {gate_line}\n"
+        f"- 현재 시장 신호: {signal} (신뢰도 {signal_conf})\n"
+        f"- 이번 슬롯 목표 비중: {target} (자본 티어 {tier}, 상한 {cap})\n"
+        f"- 실행 의미: {simple_hint}\n"
+        f"- 운영 안내: {_operator_hint_for_action(action)}\n"
     )
 
 
 def tpl_fill_notice(data: Mapping[str, Any]) -> str:
+    side = str(data.get("side") or "").upper()
+    side_ko = "매수" if side in {"BUY", "BID"} else ("매도" if side in {"SELL", "ASK"} else side)
     return (
-        "[거래] 체결 알림\n"
+        "[체결 보고]\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- 심볼: {data.get('symbol')}\n"
-        f"- 매수/매도·수량: {data.get('side')}/{data.get('qty')}\n"
-        f"- 체결가: {data.get('price')}\n"
-        f"- 수수료: {data.get('fee')} {data.get('fee_currency')}\n"
+        f"- 종목: {data.get('symbol')}\n"
+        f"- 거래 유형: {side_ko}\n"
+        f"- 체결 수량: {_as_float(data.get('qty'), digits=8)}\n"
+        f"- 체결 가격: {_as_float(data.get('price'), digits=0)}\n"
+        f"- 수수료: {_as_float(data.get('fee'), digits=4)} {data.get('fee_currency')}\n"
     )
 
 
 def tpl_tax_export_done(data: Mapping[str, Any]) -> str:
     return (
-        "[정산] Tax Export 완료\n"
+        "[정산 보고] 월말 세금 산출 완료\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- 기간: {data.get('period_label')}\n"
-        f"- export_id: {data.get('export_id')}\n"
+        f"- 산출 ID: {data.get('export_id')}\n"
     )
 
 
 def tpl_tax_export_fail(data: Mapping[str, Any]) -> str:
     return (
-        "[정산][실패] Tax Export 실패\n"
+        "[정산 경보] 월말 세금 산출 실패\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- 기간: {data.get('period_label')}\n"
-        f"- export_id: {data.get('export_id')}\n"
+        f"- 산출 ID: {data.get('export_id')}\n"
         f"- 오류: {data.get('errors')}\n"
     )
 
@@ -200,44 +286,64 @@ def tpl_finance_monthly_review(data: Mapping[str, Any]) -> str:
             lines.append(f"- {s}")
     alerts_txt = "\n".join(lines) if lines else "- (없음)"
     return (
-        "[정산][월말] Finance/Tax 리뷰\n"
+        "[정산 리뷰] 월말 검증 결과\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- 기간: {data.get('period_label')}\n"
-        f"- tax_export_status: {data.get('tax_export_status')}\n"
-        f"- manifest_ref: {data.get('manifest_ref')}\n"
+        f"- 산출 상태: {data.get('tax_export_status')}\n"
+        f"- 리포트 참조: {data.get('manifest_ref')}\n"
         f"- LLM: {'사용' if data.get('llm_used') else '미사용'} ({data.get('llm_model')})\n"
-        f"- 요약: {_clip(data.get('summary'), 220)}\n"
-        f"- 불일치 경보:\n{alerts_txt}\n"
+        f"- 핵심 요약: {_clip(data.get('summary'), 220)}\n"
+        f"- 불일치/경보:\n{alerts_txt}\n"
     )
 
 
 def tpl_order_rejected(data: Mapping[str, Any]) -> str:
     return (
-        "[거래][높음] 주문 거부\n"
+        "[주문 경보] 주문이 거부되었습니다\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- 심볼: {data.get('symbol')}\n"
-        f"- order_id: {data.get('order_id')}\n"
-        f"- 사유: {data.get('reject_reason')}\n"
+        f"- 종목: {data.get('symbol')}\n"
+        f"- 주문 ID: {data.get('order_id')}\n"
+        f"- 거부 사유: {data.get('reject_reason')}\n"
     )
 
 
 def tpl_daily_review(data: Mapping[str, Any]) -> str:
+    realized = _as_krw(data.get("realized_pnl"))
+    fees = _as_krw(data.get("fees_paid"))
+    mdd = _as_krw(data.get("max_drawdown"))
+    improvement_title = str(data.get("improvement_title") or "").strip()
+    improvement_reason = str(data.get("improvement_reason") or "").strip()
+    suggested_changes = data.get("suggested_changes") if isinstance(data.get("suggested_changes"), list) else []
+    change_lines: list[str] = []
+    for row in suggested_changes[:5]:
+        s = str(row or "").strip()
+        if s:
+            change_lines.append(f"- {s}")
+    changes_text = "\n".join(change_lines) if change_lines else "- (없음)"
+    recommendation_block = ""
+    if improvement_title or improvement_reason or change_lines:
+        recommendation_block = (
+            f"- 오늘 수정 우선순위: {improvement_title or '-'}\n"
+            f"- 판단 근거: {improvement_reason or '-'}\n"
+            f"- 권장 수정 항목:\n{changes_text}\n"
+        )
     return (
-        f"[리뷰][일간] {data.get('day')}\n"
-        f"- 실현손익: {data.get('realized_pnl')}\n"
-        f"- 수수료: {data.get('fees_paid')}\n"
-        f"- 거래 수: {data.get('trades_count')}\n"
-        f"- 최대 낙폭: {data.get('max_drawdown')}\n"
+        f"[일간 리뷰] {data.get('day')}\n"
+        f"- 오늘 실현손익: {realized}\n"
+        f"- 오늘 수수료: {fees}\n"
+        f"- 오늘 거래 횟수: {_as_int(data.get('trades_count'))}회\n"
+        f"- 최대 낙폭: {mdd}\n"
+        f"{recommendation_block}"
     )
 
 
 def tpl_weekly_review(data: Mapping[str, Any]) -> str:
     return (
-        f"[리뷰][주간] {data.get('week_label')}\n"
-        f"- 주간 손익: {data.get('weekly_pnl')}\n"
-        f"- 승률: {data.get('win_rate')}\n"
-        f"- 손실 원인 Top3: {data.get('loss_tags_top3')}\n"
-        f"- 룰 패치 상태: {data.get('rule_patch_status')}\n"
+        f"[주간 리뷰] {data.get('week_label')}\n"
+        f"- 주간 손익: {_as_krw(data.get('weekly_pnl'))}\n"
+        f"- 승률: {_as_pct(data.get('win_rate'), digits=2)}\n"
+        f"- 반복 손실 원인: {data.get('loss_tags_top3')}\n"
+        f"- 자동 튜닝 상태: {data.get('rule_patch_status')}\n"
     )
 
 
@@ -254,18 +360,18 @@ def tpl_research_daily_brief(data: Mapping[str, Any]) -> str:
     links_txt = "\n".join(links) if links else "- (없음)"
 
     return (
-        f"[리서치][일간] {data.get('brief_date')}\n"
-        f"- 한 줄 요약: {_clip(data.get('summary'), 240)}\n"
-        f"- 리스크:\n{_format_risks(data.get('risk_watchlist'))}\n"
-        f"- 주요 링크:\n{links_txt}\n"
+        f"[리서치 브리핑] {data.get('brief_date')}\n"
+        f"- 오늘 요약: {_clip(data.get('summary'), 240)}\n"
+        f"- 주의할 리스크:\n{_format_risks(data.get('risk_watchlist'))}\n"
+        f"- 참고 기사:\n{links_txt}\n"
     )
 
 
 def tpl_agent_daily_report(data: Mapping[str, Any]) -> str:
     return (
-        f"[리서치][일간] 에이전트 보고 ({data.get('agent_name')})\n"
+        f"[에이전트 보고] {data.get('agent_name')}\n"
         f"- 보고일: {data.get('report_date')}\n"
-        f"- 요약: {data.get('summary')}\n"
+        f"- 내용 요약: {_clip(data.get('summary'), 260)}\n"
     )
 
 
@@ -284,7 +390,7 @@ def tpl_meeting_summary(data: Mapping[str, Any]) -> str:
     plan_line = ""
     if trade_plan:
         plan_line = (
-            f"- 최종 플랜: {trade_plan.get('symbol')} / target={_as_float(trade_plan.get('target_position_pct'))}%"
+            f"- 최종 플랜: {trade_plan.get('symbol')} / 목표 비중 {_as_pct(trade_plan.get('target_position_pct'), digits=2)}"
             f" / valid={trade_plan.get('valid_from_kst')}~{trade_plan.get('valid_to_kst')}\n"
         )
 
@@ -297,14 +403,14 @@ def tpl_meeting_summary(data: Mapping[str, Any]) -> str:
     buy_flag = _as_mapping(trade_plan.get("allowed_actions")).get("buy")
     sell_flag = _as_mapping(trade_plan.get("allowed_actions")).get("sell")
     return (
-        "[회의] 회의록 (쉬운 요약)\n"
+        "[회의 결과 보고]\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- meeting_id: {data.get('meeting_id')}\n"
+        f"- 회의 ID: {data.get('meeting_id')}\n"
         f"{source_line}\n"
         f"- 한 줄 결론: {_clip(data.get('summary'), 180)}\n"
         + plan_line
         + f"- 실행 이해: {action_hint}\n"
-        + f"- 이번 슬롯 허용: buy={_as_bool_ko(buy_flag)}, sell={_as_bool_ko(sell_flag)}\n"
+        + f"- 이번 슬롯 허용: 매수 {_as_bool_ko(buy_flag)}, 매도 {_as_bool_ko(sell_flag)}\n"
         + "\n"
         + f"{_clip(body, 1800)}\n"
     )
@@ -321,22 +427,22 @@ def tpl_meeting_action_items(data: Mapping[str, Any]) -> str:
             action = str(it.get("action") or "").strip()
             due = str(it.get("due_date") or "").strip()
             if owner or action:
-                lines.append(f"- {owner}: {action} (기한 {due or '-'})")
+                lines.append(f"- 담당 {owner}: {action} (기한 {due or '-'})")
     items_txt = "\n".join(lines) if lines else "- (없음)"
     return (
-        "[회의][액션아이템]\n"
+        "[회의 후속 작업]\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- meeting_id: {data.get('meeting_id')}\n"
+        f"- 회의 ID: {data.get('meeting_id')}\n"
         f"{items_txt}\n"
     )
 
 
 def tpl_weekly_priority(data: Mapping[str, Any]) -> str:
     return (
-        "[거버넌스][주간] 개선 우선순위\n"
+        "[주간 개선 과제]\n"
         f"- 주차: {data.get('week_label')}\n"
-        f"- 우선순위: {data.get('priority_title')}\n"
-        f"- 가설: {data.get('hypothesis')}\n"
+        f"- 이번 주 핵심 과제: {data.get('priority_title')}\n"
+        f"- 검증 가설: {data.get('hypothesis')}\n"
         f"- 담당: {data.get('owner')}\n"
     )
 
@@ -346,29 +452,27 @@ def tpl_trade_plan_set(data: Mapping[str, Any]) -> str:
     constraints = _as_mapping(data.get("constraints"))
     activation_gate = _as_mapping(data.get("activation_gate"))
     activation_status = str(data.get("activation_status") or "-")
-    decision = str(activation_gate.get("decision") or "-")
-    decision_effective = str(activation_gate.get("decision_effective") or "-")
     exec_state_title, exec_state_detail = _plain_exec_state(activation_gate)
+    mode_line = _activation_mode_line(activation_status, activation_gate)
     action_hint = _human_trade_action_hint(
         action=str(data.get("action") or ""),
         buy=allowed.get("buy"),
         sell=allowed.get("sell"),
     )
     return (
-        "[거버넌스] 트레이드 플랜 확정\n"
+        "[거버넌스 플랜 보고]\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- 회의/슬롯: {data.get('meeting_id')} / {data.get('slot_key')}\n"
-        f"- 이번 슬롯 결론: {data.get('symbol')} / 목표 {_as_float(data.get('target_position_pct'))}%\n"
-        f"- 한 줄 설명: {action_hint}\n"
+        f"- 이번 슬롯 결론: {data.get('symbol')} 목표 {_as_pct(data.get('target_position_pct'), digits=2)}\n"
+        f"- 실행 요약: {action_hint}\n"
         f"- 유효시간(KST): {data.get('valid_from_kst')} ~ {data.get('valid_to_kst')}\n"
-        f"- 허용 액션: buy={_as_bool_ko(allowed.get('buy'))}, sell={_as_bool_ko(allowed.get('sell'))}\n"
-        f"- 활성화 상태: {activation_status} (decision={decision}, effective={decision_effective})\n"
-        f"- 런타임 실행 상태: {exec_state_title}\n"
-        f"- 실행 상태 설명: {exec_state_detail}\n"
-        f"- 과매매 방지: cooldown={_as_int(data.get('cooldown_minutes'))}분, rebalance_band={_as_float(data.get('rebalance_band_pct'))}%\n"
-        f"- 실행 제약: max_spread={_as_float(constraints.get('max_spread_bps'))}bps, max_slippage={_as_float(constraints.get('max_slippage_bps'))}bps, max_position={_as_float(constraints.get('max_position_pct'))}%\n"
+        f"- 허용 동작: 매수 {_as_bool_ko(allowed.get('buy'))}, 매도 {_as_bool_ko(allowed.get('sell'))}\n"
+        f"- {mode_line}\n"
+        f"- 현재 실행 판정: {exec_state_title} / {exec_state_detail}\n"
+        f"- 과매매 방지: 재진입 대기 {_as_int(data.get('cooldown_minutes'))}분, 리밸런싱 밴드 {_as_pct(data.get('rebalance_band_pct'), digits=2)}\n"
+        f"- 실행 제약: 스프레드 {_as_bps(constraints.get('max_spread_bps'), digits=2)} 이하, 슬리피지 {_as_bps(constraints.get('max_slippage_bps'), digits=2)} 이하, 종목 비중 {_as_pct(constraints.get('max_position_pct'), digits=2)} 이하\n"
         f"- 근거 요약: {_clip(data.get('rationale_summary'), 240)}\n"
-        "- 운영자 확인: TTL 만료 전 회의 갱신 여부를 확인하세요.\n"
+        "- 운영 안내: 유효시간이 끝나기 전에 다음 회의 플랜이 나오는지 확인해 주세요.\n"
     )
 
 
@@ -382,10 +486,10 @@ def tpl_engineering_change_announced(data: Mapping[str, Any]) -> str:
                 summary.append(f"- {s}")
     summary_txt = "\n".join(summary) if summary else "- (요약 없음)"
     return (
-        "[엔지니어링] 개선 반영 공지\n"
+        "[엔지니어링 공지] 개선사항 반영\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
-        f"- change_id: {data.get('change_id')}\n"
-        f"- 활성 모드: {data.get('activation_mode')}\n"
+        f"- 변경 ID: {data.get('change_id')}\n"
+        f"- 적용 모드: {data.get('activation_mode')}\n"
         f"- 변경 요약:\n{summary_txt}\n"
         f"- 롤백 안내: {data.get('rollback_hint')}\n"
     )

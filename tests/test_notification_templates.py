@@ -31,10 +31,10 @@ class NotificationTemplateTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("한 줄 요약", text)
+        self.assertIn("결론", text)
         self.assertIn("스프레드 과다", text)
-        self.assertIn("리스크 차단", text)
-        self.assertIn("운영자 확인", text)
+        self.assertIn("리스크 게이트 차단", text)
+        self.assertIn("운영 안내", text)
 
     def test_trade_plan_set_template_contains_constraints(self) -> None:
         text = render(
@@ -59,9 +59,9 @@ class NotificationTemplateTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("트레이드 플랜 확정", text)
+        self.assertIn("거버넌스 플랜 보고", text)
         self.assertIn("KRW-BTC", text)
-        self.assertIn("max_spread", text)
+        self.assertIn("스프레드", text)
         self.assertIn("근거 요약", text)
 
     def test_research_daily_brief_includes_links(self) -> None:
@@ -78,7 +78,7 @@ class NotificationTemplateTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("주요 링크", text)
+        self.assertIn("참고 기사", text)
         self.assertIn("https://example.com/a", text)
 
     def test_finance_monthly_review_template(self) -> None:
@@ -95,7 +95,7 @@ class NotificationTemplateTests(unittest.TestCase):
                 "discrepancy_alerts": ["실현손익-원장 근사 차이 500 KRW"],
             },
         )
-        self.assertIn("Finance/Tax 리뷰", text)
+        self.assertIn("정산 리뷰", text)
         self.assertIn("gpt-5.2-pro", text)
         self.assertIn("2026-02", text)
 
@@ -110,9 +110,30 @@ class NotificationTemplateTests(unittest.TestCase):
                 "rollback_hint": "git revert <sha> 후 재시작",
             },
         )
-        self.assertIn("개선 반영 공지", text)
+        self.assertIn("엔지니어링 공지", text)
         self.assertIn("tpv2-20260212-1", text)
         self.assertIn("PAPER/HOLD", text)
+
+    def test_daily_review_template_contains_improvement_advice(self) -> None:
+        text = render(
+            "tpl_daily_review",
+            {
+                "day": "2026-02-26",
+                "realized_pnl": -3200,
+                "fees_paid": 1800,
+                "trades_count": 11,
+                "max_drawdown": 5400,
+                "improvement_title": "수수료 누수 차단이 1순위",
+                "improvement_reason": "수수료가 손익을 잠식",
+                "suggested_changes": [
+                    "`strategy.alpha_score.entry_alpha` +0.03",
+                    "`governance.micro_mode.min_alpha` +0.02",
+                ],
+            },
+        )
+        self.assertIn("오늘 수정 우선순위", text)
+        self.assertIn("수수료 누수 차단", text)
+        self.assertIn("권장 수정 항목", text)
 
 
 if __name__ == "__main__":

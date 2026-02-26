@@ -571,6 +571,9 @@ class NotificationService:
         fees_paid: float,
         trades_count: int,
         max_drawdown: float | None,
+        improvement_title: str | None = None,
+        improvement_reason: str | None = None,
+        suggested_changes: list[str] | None = None,
     ) -> None:
         try:
             chat_id = telegram_client.chat_id_review()
@@ -602,6 +605,9 @@ class NotificationService:
                 "fees_paid": fees_paid,
                 "trades_count": trades_count,
                 "max_drawdown": max_drawdown,
+                "improvement_title": str(improvement_title or "").strip(),
+                "improvement_reason": str(improvement_reason or "").strip(),
+                "suggested_changes": [str(x).strip() for x in list(suggested_changes or []) if str(x).strip()][:5],
             },
         )
 
