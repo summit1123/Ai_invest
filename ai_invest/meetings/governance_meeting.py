@@ -170,6 +170,11 @@ def _infer_time_horizon(*, fact_pack: Mapping[str, Any], symbol: str | None = No
 
     learning = (fact_pack.get("learning_context") or {}) if isinstance(fact_pack.get("learning_context"), Mapping) else {}
     outcome_windows = (learning.get("outcome_windows") or {}) if isinstance(learning.get("outcome_windows"), Mapping) else {}
+    performance_windows = (
+        (learning.get("performance_windows") or {})
+        if isinstance(learning.get("performance_windows"), Mapping)
+        else {}
+    )
     outcomes = (learning.get("recent_outcomes") or {}) if isinstance(learning.get("recent_outcomes"), Mapping) else {}
     short_outcomes = (
         (outcome_windows.get("short") or {})
@@ -181,6 +186,16 @@ def _infer_time_horizon(*, fact_pack: Mapping[str, Any], symbol: str | None = No
         if isinstance(outcome_windows.get("execution"), Mapping)
         else outcomes
     )
+    execution_performance = (
+        (performance_windows.get("execution") or {})
+        if isinstance(performance_windows.get("execution"), Mapping)
+        else {}
+    )
+    short_performance = (
+        (performance_windows.get("short") or {})
+        if isinstance(performance_windows.get("short"), Mapping)
+        else {}
+    )
     total_trades = max(0, int(_as_float(short_outcomes.get("total_trades"), default=_as_float(outcomes.get("total_trades"), default=0.0))))
     top_errors = [x for x in list(short_outcomes.get("top_error_types") or []) if isinstance(x, Mapping)]
     cost_error_count = 0
@@ -191,6 +206,21 @@ def _infer_time_horizon(*, fact_pack: Mapping[str, Any], symbol: str | None = No
             break
     cost_error_ratio = (float(cost_error_count) / float(total_trades)) if total_trades > 0 else 0.0
     execution_win_rate = float(_as_float(execution_outcomes.get("win_rate_pct"), default=_as_float(outcomes.get("win_rate_pct"), default=0.0)))
+    execution_net_after_fees = float(_as_float(execution_performance.get("net_pnl_after_fees"), default=0.0))
+    execution_avg_hold_min = float(_as_float(execution_performance.get("avg_hold_minutes"), default=0.0))
+    execution_perf_trades = int(_as_float(execution_performance.get("trades_count"), default=0.0))
+    short_fee_to_realized = _as_float(short_performance.get("fee_to_realized_ratio"), default=-1.0)
+
+    # 초단타 + 비용잠식 구간에서는 의도적으로 horizon을 늘려 churn을 줄인다.
+    if execution_perf_trades >= 6 and execution_net_after_fees < 0.0 and execution_avg_hold_min <= 8.0:
+        if atr_pct <= 1.1 and spread_bps <= 4.5:
+            return "swing"
+        if atr_pct <= 2.0 and spread_bps <= 8.0:
+            return "1d"
+
+    # 단기 수수료 비중이 과도하면 빈도 축소.
+    if short_fee_to_realized >= 0.7 and atr_pct <= 1.8 and spread_bps <= 7.0:
+        return "1d"
 
     # Cost pain -> prefer slower horizon when microstructure is acceptable.
     if total_trades >= 12 and cost_error_ratio >= 0.30:
@@ -454,8 +484,8 @@ def _normalize_meeting_times(times: Sequence[str], *, on_the_hour_only: bool) ->
 
 
 def default_meeting_times_kst() -> list[str]:
-    # 정기 회의 기본값: 매시 정각.
-    return [f"{h:02d}:00" for h in range(24)]
+    # 정기 회의 기본값: 6시간 간격(하루 4회).
+    return ["00:00", "06:00", "12:00", "18:00"]
 
 
 def get_meeting_times_kst(rules_raw: Mapping[str, Any]) -> list[str]:
@@ -2956,6 +2986,18 @@ def _as_kst_dt(value: Any) -> datetime | None:
     return None
 
 
+def _median(values: Sequence[float]) -> float:
+    rows = [float(v) for v in list(values or [])]
+    if not rows:
+        return 0.0
+    rows.sort()
+    n = len(rows)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(rows[mid])
+    return float((rows[mid - 1] + rows[mid]) / 2.0)
+
+
 def _summarize_recent_outcomes(
     *,
     repo: PostgresRepo,
@@ -2998,6 +3040,84 @@ def _summarize_recent_outcomes(
         "labels": {k: int(v) for k, v in labels.items()},
         "top_error_types": [{"error_type": str(k), "count": int(v)} for k, v in top_errors],
         "loss_count": int(loss),
+    }
+
+
+def _summarize_recent_trade_performance(
+    *,
+    repo: PostgresRepo,
+    now_kst: datetime,
+    days: int = 3,
+    hours: int | None = None,
+    rows: Sequence[Mapping[str, Any]] | None = None,
+    window_name: str | None = None,
+) -> dict[str, Any]:
+    window_hours = int(max(1, int(hours))) if hours is not None else None
+    window_days = int(max(1, int(days))) if hours is None else None
+    since = now_kst - (timedelta(hours=window_hours) if window_hours is not None else timedelta(days=window_days or 3))
+    source_rows = [r for r in list(rows or []) if isinstance(r, Mapping)] if rows is not None else repo.fetch_realized_trades(limit=5000)
+
+    trades = 0
+    wins_after_fees = 0
+    realized_sum = 0.0
+    fees_sum = 0.0
+    hold_minutes: list[float] = []
+    for r in source_rows:
+        close_kst = _as_kst_dt(r.get("ts_close"))
+        if close_kst is None or close_kst < since:
+            continue
+        trades += 1
+        realized = float(_as_float(r.get("realized_pnl"), default=0.0))
+        fees = float(_as_float(r.get("fees_total"), default=0.0))
+        realized_sum += realized
+        fees_sum += fees
+        if (realized - fees) > 0.0:
+            wins_after_fees += 1
+        open_kst = _as_kst_dt(r.get("ts_open"))
+        if open_kst is not None:
+            hold_minutes.append(max(0.0, (close_kst - open_kst).total_seconds() / 60.0))
+
+    win_rate = (float(wins_after_fees) / float(trades) * 100.0) if trades > 0 else 0.0
+    net_after_fees = float(realized_sum - fees_sum)
+    avg_hold = (float(sum(hold_minutes)) / float(len(hold_minutes))) if hold_minutes else 0.0
+    fee_to_realized_ratio = (float(fees_sum) / float(abs(realized_sum))) if abs(realized_sum) > 1e-9 else None
+    label = str(window_name or ("execution" if window_hours is not None else "short")).strip().lower()
+    window_label = f"{window_hours}h" if window_hours is not None else f"{window_days}d"
+
+    return {
+        "window_name": str(label),
+        "window_label": str(window_label),
+        "window_days": int(window_days or 0),
+        "window_hours": int(window_hours or 0),
+        "trades_count": int(trades),
+        "wins_after_fees": int(wins_after_fees),
+        "win_rate_pct": float(round(win_rate, 2)),
+        "realized_pnl": float(round(realized_sum, 4)),
+        "fees_paid": float(round(fees_sum, 4)),
+        "net_pnl_after_fees": float(round(net_after_fees, 4)),
+        "avg_hold_minutes": float(round(avg_hold, 2)),
+        "median_hold_minutes": float(round(_median(hold_minutes), 2)),
+        "fee_to_realized_ratio": (float(round(fee_to_realized_ratio, 4)) if fee_to_realized_ratio is not None else None),
+    }
+
+
+def _latest_daily_review_snapshot(*, repo: PostgresRepo) -> dict[str, Any] | None:
+    ev = repo.fetch_latest_event(event_type="DAILY_REVIEW_SENT")
+    if not isinstance(ev, Mapping):
+        return None
+    payload = ev.get("payload") if isinstance(ev.get("payload"), Mapping) else {}
+    if not isinstance(payload, Mapping):
+        return None
+    advice = payload.get("improvement_advice") if isinstance(payload.get("improvement_advice"), Mapping) else {}
+    return {
+        "day": str(payload.get("day") or ""),
+        "realized_pnl": float(_as_float(payload.get("realized_pnl"), default=0.0)),
+        "fees_paid": float(_as_float(payload.get("fees_paid"), default=0.0)),
+        "trades_count": int(_as_float(payload.get("trades_count"), default=0.0)),
+        "improvement_title": str(advice.get("improvement_title") or ""),
+        "improvement_reason": str(advice.get("improvement_reason") or ""),
+        "suggested_changes": [str(x) for x in list(advice.get("suggested_changes") or []) if str(x).strip()][:5],
+        "diagnostics": dict(advice.get("diagnostics") or {}) if isinstance(advice, Mapping) else {},
     }
 
 
@@ -3083,40 +3203,78 @@ def _build_learning_context(*, repo: PostgresRepo, now_kst: datetime, rules_raw:
     meeting_max_sessions = max(1, meeting_max_sessions)
     meeting_summary_max_chars = max(120, meeting_summary_max_chars)
 
-    rows = repo.fetch_decision_outcomes(limit=max_rows)
+    outcome_rows = repo.fetch_decision_outcomes(limit=max_rows)
+    trade_rows = repo.fetch_realized_trades(limit=max_rows)
     outcome_windows = {
         "execution": _summarize_recent_outcomes(
             repo=repo,
             now_kst=now_kst,
             hours=execution_hours,
-            rows=rows,
+            rows=outcome_rows,
             window_name="execution",
         ),
         "short": _summarize_recent_outcomes(
             repo=repo,
             now_kst=now_kst,
             days=short_days,
-            rows=rows,
+            rows=outcome_rows,
             window_name="short",
         ),
         "medium": _summarize_recent_outcomes(
             repo=repo,
             now_kst=now_kst,
             days=medium_days,
-            rows=rows,
+            rows=outcome_rows,
             window_name="medium",
         ),
         "anchor": _summarize_recent_outcomes(
             repo=repo,
             now_kst=now_kst,
             days=anchor_days,
-            rows=rows,
+            rows=outcome_rows,
+            window_name="anchor",
+        ),
+    }
+    performance_windows = {
+        "execution": _summarize_recent_trade_performance(
+            repo=repo,
+            now_kst=now_kst,
+            hours=execution_hours,
+            rows=trade_rows,
+            window_name="execution",
+        ),
+        "short": _summarize_recent_trade_performance(
+            repo=repo,
+            now_kst=now_kst,
+            days=short_days,
+            rows=trade_rows,
+            window_name="short",
+        ),
+        "medium": _summarize_recent_trade_performance(
+            repo=repo,
+            now_kst=now_kst,
+            days=medium_days,
+            rows=trade_rows,
+            window_name="medium",
+        ),
+        "anchor": _summarize_recent_trade_performance(
+            repo=repo,
+            now_kst=now_kst,
+            days=anchor_days,
+            rows=trade_rows,
             window_name="anchor",
         ),
     }
     execution_outcomes = outcome_windows["execution"]
     short_outcomes = outcome_windows["short"]
+    execution_performance = performance_windows["execution"]
+    short_performance = performance_windows["short"]
     recent_outcomes = execution_outcomes if int(execution_outcomes.get("total_trades") or 0) >= min_recent_trades else short_outcomes
+    recent_performance = (
+        execution_performance
+        if int(execution_performance.get("trades_count") or 0) >= min_recent_trades
+        else short_performance
+    )
     recent_meeting_lessons = (
         _build_recent_meeting_lessons(
             repo=repo,
@@ -3131,6 +3289,9 @@ def _build_learning_context(*, repo: PostgresRepo, now_kst: datetime, rules_raw:
     return {
         "recent_outcomes": dict(recent_outcomes),
         "outcome_windows": {k: dict(v) for k, v in outcome_windows.items()},
+        "recent_performance": dict(recent_performance),
+        "performance_windows": {k: dict(v) for k, v in performance_windows.items()},
+        "latest_daily_review": _latest_daily_review_snapshot(repo=repo),
         "recent_meeting_lessons": list(recent_meeting_lessons),
         "latest_weekly_priority": _latest_weekly_priority_snapshot(repo=repo),
         "settings": {

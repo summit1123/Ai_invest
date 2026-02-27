@@ -95,10 +95,10 @@ signal:
   trend_follow_enabled: true
 version: v1.0
 workers:
-  ops_interval_sec: 3600
-  risk_interval_sec: 3600
-  quant_interval_sec: 3600
-  research_interval_sec: 3600
+  ops_interval_sec: 7200
+  risk_interval_sec: 7200
+  quant_interval_sec: 7200
+  research_interval_sec: 7200
 research:
   web_search:
     limit: 8
@@ -114,7 +114,7 @@ strategy:
     ema_slow: 60
     exit_rsi: 45
     atr_ref_pct: 1.3
-    entry_alpha: 0.62
+    entry_alpha: 0.75
     strong_alpha: 0.65
     atr_block_pct: 2.5
     ret_long_mins: 60
@@ -131,7 +131,7 @@ strategy:
     base_target_pct: 2.0
     rev_ret_15m_max: -0.008
     rev_rsi_now_min: 50
-    cooldown_minutes: 120
+    cooldown_minutes: 152
     lookback_minutes: 240
     mom_weight_trend: 0.25
     rev_rsi_prev_max: 32
@@ -192,22 +192,23 @@ cost_guard:
   min_expected_edge_bps: 28.0
   max_predicted_slippage_bps: 10.0
 governance:
-  llm_call_timeout_sec: 90
-  protocol_timeout_sec: 900
-  max_open_meeting_minutes: 30
   micro_mode:
     enabled: true
-    min_alpha: 0.72
+    min_alpha: 0.85
+    realtime_min_alpha_delta: -0.08
+    realtime_max_spread_mult: 1.15
     entry_mode: adaptive
-    max_spread_bps: 1.5
+    max_spread_bps: 1.165
     plan_hold_only: true
+    realtime_between_meetings: true
+    realtime_symbol_max_age_min: 180
     max_position_pct: 3.0
     max_daily_loss_pct: 0.5
     max_trades_per_day: 10
     require_market_long: false
     allow_plan_led_entry: true
-    ignore_market_cooldown_in_plan_led: true
     ignore_market_edge_in_plan_led: true
+    ignore_market_cooldown_in_plan_led: true
   capital_policy:
     tiers:
     - name: seed_small
@@ -251,72 +252,63 @@ governance:
   catchup_enabled: true
   plan_continuity:
     enabled: true
-    min_hold_minutes: 120
+    min_hold_minutes: 152
     sticky_if_position_open: true
     switch_min_backtest_score_delta: 2.0
     switch_min_candidate_score_delta: 0.15
-  meeting_window_min: 5
-  prework_max_age_min: 90
-  catchup_lookback_hours: 36
-  daily_meeting_times_kst:
-  - 00:00
-  - 01:00
-  - 02:00
-  - 03:00
-  - 04:00
-  - 05:00
-  - 06:00
-  - 07:00
-  - 08:00
-  - 09:00
-  - '10:00'
-  - '11:00'
-  - '12:00'
-  - '13:00'
-  - '14:00'
-  - '15:00'
-  - '16:00'
-  - '17:00'
-  - '18:00'
-  - '19:00'
-  - '20:00'
-  - '21:00'
-  - '22:00'
-  - '23:00'
-  require_prework_reports: true
-  meeting_on_the_hour_only: true
-  default_target_position_pct: 10.0
-  prework_refresh_cooldown_min: 5
   learning_context:
-    max_outcome_rows: 6000
-    recent_window_fallback_min_trades: 5
-    outcome_windows:
-      execution_hours: 6
-      short_days: 14
-      medium_days: 90
-      anchor_days: 270
     meeting_memory:
       enabled: true
-      lookback_days: 14
       max_sessions: 6
+      lookback_days: 14
       summary_max_chars: 280
+    outcome_windows:
+      short_days: 14
+      anchor_days: 270
+      medium_days: 90
+      execution_hours: 6
+    max_outcome_rows: 6000
+    recent_window_fallback_min_trades: 5
+  meeting_window_min: 3
+  prework_max_age_min: 90
+  llm_call_timeout_sec: 90
+  protocol_timeout_sec: 900
+  catchup_lookback_hours: 36
+  daily_meeting_times_kst:
+  - '00:05'
+  - '02:05'
+  - '04:05'
+  - '06:05'
+  - '08:05'
+  - '10:05'
+  - '12:05'
+  - '14:05'
+  - '16:05'
+  - '18:05'
+  - '20:05'
+  - '22:05'
+  require_prework_reports: true
+  max_open_meeting_minutes: 20
+  meeting_on_the_hour_only: false
+  default_target_position_pct: 10.0
+  prework_refresh_cooldown_min: 3
 paper_mode:
   data_collection:
     enabled: true
     force_plan_target_pct: 3.0
-    allow_soft_plan_block_bypass: true
     force_plan_buy_allowed: true
     relaxed_min_win_rate_pct: 25.0
     relaxed_min_profit_factor: 1.05
     min_trades_for_strict_gate: 4
     relaxed_min_backtest_score: -1.5
     relaxed_min_expectancy_pct: 0.0
+    allow_soft_plan_block_bypass: true
 scheduling:
   candle_timeframes:
   - 1m
   - 15m
   - 1h
-  decision_interval_sec: 15
+  decision_interval_sec: 30
 settlement:
   timezone: Asia/Seoul
 stop_policy:
@@ -370,8 +362,6 @@ adaptive_tuning:
     execution_hours: 6
   interval_sec: 3600
   max_step_pct: 8.0
-  min_apply_interval_hours: 6
-  preserve_exploration_on_low_activity: true
   align_to_clock: true
   regime_weights:
     CHOP:
@@ -401,4 +391,6 @@ adaptive_tuning:
   - governance.micro_mode.min_alpha
   - governance.micro_mode.max_spread_bps
   - governance.plan_continuity.min_hold_minutes
+  min_apply_interval_hours: 6
   target_trades_in_execution_window: 6
+  preserve_exploration_on_low_activity: true

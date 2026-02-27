@@ -79,11 +79,13 @@ def governance_quant_instructions() -> str:
             "Fact Pack 기반으로 실행 가능한 전략 초안(심볼/비중/트리거/쿨다운/시간성향)을 제안한다.",
             "과매매 방지 조건(rebalance band, cooldown)을 포함한다.",
             "learning_context.outcome_windows(실행/단기/중기/앵커)에서 실패 패턴을 읽고 진입/청산 조건을 조정한다.",
+            "learning_context.performance_windows(실현손익/수수료/보유시간)로 단타 과열 여부를 판단한다.",
             "체결 결과(수익/수수료/실패코드)를 반영해 after-cost 기대값이 양수인 진입만 남긴다.",
         ],
         input_contract=[
             "입력의 allowed_symbols와 rules.risk/cost_guard/capital_profile 제약을 반드시 반영한다.",
             "learning_context.latest_weekly_priority와 outcome_windows를 근거로 notes에 왜 그렇게 바꿨는지 남긴다.",
+            "learning_context.latest_daily_review가 있으면 suggested_changes 중 이번 슬롯에 적용한 항목/미적용 항목을 notes에 명시한다.",
             "learning_context.recent_meeting_lessons(최근 회의 요약)가 있으면 직전 실수 재발 방지 조건을 1개 이상 반영한다.",
         ],
         hard_rules=[
@@ -95,6 +97,7 @@ def governance_quant_instructions() -> str:
             "entry_triggers에는 진입 조건 + 무효화(invalidation) 조건을 최소 1개씩 포함한다.",
             "exit_triggers에는 이익실현/손절/시간청산 조건을 각각 최소 1개 이상 포함한다.",
             "OC_COST_UNDERESTIMATED가 반복되면 비용 미커버 단타를 금지하는 조건(최소 기대 엣지)을 명시한다.",
+            "recent_performance.net_pnl_after_fees<0 이고 avg_hold_minutes가 짧으면 time_horizon을 intraday로 고정하지 않는다.",
             "스키마 JSON만 출력.",
         ],
         output_schema=[
@@ -193,11 +196,13 @@ def governance_coordinator_instructions() -> str:
             "시장 상태에 맞는 time_horizon(intraday/1d/swing)을 명시한다.",
             "learning_context의 최근 성과/실패원인을 반영해 이번 슬롯 실험 가설을 구체화한다.",
             "하드게이트가 통과하는 경우에는 실행 가능한 계획(진입/무효화/청산)을 구체적으로 확정한다.",
+            "after-cost 성과가 음수일 때는 빈도보다 품질(비용 커버) 중심으로 계획을 재구성한다.",
         ],
         input_contract=[
             "입력에는 fact_pack, round1, critiques가 포함된다.",
             "allowed_symbols, rules.risk/cost_guard, capital_profile 제약을 준수한다.",
             "learning_context.outcome_windows와 latest_weekly_priority를 참조한다.",
+            "learning_context.performance_windows와 latest_daily_review를 참조해 비용잠식 여부를 확인한다.",
             "learning_context.recent_meeting_lessons를 참조해 직전 회의의 실패 교훈이 이번 계획에 반영됐는지 확인한다.",
         ],
         hard_rules=[
@@ -206,6 +211,7 @@ def governance_coordinator_instructions() -> str:
             "target_position_pct는 0~max_position_pct_per_symbol 범위.",
             "time_horizon은 auto|intraday|1d|swing 중 1개를 사용한다.",
             "최종 rationale에는 '이번 슬롯에서 검증할 가설 1개'를 명시한다.",
+            "rationale에는 recent_performance의 핵심 수치(순손익/수수료/평균보유시간) 중 최소 1개를 인용한다.",
             "하드게이트가 모두 통과한 상황에서는 target_position_pct=0을 기본값으로 두지 않는다.",
             "스키마 JSON만 출력.",
         ],
@@ -228,6 +234,7 @@ def governance_secretary_instructions() -> str:
             "회의 내용을 사람이 바로 이해할 수 있는 회의록으로 요약한다.",
             "결론/근거/제약/리스크/액션아이템을 빠짐없이 정리한다.",
             "다음 슬롯까지의 단계별 개선 플랜을 실행 가능한 문장으로 제시한다.",
+            "learning_context.latest_daily_review가 있으면 오늘 수정 권고를 1~3개로 요약한다.",
         ],
         input_contract=[
             "입력에는 fact_pack, round1, critiques, final_plan이 포함된다.",

@@ -31,6 +31,41 @@ class _RepoStub:
         _ = limit
         return []
 
+    def fetch_realized_trades(self, *, limit: int = 5000):  # type: ignore[no-untyped-def]
+        _ = limit
+        return [
+            {
+                "ts_open": self._now - timedelta(hours=2, minutes=40),
+                "ts_close": self._now - timedelta(hours=2, minutes=30),
+                "realized_pnl": 1200.0,
+                "fees_total": 320.0,
+            },
+            {
+                "ts_open": self._now - timedelta(hours=1, minutes=15),
+                "ts_close": self._now - timedelta(hours=1),
+                "realized_pnl": -300.0,
+                "fees_total": 210.0,
+            },
+        ]
+
+    def fetch_latest_event(self, *, event_type: str):  # type: ignore[no-untyped-def]
+        if event_type != "DAILY_REVIEW_SENT":
+            return None
+        return {
+            "payload": {
+                "day": "2026-02-25",
+                "realized_pnl": 900.0,
+                "fees_paid": 530.0,
+                "trades_count": 2,
+                "improvement_advice": {
+                    "improvement_title": "수수료 누수 차단이 1순위",
+                    "improvement_reason": "비용이 손익을 잠식",
+                    "suggested_changes": ["entry_alpha 상향", "max_spread_bps 축소"],
+                    "diagnostics": {"avg_hold_minutes": 12.5},
+                },
+            }
+        }
+
     def fetch_meeting_sessions(self, *, limit: int = 50):  # type: ignore[no-untyped-def]
         _ = limit
         return [
@@ -78,3 +113,12 @@ def test_learning_context_contains_recent_meeting_lessons() -> None:
     assert len(lessons) == 1
     assert str(lessons[0].get("symbol")) == "KRW-BTC"
     assert "비용 미커버 단타" in str(lessons[0].get("summary") or "")
+
+    perf = dict(ctx.get("recent_performance") or {})
+    assert int(perf.get("trades_count") or 0) >= 1
+    assert float(perf.get("fees_paid") or 0.0) > 0.0
+    assert "performance_windows" in ctx
+
+    latest_daily = dict(ctx.get("latest_daily_review") or {})
+    assert str(latest_daily.get("improvement_title") or "") == "수수료 누수 차단이 1순위"
+    assert len(list(latest_daily.get("suggested_changes") or [])) >= 1

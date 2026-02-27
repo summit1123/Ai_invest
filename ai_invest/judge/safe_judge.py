@@ -84,6 +84,10 @@ def _opt_str(payload: Mapping[str, Any], path: str) -> str | None:
     return s or None
 
 
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(float(lo), min(float(hi), float(value)))
+
+
 def _extract_reason_codes(payload: Mapping[str, Any] | None) -> list[ReasonCode]:
     if not isinstance(payload, Mapping):
         return []
@@ -316,14 +320,21 @@ def safe_judge_decide(
         micro_max_position_pct = float(micro_cfg.get("max_position_pct") or 3.0)
         micro_max_spread_bps = float(micro_cfg.get("max_spread_bps") or 1.0)
         micro_min_alpha = float(micro_cfg.get("min_alpha") or 0.7)
+        micro_realtime_min_alpha_delta = float(micro_cfg.get("realtime_min_alpha_delta") or -0.08)
+        micro_realtime_max_spread_mult = float(micro_cfg.get("realtime_max_spread_mult") or 1.15)
         micro_max_daily_loss_pct = float(micro_cfg.get("max_daily_loss_pct") or 0.5)
         micro_max_trades_per_day = int(micro_cfg.get("max_trades_per_day") or 5)
         micro_plan_hold_only = bool(micro_cfg.get("plan_hold_only", True))
         micro_allow_plan_led_entry = bool(micro_cfg.get("allow_plan_led_entry", False))
         micro_require_market_long = bool(micro_cfg.get("require_market_long", True))
+        micro_ignore_cooldown_in_plan_led = bool(micro_cfg.get("ignore_market_cooldown_in_plan_led", False))
+        micro_ignore_edge_in_plan_led = bool(micro_cfg.get("ignore_market_edge_in_plan_led", True))
         plan_gate_hard_block = _opt_bool(payload, "context.trade_plan.activation_gate.hard_plan_block")
         plan_gate_soft_block = _opt_bool(payload, "context.trade_plan.activation_gate.soft_plan_block")
         plan_gate_exec_block = _opt_bool(payload, "context.trade_plan.activation_gate.plan_execution_blocked")
+        inter_slot_realtime_mode = bool(
+            _opt_bool(payload, "context.trade_plan.activation_gate.inter_slot_realtime_mode")
+        )
         plan_gate_passed = not bool(plan_gate_hard_block or plan_gate_soft_block or plan_gate_exec_block)
 
         gates["micro_mode_enabled"] = bool(micro_enabled)
@@ -337,6 +348,11 @@ def safe_judge_decide(
             "plan_hold_only": bool(micro_plan_hold_only),
             "allow_plan_led_entry": bool(micro_allow_plan_led_entry),
             "require_market_long": bool(micro_require_market_long),
+            "ignore_market_cooldown_in_plan_led": bool(micro_ignore_cooldown_in_plan_led),
+            "ignore_market_edge_in_plan_led": bool(micro_ignore_edge_in_plan_led),
+            "realtime_min_alpha_delta": float(micro_realtime_min_alpha_delta),
+            "realtime_max_spread_mult": float(micro_realtime_max_spread_mult),
+            "inter_slot_realtime_mode": bool(inter_slot_realtime_mode),
         }
 
         plan_decision_effective = str(trade_plan_activation_decision_effective or "").upper()
@@ -373,9 +389,17 @@ def safe_judge_decide(
             micro_entry_path = "market-led" if market_led_ok else "blocked"
         market_has_cooldown_block = any(c == ReasonCode.RG_COOLDOWN_ACTIVE for c in market_reason_codes)
         market_has_edge_block = any(c == ReasonCode.RG_EDGE_TOO_LOW for c in market_reason_codes)
-        # In plan-led micro entry, allow a lower-edge pilot in paper mode as long as alpha/risk/cost checks pass.
-        edge_block_applied = bool(market_has_edge_block and micro_entry_path != "plan-led")
-        market_reason_blocked = bool(market_has_cooldown_block or edge_block_applied)
+        # In plan-led micro entry, optionally ignore market cooldown/edge blocks and rely on
+        # alpha + spread + daily-loss + size gates for controlled paper exploration.
+        cooldown_block_applied = bool(
+            market_has_cooldown_block
+            and not (micro_entry_path == "plan-led" and micro_ignore_cooldown_in_plan_led)
+        )
+        edge_block_applied = bool(
+            market_has_edge_block
+            and not (micro_entry_path == "plan-led" and micro_ignore_edge_in_plan_led)
+        )
+        market_reason_blocked = bool(cooldown_block_applied or edge_block_applied)
 
         micro_candidate_context = (
             bool(micro_enabled)
@@ -389,16 +413,38 @@ def safe_judge_decide(
         if micro_candidate_context and (not bool(trigger_ok)):
             micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_POLICY
         if micro_allowed_context and market_reason_blocked:
-            if market_has_cooldown_block:
+            if cooldown_block_applied:
                 micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_COOLDOWN
             elif edge_block_applied:
                 micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_EDGE
 
+        # Dynamic micro thresholds for real-time responsiveness:
+        # - inter-slot mode relaxes alpha/spread slightly (paper only exploration)
+        # - tight spread relaxes alpha, near-limit spread tightens alpha
+        # - near daily loss limit tightens alpha
+        dynamic_min_alpha = float(micro_min_alpha)
+        dynamic_max_spread_bps = float(micro_max_spread_bps)
+        if inter_slot_realtime_mode:
+            dynamic_min_alpha = float(dynamic_min_alpha + micro_realtime_min_alpha_delta)
+            dynamic_max_spread_bps = float(dynamic_max_spread_bps * micro_realtime_max_spread_mult)
+        if float(spread_bps) <= float(micro_max_spread_bps) * 0.5:
+            dynamic_min_alpha -= 0.02
+        if float(spread_bps) >= float(dynamic_max_spread_bps) * 0.9:
+            dynamic_min_alpha += 0.03
+        if float(daily_loss_pct) >= float(micro_max_daily_loss_pct) * 0.8:
+            dynamic_min_alpha += 0.05
+        dynamic_min_alpha = _clamp(dynamic_min_alpha, 0.55, 0.98)
+        dynamic_max_spread_bps = _clamp(
+            dynamic_max_spread_bps,
+            min(1.0, float(rules.cost_guard.max_spread_bps_entry)),
+            float(rules.cost_guard.max_spread_bps_entry),
+        )
+
         micro_pass = (
             micro_allowed_context
             and not bool(market_reason_blocked)
-            and (market_alpha is not None and float(market_alpha) >= float(micro_min_alpha))
-            and float(spread_bps) <= float(micro_max_spread_bps)
+            and (market_alpha is not None and float(market_alpha) >= float(dynamic_min_alpha))
+            and float(spread_bps) <= float(dynamic_max_spread_bps)
             and float(daily_loss_pct) <= float(micro_max_daily_loss_pct)
             and (
                 daily_trades_count is None
@@ -412,6 +458,8 @@ def safe_judge_decide(
         gates["micro_mode_market_reason_blocked"] = bool(market_reason_blocked)
         gates["micro_mode_edge_block_applied"] = bool(edge_block_applied)
         gates["micro_mode_plan_gate_passed"] = bool(plan_gate_passed)
+        gates["micro_mode_dynamic_min_alpha"] = float(dynamic_min_alpha)
+        gates["micro_mode_dynamic_max_spread_bps"] = float(dynamic_max_spread_bps)
 
         if micro_pass:
             action = "BUY"

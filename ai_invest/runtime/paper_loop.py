@@ -91,6 +91,37 @@ def _as_int(value: Any, *, default: int = 0) -> int:
         return int(default)
 
 
+def _latest_symbol_learning_feedback(*, repo: PostgresRepo, symbol: str) -> dict[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    row = repo.fetch_latest_agent_daily_report(agent_name="quant_strategist")
+    if not isinstance(row, Mapping):
+        return {"enabled": False, "symbol": sym}
+    findings = row.get("findings")
+    findings_map = findings if isinstance(findings, Mapping) else {}
+    learning_raw = findings_map.get("learning_feedback")
+    learning_map = learning_raw if isinstance(learning_raw, Mapping) else {}
+    by_symbol = learning_map.get("by_symbol")
+    by_symbol_map = by_symbol if isinstance(by_symbol, Mapping) else {}
+    symbol_profile = by_symbol_map.get(sym)
+    profile_map = symbol_profile if isinstance(symbol_profile, Mapping) else {}
+
+    created_at = row.get("created_at")
+    age_minutes = None
+    if isinstance(created_at, datetime):
+        ts = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+        age_minutes = max(0.0, (_utcnow() - ts.astimezone(timezone.utc)).total_seconds() / 60.0)
+
+    return {
+        "enabled": bool(learning_map.get("enabled", False)),
+        "symbol": sym,
+        "report_id": str(row.get("report_id") or ""),
+        "report_age_minutes": float(age_minutes) if age_minutes is not None else None,
+        "summary": dict(learning_map.get("summary") or {}) if isinstance(learning_map.get("summary"), Mapping) else {},
+        "top_symbol": str(learning_map.get("top_symbol") or ""),
+        "symbol_profile": dict(profile_map),
+    }
+
+
 def _resolve_cap_config(activation_gate: Mapping[str, Any]) -> dict[str, Any]:
     cap = (activation_gate.get("conditional_activation") or {}) if isinstance(activation_gate, Mapping) else {}
     conditions = (cap.get("conditions") or {}) if isinstance(cap, Mapping) else {}
@@ -132,6 +163,61 @@ def _trade_plan_is_active(plan: dict[str, Any]) -> bool:
     if vt and now >= vt:
         return False
     return True
+
+
+def _plan_is_hold_activation(plan: Mapping[str, Any] | None) -> bool:
+    if not isinstance(plan, Mapping):
+        return False
+    gate = plan.get("activation_gate") if isinstance(plan.get("activation_gate"), Mapping) else {}
+    decision_effective = str((gate or {}).get("decision_effective") or "").strip().upper()
+    decision = str((gate or {}).get("decision") or "").strip().upper()
+    hold_mode = str((gate or {}).get("hold_mode") or "").strip().upper()
+    return bool(decision_effective == "HOLD" or decision == "HOLD" or hold_mode.startswith("HOLD"))
+
+
+def _latest_quant_candidate_symbol(
+    *,
+    repo: PostgresRepo,
+    max_age_minutes: int = 180,
+    allowed_symbols: set[str] | None = None,
+) -> str | None:
+    row = repo.fetch_latest_agent_daily_report(agent_name="quant_strategist")
+    if not isinstance(row, Mapping):
+        return None
+
+    created_at = row.get("created_at")
+    if isinstance(created_at, datetime):
+        ts = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+        age_min = max(0.0, (_utcnow() - ts.astimezone(timezone.utc)).total_seconds() / 60.0)
+        if age_min > float(max(1, int(max_age_minutes))):
+            return None
+
+    findings = row.get("findings") if isinstance(row.get("findings"), Mapping) else {}
+    candidates = findings.get("candidates") if isinstance(findings, Mapping) and isinstance(findings.get("candidates"), list) else []
+
+    best_symbol: str | None = None
+    best_score = -10_000.0
+    for cand in candidates:
+        if not isinstance(cand, Mapping):
+            continue
+        sym = str(cand.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        if allowed_symbols is not None and sym not in allowed_symbols:
+            continue
+        score = _as_float(cand.get("score"), default=-9999.0)
+        if best_symbol is None or float(score) > float(best_score):
+            best_symbol = sym
+            best_score = float(score)
+
+    if best_symbol:
+        return best_symbol
+
+    suggested = findings.get("suggested_plan") if isinstance(findings, Mapping) and isinstance(findings.get("suggested_plan"), Mapping) else {}
+    sym = str((suggested or {}).get("symbol") or "").strip().upper()
+    if sym and (allowed_symbols is None or sym in allowed_symbols):
+        return sym
+    return None
 
 
 def _fetch_open_position_symbols(*, repo: PostgresRepo) -> list[str]:
@@ -249,29 +335,57 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         1,
         int(_as_float((raw_rules.get("scheduling", {}) or {}).get("decision_interval_sec"), default=15.0)),
     )
+    governance_cfg = (raw_rules.get("governance") or {}) if isinstance(raw_rules, Mapping) else {}
+    micro_cfg = (governance_cfg.get("micro_mode") or {}) if isinstance(governance_cfg, Mapping) else {}
+    universe_mode = str((universe_cfg.get("mode") or "paper")).strip().lower()
+    realtime_between_meetings = bool(micro_cfg.get("realtime_between_meetings", True))
+    realtime_symbol_max_age_min = max(15, _as_int(micro_cfg.get("realtime_symbol_max_age_min"), default=180))
     cap_runtime_state: dict[str, dict[str, Any]] = {}
 
     for _i in range(cycles):
         decision_id = uuid.uuid4()
         symbol = default_symbol
+        symbol_source = "default"
         plan_symbol: str | None = None
+        plan_is_hold = False
         manage_open_position_only = False
+        inter_slot_realtime_mode = False
         plan = repo.fetch_latest_trade_plan()
         if plan and _trade_plan_is_active(plan):
             p_sym = str(plan.get("symbol") or "").strip().upper()
             if p_sym:
                 plan_symbol = p_sym
+            plan_is_hold = _plan_is_hold_activation(plan)
 
         open_symbols = _fetch_open_position_symbols(repo=repo)
         if open_symbols:
             if plan_symbol and plan_symbol in set(open_symbols):
                 symbol = str(plan_symbol)
+                symbol_source = "open_position_plan_symbol"
             else:
                 symbol = str(open_symbols[0])
+                symbol_source = "open_position_fallback"
                 if plan_symbol and plan_symbol != symbol:
                     manage_open_position_only = True
-        elif plan_symbol and (not enforce_static_allowlist or plan_symbol in set(rules.universe.symbols)):
+        elif plan_symbol and (not enforce_static_allowlist or plan_symbol in set(rules.universe.symbols)) and (
+            not (plan_is_hold and universe_mode == "paper" and realtime_between_meetings)
+        ):
             symbol = str(plan_symbol)
+            symbol_source = "plan_symbol"
+        elif plan_is_hold and universe_mode == "paper" and realtime_between_meetings:
+            allowed_symbols = set(rules.universe.symbols) if enforce_static_allowlist else None
+            runtime_symbol = _latest_quant_candidate_symbol(
+                repo=repo,
+                max_age_minutes=int(realtime_symbol_max_age_min),
+                allowed_symbols=allowed_symbols,
+            )
+            if runtime_symbol:
+                symbol = str(runtime_symbol)
+                symbol_source = "quant_inter_slot"
+                inter_slot_realtime_mode = True
+            elif plan_symbol and (not enforce_static_allowlist or plan_symbol in set(rules.universe.symbols)):
+                symbol = str(plan_symbol)
+                symbol_source = "plan_symbol_hold_fallback"
 
         try:
             snapshot = fetch_market_snapshot(symbol)
@@ -366,6 +480,12 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 if str(plan_activation_decision_effective or plan_activation_decision or "").upper() == "HOLD":
                     plan_target_pct = 0.0
                     raw_plan_target_pct = 0.0
+                    if inter_slot_realtime_mode and universe_mode == "paper" and realtime_between_meetings:
+                        # HOLD plan between meetings: keep plan target at 0, but allow market-led micro entry.
+                        plan_allowed_actions["buy"] = True
+                        if "sell" not in plan_allowed_actions:
+                            plan_allowed_actions["sell"] = True
+                        plan_activation_gate["inter_slot_realtime_mode"] = True
         except Exception:
             plan_target_pct = None
             raw_plan_target_pct = None
@@ -481,11 +601,17 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     "raw_target_position_pct": (raw_plan_target_pct if raw_plan_target_pct is not None else (plan.get("target_position_pct") if plan else None)),
                     "valid_to_kst": plan.get("valid_to_kst") if plan else None,
                     "allowed_actions": dict(plan_allowed_actions),
-                    "execution_scope": "MANAGE_OPEN_POSITION_ONLY" if manage_open_position_only else "PLAN_SYMBOL",
+                    "execution_scope": (
+                        "MANAGE_OPEN_POSITION_ONLY"
+                        if manage_open_position_only
+                        else ("INTER_SLOT_REALTIME" if inter_slot_realtime_mode else "PLAN_SYMBOL")
+                    ),
+                    "symbol_source": str(symbol_source),
                     "plan_symbol": plan_symbol,
                     "activation_gate": dict(plan_activation_gate or {}),
                     "execution_plan": dict(plan_execution_plan or {}),
                 },
+                "learning_feedback": _latest_symbol_learning_feedback(repo=repo, symbol=symbol),
             },
         )
 

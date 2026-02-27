@@ -245,6 +245,7 @@ class SafeJudgeTests(unittest.TestCase):
 
     def test_micro_plan_led_promotes_buy_in_hold_mode(self) -> None:
         payload = base_payload()
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})["max_spread_bps"] = 3.0
         payload["context"]["trade_plan"] = {
             "allowed_actions": {"buy": True, "sell": True},
             "target_position_pct": 2.5,
@@ -292,6 +293,10 @@ class SafeJudgeTests(unittest.TestCase):
                 "plan_execution_blocked": False,
             },
         }
+        # Guard semantics test: explicitly disable plan-led cooldown ignore.
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})[
+            "ignore_market_cooldown_in_plan_led"
+        ] = False
 
         decision = safe_judge_decide(
             payload,
@@ -308,6 +313,109 @@ class SafeJudgeTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "HOLD")
         self.assertEqual(decision.selected_reasons, [ReasonCode.RG_MICRO_BLOCKED_COOLDOWN.value])
+
+    def test_micro_plan_led_can_ignore_cooldown_when_enabled(self) -> None:
+        payload = base_payload()
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})["max_spread_bps"] = 3.0
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": True, "sell": True},
+            "target_position_pct": 2.0,
+            "activation_gate": {
+                "decision": "HOLD",
+                "decision_effective": "HOLD",
+                "hard_plan_block": False,
+                "soft_plan_block": False,
+                "plan_execution_blocked": False,
+            },
+        }
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})[
+            "ignore_market_cooldown_in_plan_led"
+        ] = True
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={
+                "signal": "HOLD",
+                "alpha": 0.95,
+                "signal_target_pct": 0.0,
+                "reason_codes": [ReasonCode.RG_COOLDOWN_ACTIVE.value],
+            },
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "BUY")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_CAP_PROMOTED.value])
+
+    def test_micro_inter_slot_realtime_relaxes_alpha_threshold(self) -> None:
+        payload = base_payload()
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})["max_spread_bps"] = 3.0
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})["min_alpha"] = 0.85
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})["realtime_min_alpha_delta"] = -0.08
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": True, "sell": True},
+            "target_position_pct": 2.0,
+            "activation_gate": {
+                "decision": "HOLD",
+                "decision_effective": "HOLD",
+                "hard_plan_block": False,
+                "soft_plan_block": False,
+                "plan_execution_blocked": False,
+                "inter_slot_realtime_mode": True,
+            },
+        }
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={
+                "signal": "HOLD",
+                "alpha": 0.79,
+                "signal_target_pct": 0.0,
+                "reason_codes": [ReasonCode.RG_PASS.value],
+            },
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "BUY")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_CAP_PROMOTED.value])
+        self.assertLess(float(decision.gates.get("micro_mode_dynamic_min_alpha") or 0.0), 0.85)
+
+    def test_micro_without_inter_slot_keeps_base_alpha_threshold(self) -> None:
+        payload = base_payload()
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})["max_spread_bps"] = 3.0
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})["min_alpha"] = 0.85
+        self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})["realtime_min_alpha_delta"] = -0.08
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": True, "sell": True},
+            "target_position_pct": 2.0,
+            "activation_gate": {
+                "decision": "HOLD",
+                "decision_effective": "HOLD",
+                "hard_plan_block": False,
+                "soft_plan_block": False,
+                "plan_execution_blocked": False,
+                "inter_slot_realtime_mode": False,
+            },
+        }
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={
+                "signal": "HOLD",
+                "alpha": 0.79,
+                "signal_target_pct": 0.0,
+                "reason_codes": [ReasonCode.RG_PASS.value],
+            },
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_MICRO_BLOCKED_POLICY.value])
 
     def test_cap_promoted_paper_override_allows_buy_with_effective_target(self) -> None:
         payload = base_payload()
