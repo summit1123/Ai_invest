@@ -13,7 +13,7 @@ class AlphaScoreTests(unittest.TestCase):
         features = {
             "rsi_14": 60.0,  # s_rsi=1
             "rsi_14_prev": 58.0,
-            "vol_zscore": 1.457142857,  # s_vol~=0.5714 -> mom ~= 0.65
+            "vol_zscore": 1.457142857,  # s_vol~=0.5714
             "ret_15m": 0.0,
             "ret_60m": 0.0,
             "ema20": 101.0,
@@ -21,7 +21,13 @@ class AlphaScoreTests(unittest.TestCase):
             "atr_pct": 1.3,
         }
         out = compute_alpha_score(features=features, cfg=self.cfg)
-        self.assertAlmostEqual(out.alpha, 0.65, places=2)
+        expected_mom = (
+            (self.cfg.mom_weight_rsi * 1.0)
+            + (self.cfg.mom_weight_vol * ((1.457142857 - 1.0) / 0.8))
+            + (self.cfg.mom_weight_ret * 0.0)
+            + (self.cfg.mom_weight_trend * 1.0)
+        ) / (self.cfg.mom_weight_rsi + self.cfg.mom_weight_vol + self.cfg.mom_weight_ret + self.cfg.mom_weight_trend)
+        self.assertAlmostEqual(out.alpha, expected_mom, places=6)
         self.assertGreaterEqual(out.signal_target_pct, self.cfg.base_target_pct * 0.95)
 
     def test_strong_alpha_increases_target(self) -> None:
@@ -75,4 +81,3 @@ class AlphaScoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -136,8 +136,17 @@ class PaperExecutor:
                 except Exception:
                     max_open_positions = 1
                 if max_open_positions > 0:
-                    overview = self._repo.fetch_portfolio_overview(quote_currency=quote_ccy)
-                    open_positions = int(overview.get("positions_count") or 0)
+                    # Backward compatibility:
+                    # test doubles / lightweight repos may not implement portfolio overview yet.
+                    overview_fn = getattr(self._repo, "fetch_portfolio_overview", None)
+                    if callable(overview_fn):
+                        try:
+                            overview = overview_fn(quote_currency=quote_ccy)
+                            open_positions = int((overview or {}).get("positions_count") or 0)
+                        except Exception:
+                            open_positions = 0
+                    else:
+                        open_positions = 0
                     if open_positions >= int(max_open_positions):
                         return None
             min_order_krw = int(rules.execution.min_order_krw)

@@ -101,6 +101,22 @@ def market_agent_opine(
         plan_exec.get("final_numbers") if isinstance(plan_exec.get("final_numbers"), Mapping) else {}
     )
     plan_time_horizon = str(trade_plan.get("time_horizon") or "").strip().lower()
+    learning_feedback = context.get("learning_feedback") if isinstance(context.get("learning_feedback"), Mapping) else {}
+    learning_enabled = bool(learning_feedback.get("enabled", False))
+    learning_profile = (
+        learning_feedback.get("symbol_profile") if isinstance(learning_feedback.get("symbol_profile"), Mapping) else {}
+    )
+    feedback_sample_total = _as_int(learning_profile.get("sample_total"), default=0)
+    feedback_trade_stats = (
+        learning_profile.get("trade_stats") if isinstance(learning_profile.get("trade_stats"), Mapping) else {}
+    )
+    feedback_outcome_stats = (
+        learning_profile.get("outcome_stats") if isinstance(learning_profile.get("outcome_stats"), Mapping) else {}
+    )
+    feedback_cost_ratio = _as_float(feedback_outcome_stats.get("oc_cost_underestimated_ratio"), default=0.0)
+    feedback_latency_ratio = _as_float(feedback_outcome_stats.get("oc_execution_latency_ratio"), default=0.0)
+    feedback_win_rate = _as_float(feedback_trade_stats.get("win_rate_trades"), default=0.0)
+    feedback_avg_pnl_bps = _as_float(feedback_trade_stats.get("avg_pnl_bps"), default=0.0)
     now = _now_utc(payload)
 
     cfg = load_alpha_score_config(rules_raw=rules.raw)
@@ -302,12 +318,27 @@ def market_agent_opine(
             reason={"cooldown_until": state.cooldown_until.isoformat() if state.cooldown_until else None},
         )
 
-    entry_alpha_effective = float(cfg.entry_alpha) + (
+    entry_alpha_dynamic = float(cfg.entry_alpha) + (
         float(cfg.entry_alpha_spread_k) * max(0.0, float(spread_bps)) / 10.0
     ) + (
         float(cfg.entry_alpha_fee_k) * max(0.0, float(fee_total_bps)) / 10.0
     )
-    entry_alpha_effective = max(float(cfg.entry_alpha), min(0.95, float(entry_alpha_effective)))
+    entry_alpha_feedback_adj = 0.0
+    if bool(learning_enabled) and int(feedback_sample_total) >= 8:
+        if float(feedback_cost_ratio) >= 0.20:
+            entry_alpha_feedback_adj += min(0.06, 0.01 + (float(feedback_cost_ratio) - 0.20) * 0.16)
+        if float(feedback_latency_ratio) >= 0.15:
+            entry_alpha_feedback_adj += min(0.03, 0.005 + (float(feedback_latency_ratio) - 0.15) * 0.08)
+        if (
+            float(feedback_avg_pnl_bps) >= 25.0
+            and float(feedback_win_rate) >= 0.58
+            and float(feedback_cost_ratio) <= 0.15
+        ):
+            entry_alpha_feedback_adj -= 0.02
+
+    entry_alpha_floor = max(0.10, float(cfg.entry_alpha) - 0.04)
+    entry_alpha_effective = float(entry_alpha_dynamic) + float(entry_alpha_feedback_adj)
+    entry_alpha_effective = min(0.95, max(float(entry_alpha_floor), float(entry_alpha_effective)))
 
     if alpha.alpha >= float(entry_alpha_effective):
         conf = min(0.95, 0.50 + alpha.alpha * 0.45)
@@ -332,9 +363,18 @@ def market_agent_opine(
                 "signal_target_pct": alpha.signal_target_pct,
                 "strategy_tag": alpha.strategy_tag_candidate,
                 "entry_alpha": float(cfg.entry_alpha),
+                "entry_alpha_dynamic": float(entry_alpha_dynamic),
+                "entry_alpha_feedback_adj": float(entry_alpha_feedback_adj),
+                "entry_alpha_floor": float(entry_alpha_floor),
                 "entry_alpha_effective": float(entry_alpha_effective),
                 "spread_bps": float(spread_bps),
                 "fee_total_bps": float(fee_total_bps),
+                "learning_feedback_enabled": bool(learning_enabled),
+                "learning_feedback_sample_total": int(feedback_sample_total),
+                "learning_feedback_cost_ratio": float(feedback_cost_ratio),
+                "learning_feedback_latency_ratio": float(feedback_latency_ratio),
+                "learning_feedback_win_rate": float(feedback_win_rate),
+                "learning_feedback_avg_pnl_bps": float(feedback_avg_pnl_bps),
             },
         )
 
@@ -355,8 +395,17 @@ def market_agent_opine(
         reason={
             "alpha": alpha.alpha,
             "entry_alpha": float(cfg.entry_alpha),
+            "entry_alpha_dynamic": float(entry_alpha_dynamic),
+            "entry_alpha_feedback_adj": float(entry_alpha_feedback_adj),
+            "entry_alpha_floor": float(entry_alpha_floor),
             "entry_alpha_effective": float(entry_alpha_effective),
             "spread_bps": float(spread_bps),
             "fee_total_bps": float(fee_total_bps),
+            "learning_feedback_enabled": bool(learning_enabled),
+            "learning_feedback_sample_total": int(feedback_sample_total),
+            "learning_feedback_cost_ratio": float(feedback_cost_ratio),
+            "learning_feedback_latency_ratio": float(feedback_latency_ratio),
+            "learning_feedback_win_rate": float(feedback_win_rate),
+            "learning_feedback_avg_pnl_bps": float(feedback_avg_pnl_bps),
         },
     )

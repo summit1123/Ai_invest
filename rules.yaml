@@ -195,18 +195,18 @@ governance:
   micro_mode:
     enabled: true
     min_alpha: 0.85
-    realtime_min_alpha_delta: -0.08
-    realtime_max_spread_mult: 1.15
     entry_mode: adaptive
     max_spread_bps: 1.165
     plan_hold_only: true
-    realtime_between_meetings: true
-    realtime_symbol_max_age_min: 180
     max_position_pct: 3.0
     max_daily_loss_pct: 0.5
     max_trades_per_day: 10
     require_market_long: false
     allow_plan_led_entry: true
+    realtime_max_spread_mult: 1.15
+    realtime_min_alpha_delta: -0.08
+    realtime_between_meetings: true
+    realtime_symbol_max_age_min: 180
     ignore_market_edge_in_plan_led: true
     ignore_market_cooldown_in_plan_led: true
   capital_policy:
@@ -275,11 +275,11 @@ governance:
   protocol_timeout_sec: 900
   catchup_lookback_hours: 36
   daily_meeting_times_kst:
-  - '00:05'
-  - '02:05'
-  - '04:05'
-  - '06:05'
-  - '08:05'
+  - 00:05
+  - 02:05
+  - 04:05
+  - 06:05
+  - 08:05
   - '10:05'
   - '12:05'
   - '14:05'
