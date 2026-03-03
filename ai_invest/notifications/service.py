@@ -295,6 +295,12 @@ class NotificationService:
         fee: float,
         fee_currency: str,
     ) -> None:
+        quote_currency = str(symbol or "").split("-", 1)[0] if "-" in str(symbol or "") else str(fee_currency or "")
+        total_value = float(qty) * float(price)
+        total_fee = float(fee)
+        fee_rate = (total_fee / total_value) if float(total_value) > 0.0 else 0.0
+        fee_rate_pct = float(fee_rate) * 100.0
+        fee_rate_bps = float(fee_rate) * 10000.0
         try:
             chat_id = telegram_client.chat_id_trading()
         except Exception as exc:  # pragma: no cover
@@ -326,6 +332,11 @@ class NotificationService:
                 "price": price,
                 "fee": fee,
                 "fee_currency": fee_currency,
+                "total_value": total_value,
+                "total_fee": total_fee,
+                "quote_currency": quote_currency,
+                "fee_rate_pct": fee_rate_pct,
+                "fee_rate_bps": fee_rate_bps,
             },
         )
 

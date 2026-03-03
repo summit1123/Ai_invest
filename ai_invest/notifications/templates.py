@@ -18,6 +18,16 @@ def _as_float(value: Any, *, digits: int = 2) -> str:
         return "-"
 
 
+def _as_float_trim(value: Any, *, max_digits: int = 8) -> str:
+    try:
+        if value is None:
+            return "-"
+        out = f"{float(value):.{max_digits}f}".rstrip("0").rstrip(".")
+        return out if out else "0"
+    except Exception:
+        return "-"
+
+
 def _as_int(value: Any) -> str:
     try:
         if value is None:
@@ -247,14 +257,64 @@ def tpl_safe_decision(data: Mapping[str, Any]) -> str:
 def tpl_fill_notice(data: Mapping[str, Any]) -> str:
     side = str(data.get("side") or "").upper()
     side_ko = "매수" if side in {"BUY", "BID"} else ("매도" if side in {"SELL", "ASK"} else side)
+    quote_currency = str(data.get("quote_currency") or "").strip().upper()
+    fee_currency = str(data.get("fee_currency") or "").strip().upper()
+
+    qty_text = _as_float_trim(data.get("qty"), max_digits=8)
+
+    if quote_currency == "KRW":
+        price_text = _as_krw(data.get("price"))
+    else:
+        price_text = _join_nonempty(
+            [
+                _as_float_trim(data.get("price"), max_digits=8),
+                quote_currency,
+            ],
+            sep=" ",
+        )
+
+    if quote_currency == "KRW":
+        total_value_text = _as_krw(data.get("total_value"))
+    else:
+        total_value_text = _join_nonempty(
+            [
+                _as_float_trim(data.get("total_value"), max_digits=8),
+                quote_currency,
+            ],
+            sep=" ",
+        )
+    total_fee_text = _join_nonempty(
+        [
+            _as_float_trim(data.get("total_fee", data.get("fee")), max_digits=8),
+            fee_currency,
+        ],
+        sep=" ",
+    )
+    fee_text = _join_nonempty(
+        [
+            _as_float_trim(data.get("fee"), max_digits=8),
+            fee_currency,
+        ],
+        sep=" ",
+    )
+    fee_rate_pct_text = _as_pct(data.get("fee_rate_pct"), digits=4)
+    fee_rate_bps_text = _as_bps(data.get("fee_rate_bps"), digits=2)
+    fee_rate_suffix = (
+        f" (요율 {fee_rate_pct_text}, {fee_rate_bps_text})"
+        if fee_rate_pct_text != "-" and fee_rate_bps_text != "-"
+        else ""
+    )
+
     return (
         "[체결 보고]\n"
         f"- 시각(KST): {data.get('ts_kst')}\n"
         f"- 종목: {data.get('symbol')}\n"
         f"- 거래 유형: {side_ko}\n"
-        f"- 체결 수량: {_as_float(data.get('qty'), digits=8)}\n"
-        f"- 체결 가격: {_as_float(data.get('price'), digits=0)}\n"
-        f"- 수수료: {_as_float(data.get('fee'), digits=4)} {data.get('fee_currency')}\n"
+        f"- 체결 수량: {qty_text}\n"
+        f"- 체결 가격: {price_text}\n"
+        f"- 수수료: {fee_text}{fee_rate_suffix}\n"
+        f"- 총 체결 금액: {total_value_text}\n"
+        f"- 총 수수료: {total_fee_text}\n"
     )
 
 

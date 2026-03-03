@@ -64,6 +64,31 @@ class NotificationTemplateTests(unittest.TestCase):
         self.assertIn("스프레드", text)
         self.assertIn("근거 요약", text)
 
+    def test_fill_notice_includes_total_amount_and_total_fee(self) -> None:
+        text = render(
+            "tpl_fill_notice",
+            {
+                "ts_kst": "2026-03-03T11:15:00+09:00",
+                "symbol": "KRW-NEAR",
+                "side": "BUY",
+                "qty": 146.99028714,
+                "price": 2043,
+                "fee": 150.15057831,
+                "fee_currency": "KRW",
+                "total_value": 300_301.15663082,
+                "total_fee": 150.15057831,
+                "quote_currency": "KRW",
+                "fee_rate_pct": 0.05,
+                "fee_rate_bps": 5.0,
+            },
+        )
+
+        self.assertIn("체결 수량: 146.99028714", text)
+        self.assertIn("체결 가격: 2,043 KRW", text)
+        self.assertIn("수수료: 150.15057831 KRW (요율 0.0500%, 5.00 bps)", text)
+        self.assertIn("총 체결 금액: 300,301 KRW", text)
+        self.assertIn("총 수수료: 150.15057831 KRW", text)
+
     def test_research_daily_brief_includes_links(self) -> None:
         text = render(
             "tpl_research_daily_brief",
