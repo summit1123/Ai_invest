@@ -10,21 +10,25 @@
 
 ## 2. 전체 구조
 ```mermaid
+%%{init: {'theme':'base','themeVariables': {'fontSize': '20px'}, 'flowchart': {'nodeSpacing': 90, 'rankSpacing': 110, 'htmlLabels': true, 'curve': 'monotoneX'}} }%%
 flowchart LR
-    U[Upbit Public API] --> M[Market Snapshot + Candles]
-    M --> F[Feature Engine]
-    F --> A[Agent Layer<br/>Market Regime Risk Ops]
-    A --> SJ[Safe Judge]
-    A --> AJ[AI Judge Shadow]
-    SJ --> EX[Runtime Executor<br/>Paper or Live]
-    EX --> DB[(Postgres<br/>events decisions fills positions ledger)]
+    U["Upbit Public API<br/>업비트 공개 API"] --> M["Market Snapshot + Candles<br/>시장 스냅샷 + 캔들"]
+    M --> F["Feature Engine<br/>피처 엔진"]
+    F --> A["Agent Layer<br/>에이전트 계층 (Market/Regime/Risk/Ops)"]
+    A --> SJ["Safe Judge<br/>세이프 저지 (실행권자)"]
+    A --> AJ["AI Judge Shadow<br/>AI 저지 섀도우 (비실행)"]
+    SJ --> EX["Runtime Executor<br/>실행 엔진 (Paper/Live)"]
+    EX --> DB[("Postgres<br/>이벤트/결정/체결/포지션/원장")]
     SJ --> DB
     AJ --> DB
-    EX --> OE[Outcome Evaluator]
+    EX --> OE["Outcome Evaluator<br/>성과 평가기"]
     OE --> DB
-    DB --> GOV[Governance / Review / Adaptive Tuning]
-    DB --> NT[Notification Service]
-    NT --> TG[Telegram Channels]
+    DB --> GOV["Governance / Review / Adaptive Tuning<br/>거버넌스 / 리뷰 / 적응형 튜닝"]
+    DB --> NT["Notification Service<br/>알림 서비스"]
+    NT --> TG["Telegram Channels<br/>텔레그램 채널"]
+
+    classDef big fill:#f8fbff,stroke:#2f5597,stroke-width:2px,color:#111,font-size:20px,font-weight:bold;
+    class U,M,F,A,SJ,AJ,EX,DB,OE,GOV,NT,TG big;
 ```
 
 ## 3. 오케스트레이터 역할
