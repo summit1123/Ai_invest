@@ -17,9 +17,9 @@
 3. Safe Judge가 최종 실행 여부 결정
 4. 주문/체결/손익을 저장하고 다음 개선에 재사용
 
-### 2.1 한눈 버전 (크게)
+### 2.1 한눈 버전 (요약)
 ```mermaid
-%%{init: {'theme':'base','themeVariables': {'fontSize': '28px'}, 'flowchart': {'nodeSpacing': 95, 'rankSpacing': 110, 'htmlLabels': true, 'curve': 'linear'}} }%%
+%%{init: {'theme':'base','themeVariables': {'fontSize': '18px'}, 'flowchart': {'nodeSpacing': 72, 'rankSpacing': 86, 'htmlLabels': true, 'curve': 'linear'}} }%%
 flowchart TB
     D["1) Data<br/>데이터 수집<br/>(업비트 시세/캔들)"]
     A["2) Agents<br/>에이전트 판단<br/>(Market/Regime/Risk/Ops)"]
@@ -30,13 +30,13 @@ flowchart TB
 
     D --> A --> J --> E --> S --> N
 
-    classDef big fill:#f8fbff,stroke:#1f4d8f,stroke-width:3px,color:#111,font-size:28px,font-weight:bold;
+    classDef big fill:#f8fbff,stroke:#1f4d8f,stroke-width:2px,color:#111,font-size:18px,font-weight:bold;
     class D,A,J,E,S,N big;
 ```
 
 ### 2.2 상세 버전
 ```mermaid
-%%{init: {'theme':'base','themeVariables': {'fontSize': '24px'}, 'flowchart': {'nodeSpacing': 90, 'rankSpacing': 100, 'htmlLabels': true, 'curve': 'monotoneY'}} }%%
+%%{init: {'theme':'base','themeVariables': {'fontSize': '16px'}, 'flowchart': {'nodeSpacing': 74, 'rankSpacing': 84, 'htmlLabels': true, 'curve': 'monotoneY'}} }%%
 flowchart TB
     U["Upbit Public API<br/>업비트 공개 API"] --> M["Market Snapshot + Candles<br/>시장 스냅샷 + 캔들"]
     M --> F["Feature Engine<br/>피처 엔진"]
@@ -53,7 +53,7 @@ flowchart TB
     DB --> NT["Notification Service<br/>알림 서비스"]
     NT --> TG["Telegram Channels<br/>텔레그램 채널"]
 
-    classDef detail fill:#f7fbff,stroke:#2f5597,stroke-width:2.5px,color:#111,font-size:24px,font-weight:bold;
+    classDef detail fill:#f7fbff,stroke:#2f5597,stroke-width:2px,color:#111,font-size:16px,font-weight:bold;
     class U,M,F,AG,SJ,AJ,EX,DB,OE,GOV,NT,TG detail;
 ```
 
