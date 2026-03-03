@@ -9,14 +9,40 @@
 - 저장 원칙: 의사결정/체결/복기/알림을 이벤트 + 테이블로 모두 기록
 
 ## 2. 전체 구조
+
+먼저 한 줄로 보면 아래입니다.
+
+1. 시장 데이터 수집
+2. 에이전트가 신호/리스크 판단
+3. Safe Judge가 최종 실행 여부 결정
+4. 주문/체결/손익을 저장하고 다음 개선에 재사용
+
+### 2.1 한눈 버전 (크게)
 ```mermaid
-%%{init: {'theme':'base','themeVariables': {'fontSize': '20px'}, 'flowchart': {'nodeSpacing': 90, 'rankSpacing': 110, 'htmlLabels': true, 'curve': 'monotoneX'}} }%%
-flowchart LR
+%%{init: {'theme':'base','themeVariables': {'fontSize': '28px'}, 'flowchart': {'nodeSpacing': 95, 'rankSpacing': 110, 'htmlLabels': true, 'curve': 'linear'}} }%%
+flowchart TB
+    D["1) Data<br/>데이터 수집<br/>(업비트 시세/캔들)"]
+    A["2) Agents<br/>에이전트 판단<br/>(Market/Regime/Risk/Ops)"]
+    J["3) Safe Judge<br/>최종 실행 판단<br/>(BUY/SELL/HOLD/PAUSE)"]
+    E["4) Executor<br/>실행기<br/>(Paper/Live)"]
+    S["5) Storage + Learning<br/>저장 + 학습<br/>(events/decisions/fills/outcomes)"]
+    N["6) Notification<br/>알림 전송<br/>(Telegram)"]
+
+    D --> A --> J --> E --> S --> N
+
+    classDef big fill:#f8fbff,stroke:#1f4d8f,stroke-width:3px,color:#111,font-size:28px,font-weight:bold;
+    class D,A,J,E,S,N big;
+```
+
+### 2.2 상세 버전
+```mermaid
+%%{init: {'theme':'base','themeVariables': {'fontSize': '24px'}, 'flowchart': {'nodeSpacing': 90, 'rankSpacing': 100, 'htmlLabels': true, 'curve': 'monotoneY'}} }%%
+flowchart TB
     U["Upbit Public API<br/>업비트 공개 API"] --> M["Market Snapshot + Candles<br/>시장 스냅샷 + 캔들"]
     M --> F["Feature Engine<br/>피처 엔진"]
-    F --> A["Agent Layer<br/>에이전트 계층 (Market/Regime/Risk/Ops)"]
-    A --> SJ["Safe Judge<br/>세이프 저지 (실행권자)"]
-    A --> AJ["AI Judge Shadow<br/>AI 저지 섀도우 (비실행)"]
+    F --> AG["Agent Layer<br/>에이전트 계층 (Market/Regime/Risk/Ops)"]
+    AG --> SJ["Safe Judge<br/>세이프 저지 (실행권자)"]
+    AG --> AJ["AI Judge Shadow<br/>AI 저지 섀도우 (비실행)"]
     SJ --> EX["Runtime Executor<br/>실행 엔진 (Paper/Live)"]
     EX --> DB[("Postgres<br/>이벤트/결정/체결/포지션/원장")]
     SJ --> DB
@@ -27,8 +53,8 @@ flowchart LR
     DB --> NT["Notification Service<br/>알림 서비스"]
     NT --> TG["Telegram Channels<br/>텔레그램 채널"]
 
-    classDef big fill:#f8fbff,stroke:#2f5597,stroke-width:2px,color:#111,font-size:20px,font-weight:bold;
-    class U,M,F,A,SJ,AJ,EX,DB,OE,GOV,NT,TG big;
+    classDef detail fill:#f7fbff,stroke:#2f5597,stroke-width:2.5px,color:#111,font-size:24px,font-weight:bold;
+    class U,M,F,AG,SJ,AJ,EX,DB,OE,GOV,NT,TG detail;
 ```
 
 ## 3. 오케스트레이터 역할
@@ -45,13 +71,13 @@ flowchart LR
 | Worker | Script | 기본 주기 |
 |---|---|---|
 | runtime loop | `scripts/run_paper_loop.py` (`universe.mode` 기준 paper/live) | 30초 |
-| research work | `scripts/run_agent_work_loop.py --agent research` | 7200초 |
-| quant work | `scripts/run_agent_work_loop.py --agent quant` | 7200초 |
-| risk work | `scripts/run_agent_work_loop.py --agent risk` | 7200초 |
-| ops work | `scripts/run_agent_work_loop.py --agent ops` | 7200초 |
+| research work | `scripts/run_agent_work_loop.py --agent research` | 2시간 (120분) |
+| quant work | `scripts/run_agent_work_loop.py --agent quant` | 2시간 (120분) |
+| risk work | `scripts/run_agent_work_loop.py --agent risk` | 2시간 (120분) |
+| ops work | `scripts/run_agent_work_loop.py --agent ops` | 2시간 (120분) |
 | governance loop | `scripts/run_governance_loop.py` | 30초 |
-| review loop | `scripts/run_review_loop.py` | 60초 |
-| adaptive tuning loop | `scripts/run_adaptive_tuning_loop.py` | 3600초 |
+| review loop | `scripts/run_review_loop.py` | 1분 |
+| adaptive tuning loop | `scripts/run_adaptive_tuning_loop.py` | 1시간 (60분) |
 
 ## 4. 실시간 매매 워크플로우
 실행 엔진의 핵심 루프는 `ai_invest/runtime/paper_loop.py`입니다.
