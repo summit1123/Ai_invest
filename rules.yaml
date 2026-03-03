@@ -120,15 +120,15 @@ strategy:
     ret_long_mins: 60
     rev_vol_z_min: 1.3
     stop_atr_mult: 1.1
-    vol_scale_max: 1.2
-    vol_scale_min: 0.5
-    max_target_pct: 3.5
+    vol_scale_max: 1.0
+    vol_scale_min: 1.0
+    max_target_pct: 100.0
     mom_weight_ret: 0.4
     mom_weight_rsi: 0.2
     mom_weight_vol: 0.15
     ret_short_mins: 15
     trail_atr_mult: 0.9
-    base_target_pct: 2.0
+    base_target_pct: 100.0
     rev_ret_15m_max: -0.008
     rev_rsi_now_min: 50
     cooldown_minutes: 152

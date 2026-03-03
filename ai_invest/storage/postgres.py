@@ -1781,7 +1781,7 @@ class PostgresRepo:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                select meeting_id, meeting_type, status, started_at, ended_at, facilitator, participants, summary, decisions, action_items, run_id
+                select meeting_id, meeting_type, status, started_at, ended_at, facilitator, participants, agenda, summary, decisions, action_items, run_id
                 from meeting_sessions
                 order by started_at desc
                 limit %s
@@ -1790,7 +1790,20 @@ class PostgresRepo:
             )
             rows = cur.fetchall()
         out: list[dict[str, Any]] = []
-        for meeting_id, meeting_type, status, started_at, ended_at, facilitator, participants, summary, decisions, action_items, run_id in rows:
+        for (
+            meeting_id,
+            meeting_type,
+            status,
+            started_at,
+            ended_at,
+            facilitator,
+            participants,
+            agenda,
+            summary,
+            decisions,
+            action_items,
+            run_id,
+        ) in rows:
             out.append(
                 {
                     "meeting_id": str(meeting_id),
@@ -1800,6 +1813,7 @@ class PostgresRepo:
                     "ended_at": ended_at,
                     "facilitator": facilitator,
                     "participants": participants,
+                    "agenda": agenda,
                     "summary": summary,
                     "decisions": decisions,
                     "action_items": action_items,
