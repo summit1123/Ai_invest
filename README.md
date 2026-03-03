@@ -16,7 +16,7 @@ flowchart LR
     F --> A[Agent Layer<br/>Market Regime Risk Ops]
     A --> SJ[Safe Judge]
     A --> AJ[AI Judge Shadow]
-    SJ --> EX[Paper Executor]
+    SJ --> EX[Runtime Executor<br/>Paper or Live]
     EX --> DB[(Postgres<br/>events decisions fills positions ledger)]
     SJ --> DB
     AJ --> DB
@@ -40,7 +40,7 @@ flowchart LR
 
 | Worker | Script | 기본 주기 |
 |---|---|---|
-| paper loop | `scripts/run_paper_loop.py` | 30초 |
+| runtime loop | `scripts/run_paper_loop.py` (`universe.mode` 기준 paper/live) | 30초 |
 | research work | `scripts/run_agent_work_loop.py --agent research` | 7200초 |
 | quant work | `scripts/run_agent_work_loop.py --agent quant` | 7200초 |
 | risk work | `scripts/run_agent_work_loop.py --agent risk` | 7200초 |
@@ -58,7 +58,9 @@ flowchart LR
 4. Agent 의견 생성
 5. Safe Judge 하드 게이트 평가
 6. `SAFE_DECISION` 저장 + 알림 전송
-7. 실행 가능 시 Paper Executor가 주문/체결/원장 반영
+7. 실행 가능 시 Runtime Executor가 주문/체결/원장 반영  
+  - `universe.mode=paper` -> `PaperExecutor`  
+  - `universe.mode=live` -> `LiveExecutor` + 업비트 private API
 8. `FILL` 알림 전송(체결금액/총수수료/수수료율 포함)
 9. 포지션 종료 시 Outcome Evaluator가 원인 코드(`OC_*`) 기록
 10. AI Judge Shadow 판단 저장(실행 없음)
@@ -78,7 +80,7 @@ flowchart LR
 | Spread over limit | `spread_bps > max_spread_bps_entry` | `HOLD` |
 
 ## 6. 실행/수수료 계산
-`ai_invest/execution/paper_execution.py` 기준:
+`ai_invest/execution/paper_execution.py` / `ai_invest/execution/live_execution.py` 기준:
 
 - 체결 수수료:
 `fee = fill_price * qty * (fee_bps / 10000)`
@@ -145,6 +147,12 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 .venv/bin/python3 scripts/run_multi_orchestrator.py
 ```
 
+라이브 루프 단독 실행:
+
+```bash
+ENABLE_LIVE_TRADING=true .venv/bin/python3 scripts/run_live_loop.py --cycles 1000000000 --sleep-sec 30
+```
+
 오케스트레이터 재시작(수동):
 
 ```bash
@@ -169,10 +177,9 @@ setsid .venv/bin/python3 scripts/run_multi_orchestrator.py > runtime/orchestrato
 | `ai_invest/runtime/` | 실시간 루프, 오케스트레이션, 포지션 상태 |
 | `ai_invest/agents/` | Runtime Agent 로직 |
 | `ai_invest/judge/` | Safe/AI Judge |
-| `ai_invest/execution/` | Paper 실행 엔진/상태머신 |
+| `ai_invest/execution/` | Paper/Live 실행 엔진, 상태머신, 업비트 private 클라이언트 |
 | `ai_invest/learning/` | Outcome 평가 및 학습 루프 |
 | `ai_invest/notifications/` | 템플릿, 전송, 이력 기록 |
 | `ai_invest/storage/` | Postgres Repository |
 | `scripts/` | 워커 실행 엔트리포인트 |
 | `app/` | FastAPI 서버/UI API |
-

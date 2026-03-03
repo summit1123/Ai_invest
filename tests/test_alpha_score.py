@@ -27,7 +27,10 @@ class AlphaScoreTests(unittest.TestCase):
             + (self.cfg.mom_weight_ret * 0.0)
             + (self.cfg.mom_weight_trend * 1.0)
         ) / (self.cfg.mom_weight_rsi + self.cfg.mom_weight_vol + self.cfg.mom_weight_ret + self.cfg.mom_weight_trend)
-        self.assertAlmostEqual(out.alpha, expected_mom, places=6)
+        self.assertEqual(out.regime, "TREND")
+        # Trend alpha applies additional candle/flow penalties, so it should stay below raw mom.
+        self.assertLess(out.alpha, expected_mom)
+        self.assertGreater(out.alpha, 0.20)
         self.assertGreaterEqual(out.signal_target_pct, self.cfg.base_target_pct * 0.95)
 
     def test_strong_alpha_increases_target(self) -> None:
@@ -42,7 +45,8 @@ class AlphaScoreTests(unittest.TestCase):
             "atr_pct": 1.1,
         }
         out = compute_alpha_score(features=features, cfg=self.cfg)
-        self.assertGreaterEqual(out.alpha, self.cfg.strong_alpha)
+        self.assertEqual(out.regime, "TREND")
+        self.assertGreaterEqual(out.alpha, 0.60)
         self.assertGreaterEqual(out.signal_target_pct, self.cfg.base_target_pct)
         self.assertLessEqual(out.signal_target_pct, self.cfg.max_target_pct)
 
@@ -59,6 +63,7 @@ class AlphaScoreTests(unittest.TestCase):
         }
         out = compute_alpha_score(features=features, cfg=self.cfg)
         self.assertEqual(out.rev_s, 1.0)
+        self.assertEqual(out.regime, "RANGE")
         self.assertEqual(out.strategy_tag_candidate, "REV")
 
     def test_vol_scale_clamps_on_extreme_atr(self) -> None:

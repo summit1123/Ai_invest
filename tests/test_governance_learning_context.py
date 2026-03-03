@@ -48,6 +48,39 @@ class _RepoStub:
             },
         ]
 
+    def fetch_decisions(self, *, judge_type: str | None = None, limit: int = 200):  # type: ignore[no-untyped-def]
+        _ = (judge_type, limit)
+        return [
+            {
+                "ts": self._now - timedelta(minutes=50),
+                "action": "HOLD",
+                "selected_reasons": ["RG_SPREAD_TOO_WIDE"],
+                "gates": {"regime_trade_allowed": True},
+            },
+            {
+                "ts": self._now - timedelta(minutes=35),
+                "action": "BUY",
+                "selected_reasons": ["RG_PASS"],
+                "gates": {
+                    "regime_trade_allowed": True,
+                    "market_expected_cost_bps": 8.0,
+                    "market_expected_net_edge_bps": 36.0,
+                },
+            },
+        ]
+
+    def fetch_execution_metrics(self, *, limit: int = 200):  # type: ignore[no-untyped-def]
+        _ = limit
+        return [
+            {
+                "ts_submit": self._now - timedelta(minutes=45),
+                "slippage_bps_vs_submit": 1.4,
+                "spread_bps_at_submit": 2.2,
+                "filled_ratio": 0.98,
+                "latency_ms_submit_to_fill": 420,
+            }
+        ]
+
     def fetch_latest_event(self, *, event_type: str):  # type: ignore[no-untyped-def]
         if event_type != "DAILY_REVIEW_SENT":
             return None
@@ -122,3 +155,12 @@ def test_learning_context_contains_recent_meeting_lessons() -> None:
     latest_daily = dict(ctx.get("latest_daily_review") or {})
     assert str(latest_daily.get("improvement_title") or "") == "수수료 누수 차단이 1순위"
     assert len(list(latest_daily.get("suggested_changes") or [])) >= 1
+
+    decision_health = dict(ctx.get("recent_decision_health") or {})
+    assert int(decision_health.get("total_decisions") or 0) >= 1
+    assert float(decision_health.get("hold_ratio_pct") or 0.0) >= 0.0
+    assert str(decision_health.get("dominant_reason_code") or "") in {"RG_SPREAD_TOO_WIDE", "RG_PASS"}
+
+    exec_quality = dict(ctx.get("recent_execution_quality") or {})
+    assert int(exec_quality.get("samples") or 0) >= 1
+    assert float(exec_quality.get("avg_spread_bps_at_submit") or 0.0) > 0.0

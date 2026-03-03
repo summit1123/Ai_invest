@@ -1421,6 +1421,70 @@ class PostgresRepo:
             )
         return out
 
+    def fetch_decisions(self, *, judge_type: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        lim = max(1, int(limit))
+        with self.connect() as conn, conn.cursor() as cur:
+            if judge_type:
+                cur.execute(
+                    """
+                    select decision_id, ts, symbol, judge_type, action, score, confidence, gates,
+                           selected_reasons, rejected_reasons, expected_cost_bps, expected_rr, run_id, rule_version_id
+                    from decisions
+                    where judge_type=%s
+                    order by ts desc
+                    limit %s
+                    """,
+                    (judge_type, lim),
+                )
+            else:
+                cur.execute(
+                    """
+                    select decision_id, ts, symbol, judge_type, action, score, confidence, gates,
+                           selected_reasons, rejected_reasons, expected_cost_bps, expected_rr, run_id, rule_version_id
+                    from decisions
+                    order by ts desc
+                    limit %s
+                    """,
+                    (lim,),
+                )
+            rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for (
+            decision_id,
+            ts,
+            symbol,
+            judge_type_row,
+            action,
+            score,
+            confidence,
+            gates,
+            selected_reasons,
+            rejected_reasons,
+            expected_cost_bps,
+            expected_rr,
+            run_id,
+            rule_version_id,
+        ) in rows:
+            out.append(
+                {
+                    "decision_id": str(decision_id),
+                    "ts": ts,
+                    "symbol": symbol,
+                    "judge_type": judge_type_row,
+                    "action": action,
+                    "score": score,
+                    "confidence": confidence,
+                    "gates": gates,
+                    "selected_reasons": selected_reasons,
+                    "rejected_reasons": rejected_reasons,
+                    "expected_cost_bps": expected_cost_bps,
+                    "expected_rr": expected_rr,
+                    "run_id": str(run_id) if run_id else None,
+                    "rule_version_id": str(rule_version_id) if rule_version_id else None,
+                }
+            )
+        return out
+
     def fetch_latest_decision(self, *, judge_type: str = "SAFE") -> dict[str, Any] | None:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(

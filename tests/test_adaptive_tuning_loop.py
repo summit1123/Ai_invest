@@ -173,6 +173,38 @@ class AdaptiveTuningLoopTests(unittest.TestCase):
         self.assertTrue(skip)
         self.assertEqual(str(info.get("reason")), "min_apply_interval_not_elapsed")
 
+    def test_apply_patch_change_budget_limits_and_enforces_direction(self) -> None:
+        mod = _load_module()
+        rules_raw = {
+            "strategy": {"alpha_score": {"entry_alpha": 0.65, "cooldown_minutes": 160}},
+            "governance": {
+                "micro_mode": {"min_alpha": 0.65, "max_spread_bps": 8.0},
+                "plan_continuity": {"min_hold_minutes": 120},
+            },
+        }
+        patch = {
+            "strategy.alpha_score.entry_alpha": 0.70,  # tighten
+            "governance.micro_mode.max_spread_bps": 9.0,  # loosen
+            "strategy.alpha_score.cooldown_minutes": 175,  # tighten
+        }
+        tuned, diag = mod._apply_patch_change_budget(
+            rules_raw=rules_raw,
+            patch=patch,
+            tuning_cfg={
+                "max_paths_per_patch": 1,
+                "single_direction_per_cycle": True,
+                "path_priority": [
+                    "strategy.alpha_score.entry_alpha",
+                    "strategy.alpha_score.cooldown_minutes",
+                    "governance.micro_mode.max_spread_bps",
+                ],
+            },
+            composite_score=-0.4,
+        )
+        self.assertEqual(len(tuned), 1)
+        self.assertIn("strategy.alpha_score.entry_alpha", tuned)
+        self.assertEqual(str(diag.get("desired_direction")), "TIGHTEN")
+
 
 if __name__ == "__main__":
     unittest.main()

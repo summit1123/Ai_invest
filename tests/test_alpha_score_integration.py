@@ -63,10 +63,12 @@ def test_market_agent_rev_entry_on_crash_rebound_sequence():
     closes = closes[-120:]
     payload = _payload_from_candles(closes=closes)
     op = market_agent_opine(payload, rules=rules)
-    assert op.signal == "LONG"
-    assert op.entry_allowed is True
+    # Extreme crash-rebound with volume spike is treated as SHOCK regime (risk-first hold).
+    assert op.signal == "HOLD"
+    assert op.entry_allowed is False
+    assert op.regime == "SHOCK"
     assert op.rev_s == 1.0
-    assert op.strategy_tag == "REV"
+    assert "RG_REGIME_BLOCKED" in list(op.reason_codes)
 
 
 def test_market_agent_veto_scenario_holds_even_with_signal():
@@ -77,4 +79,3 @@ def test_market_agent_veto_scenario_holds_even_with_signal():
     assert op.signal == "HOLD"
     assert op.entry_allowed is False
     assert op.signal_target_pct == 0.0
-

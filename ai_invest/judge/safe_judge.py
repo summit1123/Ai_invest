@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 from ai_invest.config.rules_loader import RulesConfig
 from ai_invest.domain.reason_codes import ReasonCode, parse_reason_code, validate_reason_codes
+from ai_invest.strategy.spread_guard import evaluate_spread_guard
 
 
 class SafeJudgeContractError(ValueError):
@@ -147,6 +148,12 @@ def safe_judge_decide(
 
     symbol = _as_str(payload, "symbol")
     spread_bps = _as_float(payload, "snapshot.spread_bps")
+    mid_price = _opt_float(payload, "snapshot.mid_price") or 0.0
+    atr_pct = _opt_float(payload, "features.atr_pct") or 0.0
+    dv_zscore = _opt_float(payload, "features.dv_zscore") or 0.0
+    runtime_rules_hash = _opt_str(payload, "context.runtime.rules_hash")
+    runtime_universe_id = _opt_str(payload, "context.runtime.universe_id")
+    runtime_universe_mode = _opt_str(payload, "context.runtime.universe_mode")
     recon_status = _as_str(payload, "ops.reconciliation_status").upper()
     rate_limit_alert = _as_bool(payload, "ops.rate_limit_alert")
     pause_state = _as_bool(payload, "ops.pause_state")
@@ -169,15 +176,60 @@ def safe_judge_decide(
     current_position_pct = _opt_float(payload, "context.position.current_position_pct")
     cash_krw = _opt_float(payload, "context.account.cash_krw")
     market_signal_target_pct = None
+    market_expected_edge_bps = None
+    market_expected_cost_bps = None
+    market_expected_net_edge_bps = None
+    market_min_edge_required_bps = None
+    market_regime = None
     if market is not None:
         try:
             market_signal_target_pct = float((market or {}).get("signal_target_pct"))
         except Exception:
             market_signal_target_pct = None
+        try:
+            market_expected_edge_bps = float((market or {}).get("expected_edge_bps"))
+        except Exception:
+            market_expected_edge_bps = None
+        try:
+            market_expected_cost_bps = float((market or {}).get("expected_cost_bps"))
+        except Exception:
+            market_expected_cost_bps = None
+        try:
+            market_expected_net_edge_bps = float((market or {}).get("expected_net_edge_bps"))
+        except Exception:
+            market_expected_net_edge_bps = None
+        try:
+            market_min_edge_required_bps = float((market or {}).get("min_edge_required_bps"))
+        except Exception:
+            market_min_edge_required_bps = None
+        try:
+            market_regime = str((market or {}).get("regime") or "").strip().upper() or None
+        except Exception:
+            market_regime = None
     market_reason_codes = _extract_reason_codes(market)
     regime_reason_codes = _extract_reason_codes(regime)
     risk_reason_codes = _extract_reason_codes(risk)
     ops_reason_codes = _extract_reason_codes(ops)
+    if (
+        market_expected_net_edge_bps is None
+        and market_expected_edge_bps is not None
+        and market_expected_cost_bps is not None
+    ):
+        market_expected_net_edge_bps = float(market_expected_edge_bps) - float(market_expected_cost_bps)
+    alpha_cfg_raw = (
+        ((rules.raw.get("strategy") or {}).get("alpha_score") or {})
+        if isinstance(rules.raw, Mapping)
+        else {}
+    )
+    spread_guard = evaluate_spread_guard(
+        rules=rules,
+        spread_bps=spread_bps,
+        mid_price=mid_price,
+        atr_pct=atr_pct,
+        dv_zscore=dv_zscore,
+        alpha_cfg_raw=alpha_cfg_raw,
+    )
+    spread_limit_bps = float(spread_guard.effective_limit_bps)
 
     effective_target_pct: float | None
     plan_target_for_execution = (
@@ -200,6 +252,21 @@ def safe_judge_decide(
         "max_daily_loss_pct": rules.risk.max_daily_loss_pct,
         "spread_bps": spread_bps,
         "max_spread_bps_entry": rules.cost_guard.max_spread_bps_entry,
+        "spread_limit_bps_effective": spread_limit_bps,
+        "spread_guard": {
+            "enabled": bool(spread_guard.enabled),
+            "liq_score": float(spread_guard.liq_score),
+            "atr_component_bps": float(spread_guard.atr_component_bps),
+            "liq_component_bps": float(spread_guard.liq_component_bps),
+            "min_limit_bps": float(spread_guard.min_limit_bps),
+            "max_limit_bps": float(spread_guard.max_limit_bps),
+            "spread_pct": float(spread_guard.spread_pct),
+            "atr_pct": float(spread_guard.atr_pct),
+            "dv_zscore": float(spread_guard.dv_zscore),
+        },
+        "rules_hash": runtime_rules_hash,
+        "universe_id": runtime_universe_id,
+        "universe_mode": runtime_universe_mode,
         "trade_plan_target_pct": trade_plan_target_pct,
         "trade_plan_execution_target_pct": trade_plan_execution_target_pct,
         "trade_plan_buy_allowed": trade_plan_buy_allowed,
@@ -210,6 +277,11 @@ def safe_judge_decide(
         "trade_plan_cap_promoted": trade_plan_cap_promoted,
         "trade_plan_cap_runtime": trade_plan_cap_runtime if isinstance(trade_plan_cap_runtime, Mapping) else None,
         "signal_target_pct": market_signal_target_pct,
+        "market_expected_edge_bps": market_expected_edge_bps,
+        "market_expected_cost_bps": market_expected_cost_bps,
+        "market_expected_net_edge_bps": market_expected_net_edge_bps,
+        "market_min_edge_required_bps": market_min_edge_required_bps,
+        "market_regime": market_regime,
         "effective_target_pct": effective_target_pct,
         "current_position_pct": current_position_pct,
         "cash_krw": cash_krw,
@@ -260,13 +332,15 @@ def safe_judge_decide(
     elif risk_veto:
         action = "HOLD"
         reasons.extend(_non_pass_reasons(risk_reason_codes) or [ReasonCode.RG_RISK_VETO])
-    elif spread_bps > rules.cost_guard.max_spread_bps_entry:
+    elif spread_bps > float(spread_limit_bps):
         action = "HOLD"
         reasons.append(ReasonCode.RG_SPREAD_TOO_WIDE)
     else:
         # Soft decision: follow market if present, else HOLD.
         market_signal = str((market or {}).get("signal", "HOLD")).upper()
         market_alpha = None
+        market_edge_gate_blocked = False
+        market_cost_gate_blocked = False
         try:
             market_alpha = float((market or {}).get("alpha"))
         except Exception:
@@ -308,12 +382,41 @@ def safe_judge_decide(
             action = "HOLD"
             reasons = [ReasonCode.RG_MIN_ORDER_NOT_MET]
 
+        if (
+            action == "BUY"
+            and market_expected_cost_bps is not None
+            and float(market_expected_cost_bps) > float(rules.cost_guard.max_total_cost_bps)
+        ):
+            action = "HOLD"
+            reasons = [ReasonCode.RG_SLIPPAGE_EST_TOO_HIGH]
+            market_cost_gate_blocked = True
+            market_reason_codes.append(ReasonCode.RG_SLIPPAGE_EST_TOO_HIGH)
+
+        net_edge_required = (
+            float(market_min_edge_required_bps)
+            if (market_min_edge_required_bps is not None and float(market_min_edge_required_bps) > 0.0)
+            else float(rules.cost_guard.min_expected_edge_bps)
+        )
+
+        if (
+            action == "BUY"
+            and market_expected_net_edge_bps is not None
+            and float(market_expected_net_edge_bps) < float(net_edge_required)
+        ):
+            action = "HOLD"
+            reasons = [ReasonCode.RG_EDGE_TOO_LOW]
+            market_edge_gate_blocked = True
+            market_reason_codes.append(ReasonCode.RG_EDGE_TOO_LOW)
+
         # Always-On Micro Mode:
         # - When governance plan is HOLD, allow a tiny pilot BUY only under strict conditions.
         # - Purpose: keep market feedback loop alive without meaningful risk.
         micro_cfg = (rules.raw.get("governance") or {}) if isinstance(rules.raw, Mapping) else {}
         micro_cfg = (micro_cfg.get("micro_mode") or {}) if isinstance(micro_cfg, Mapping) else {}
+        is_live_mode = str(((rules.raw.get("universe") or {}).get("mode") or "paper")).strip().lower() == "live"
         micro_enabled = bool(micro_cfg.get("enabled", False))
+        if is_live_mode and not bool(micro_cfg.get("enabled_live", False)):
+            micro_enabled = False
         micro_entry_mode = str(micro_cfg.get("entry_mode") or "adaptive").strip().lower()
         if micro_entry_mode not in {"adaptive", "market-led", "plan-led"}:
             micro_entry_mode = "adaptive"
@@ -329,6 +432,14 @@ def safe_judge_decide(
         micro_require_market_long = bool(micro_cfg.get("require_market_long", True))
         micro_ignore_cooldown_in_plan_led = bool(micro_cfg.get("ignore_market_cooldown_in_plan_led", False))
         micro_ignore_edge_in_plan_led = bool(micro_cfg.get("ignore_market_edge_in_plan_led", True))
+        micro_alpha_margin = float(
+            micro_cfg.get("alpha_margin")
+            or (0.10 if is_live_mode else 0.0)
+        )
+        micro_edge_margin_bps = float(
+            micro_cfg.get("edge_margin_bps")
+            or (10.0 if is_live_mode else 0.0)
+        )
         plan_gate_hard_block = _opt_bool(payload, "context.trade_plan.activation_gate.hard_plan_block")
         plan_gate_soft_block = _opt_bool(payload, "context.trade_plan.activation_gate.soft_plan_block")
         plan_gate_exec_block = _opt_bool(payload, "context.trade_plan.activation_gate.plan_execution_blocked")
@@ -350,6 +461,8 @@ def safe_judge_decide(
             "require_market_long": bool(micro_require_market_long),
             "ignore_market_cooldown_in_plan_led": bool(micro_ignore_cooldown_in_plan_led),
             "ignore_market_edge_in_plan_led": bool(micro_ignore_edge_in_plan_led),
+            "alpha_margin": float(micro_alpha_margin),
+            "edge_margin_bps": float(micro_edge_margin_bps),
             "realtime_min_alpha_delta": float(micro_realtime_min_alpha_delta),
             "realtime_max_spread_mult": float(micro_realtime_max_spread_mult),
             "inter_slot_realtime_mode": bool(inter_slot_realtime_mode),
@@ -399,7 +512,12 @@ def safe_judge_decide(
             market_has_edge_block
             and not (micro_entry_path == "plan-led" and micro_ignore_edge_in_plan_led)
         )
-        market_reason_blocked = bool(cooldown_block_applied or edge_block_applied)
+        market_reason_blocked = bool(
+            cooldown_block_applied
+            or edge_block_applied
+            or market_edge_gate_blocked
+            or market_cost_gate_blocked
+        )
 
         micro_candidate_context = (
             bool(micro_enabled)
@@ -444,8 +562,19 @@ def safe_judge_decide(
             micro_allowed_context
             and not bool(market_reason_blocked)
             and (market_alpha is not None and float(market_alpha) >= float(dynamic_min_alpha))
+            and (
+                not bool(is_live_mode)
+                or (market_alpha is not None and float(market_alpha) >= float(dynamic_min_alpha + micro_alpha_margin))
+            )
             and float(spread_bps) <= float(dynamic_max_spread_bps)
             and float(daily_loss_pct) <= float(micro_max_daily_loss_pct)
+            and (
+                (not bool(is_live_mode))
+                or (
+                    market_expected_net_edge_bps is not None
+                    and float(market_expected_net_edge_bps) >= float(net_edge_required + micro_edge_margin_bps)
+                )
+            )
             and (
                 daily_trades_count is None
                 or int(float(daily_trades_count)) < int(micro_max_trades_per_day)
@@ -457,6 +586,8 @@ def safe_judge_decide(
         gates["micro_mode_entry_path"] = str(micro_entry_path)
         gates["micro_mode_market_reason_blocked"] = bool(market_reason_blocked)
         gates["micro_mode_edge_block_applied"] = bool(edge_block_applied)
+        gates["market_edge_gate_blocked"] = bool(market_edge_gate_blocked)
+        gates["market_cost_gate_blocked"] = bool(market_cost_gate_blocked)
         gates["micro_mode_plan_gate_passed"] = bool(plan_gate_passed)
         gates["micro_mode_dynamic_min_alpha"] = float(dynamic_min_alpha)
         gates["micro_mode_dynamic_max_spread_bps"] = float(dynamic_max_spread_bps)
@@ -489,7 +620,12 @@ def safe_judge_decide(
         except (TypeError, ValueError):
             confidence = None
         score = confidence
-        expected_cost_bps = spread_bps + rules.cost_guard.entry_cost_buffer_bps
+        if market_expected_cost_bps is not None:
+            expected_cost_bps = float(market_expected_cost_bps)
+        else:
+            expected_cost_bps = spread_bps + rules.cost_guard.entry_cost_buffer_bps
+        if market_expected_net_edge_bps is not None and expected_cost_bps and expected_cost_bps > 0:
+            expected_rr = float(max(-9.99, min(9.99, float(market_expected_net_edge_bps) / float(expected_cost_bps))))
 
     return SafeJudgeDecision(
         action=action,

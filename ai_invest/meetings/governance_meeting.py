@@ -90,6 +90,17 @@ def _as_int(value: Any, *, default: int) -> int:
         return int(default)
 
 
+def _as_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if value is None:
+        return bool(default)
+    s = str(value).strip().lower()
+    if not s:
+        return bool(default)
+    return s in {"1", "true", "yes", "y", "on"}
+
+
 TIME_HORIZON_VALUES = {"intraday", "1d", "swing"}
 
 
@@ -2422,6 +2433,36 @@ def run_governance_protocol(
         if isinstance(outcome_windows.get("short"), Mapping)
         else recent_outcomes
     )
+    recent_decision_health = (
+        (learning_ctx.get("recent_decision_health") or {})
+        if isinstance(learning_ctx.get("recent_decision_health"), Mapping)
+        else {}
+    )
+    decision_windows = (
+        (learning_ctx.get("decision_windows") or {})
+        if isinstance(learning_ctx.get("decision_windows"), Mapping)
+        else {}
+    )
+    execution_decision_health = (
+        (decision_windows.get("execution") or {})
+        if isinstance(decision_windows.get("execution"), Mapping)
+        else recent_decision_health
+    )
+    short_decision_health = (
+        (decision_windows.get("short") or {})
+        if isinstance(decision_windows.get("short"), Mapping)
+        else recent_decision_health
+    )
+    execution_quality_windows = (
+        (learning_ctx.get("execution_quality_windows") or {})
+        if isinstance(learning_ctx.get("execution_quality_windows"), Mapping)
+        else {}
+    )
+    execution_quality = (
+        (execution_quality_windows.get("execution") or {})
+        if isinstance(execution_quality_windows.get("execution"), Mapping)
+        else (learning_ctx.get("recent_execution_quality") or {})
+    )
     latest_priority = (
         (learning_ctx.get("latest_weekly_priority") or {})
         if isinstance(learning_ctx.get("latest_weekly_priority"), Mapping)
@@ -2436,6 +2477,19 @@ def run_governance_protocol(
     execution_win_rate = float(_as_float(execution_outcomes.get("win_rate_pct"), default=0.0))
     short_trades = int(_as_float(short_outcomes.get("total_trades"), default=0.0))
     short_win_rate = float(_as_float(short_outcomes.get("win_rate_pct"), default=0.0))
+    decision_execution_total = int(_as_float(execution_decision_health.get("total_decisions"), default=0.0))
+    decision_short_total = int(_as_float(short_decision_health.get("total_decisions"), default=0.0))
+    decision_hold_ratio = float(_as_float(recent_decision_health.get("hold_ratio_pct"), default=0.0))
+    decision_buy_ratio = float(_as_float(recent_decision_health.get("buy_ratio_pct"), default=0.0))
+    decision_window_label = str(recent_decision_health.get("window_label") or "")
+    decision_top_reasons = [x for x in list(recent_decision_health.get("top_reason_codes") or []) if isinstance(x, Mapping)]
+    decision_top_reason = (
+        str((decision_top_reasons[0] if decision_top_reasons else {}).get("reason_code") or "").strip().upper()
+    )
+    decision_over_blocked = bool(recent_decision_health.get("over_blocked"))
+    execution_avg_spread = _as_float(execution_quality.get("avg_spread_bps_at_submit"), default=-1.0)
+    execution_avg_slippage = _as_float(execution_quality.get("avg_slippage_bps_vs_submit"), default=-1.0)
+    execution_samples = int(_as_float(execution_quality.get("samples"), default=0.0))
     top_error_items = [x for x in list(short_outcomes.get("top_error_types") or []) if isinstance(x, Mapping)]
     top_error_txt = ", ".join(
         f"{str(x.get('error_type') or '').strip()}:{int(_as_float(x.get('count'), default=0.0))}"
@@ -2446,9 +2500,36 @@ def run_governance_protocol(
     short_window_label = str(short_outcomes.get("window_label") or "short")
 
     # Research deterministic
-    headlines = (fact_pack.get("research_brief") or {}).get("headlines") if isinstance(fact_pack.get("research_brief"), Mapping) else None
+    research_brief_map = (fact_pack.get("research_brief") or {}) if isinstance(fact_pack.get("research_brief"), Mapping) else {}
+    headlines = research_brief_map.get("headlines") if isinstance(research_brief_map, Mapping) else None
     headlines = list(headlines or [])
     hl_text = summarize_headlines_text(headlines, max_items=6)
+    macro_ctx = (
+        dict(research_brief_map.get("macro_context") or {})
+        if isinstance(research_brief_map.get("macro_context"), Mapping)
+        else {}
+    )
+    macro_risk_mode = str(macro_ctx.get("risk_mode") or "").strip().upper()
+    fg = (
+        dict(macro_ctx.get("fear_greed_index") or {})
+        if isinstance(macro_ctx.get("fear_greed_index"), Mapping)
+        else {}
+    )
+    cm = (
+        dict(macro_ctx.get("crypto_market") or {})
+        if isinstance(macro_ctx.get("crypto_market"), Mapping)
+        else {}
+    )
+    fg_value = _as_float(fg.get("value"), default=-1.0)
+    btc_dom = _as_float(cm.get("btc_dominance_pct"), default=-1.0)
+    macro_line_parts: list[str] = []
+    if macro_risk_mode:
+        macro_line_parts.append(f"risk_mode={macro_risk_mode}")
+    if fg_value >= 0:
+        macro_line_parts.append(f"fear_greed={fg_value:.0f}")
+    if btc_dom >= 0:
+        macro_line_parts.append(f"btc_dominance={btc_dom:.1f}%")
+    macro_line = ", ".join(macro_line_parts)
     det_evidence = []
     for h in headlines[:4]:
         if not isinstance(h, Mapping):
@@ -2478,12 +2559,35 @@ def run_governance_protocol(
         det_risks.append(
             f"최근 실행창({execution_window_label}) 성과: trades={execution_trades}, win_rate={execution_win_rate:.1f}%"
         )
+    if decision_execution_total >= 20 or decision_short_total >= 20:
+        det_risks.append(
+            f"의사결정 분포({decision_window_label or 'recent'}): hold={decision_hold_ratio:.1f}%, buy={decision_buy_ratio:.1f}%, top_reason={decision_top_reason or 'N/A'}"
+        )
+    if decision_over_blocked:
+        det_risks.append("게이트 과차단 신호: HOLD 비중이 과도해 entry 임계/스프레드 정책 재점검 필요")
+    current_spread_bps = _as_float((best.get("snapshot") or {}).get("spread_bps"), default=-1.0)
+    current_atr_pct = _as_float((best.get("features") or {}).get("atr_pct"), default=-1.0)
+    if current_spread_bps >= 0 and execution_samples >= 3 and execution_avg_spread >= 0:
+        det_risks.append(
+            f"실시간/과거 실행비교: now_spread={current_spread_bps:.2f}bps vs exec_avg_spread={execution_avg_spread:.2f}bps, now_atr={current_atr_pct:.2f}%"
+        )
+    if execution_avg_slippage >= 0 and execution_samples >= 3:
+        det_risks.append(
+            f"최근 체결품질({execution_quality.get('window_label') or 'execution'}): avg_slippage={execution_avg_slippage:.2f}bps, samples={execution_samples}"
+        )
     if latest_meeting_summary:
         det_risks.append(f"최근 회의 교훈: {latest_meeting_summary}")
+    if macro_line:
+        det_risks.append(f"매크로/지수 컨텍스트: {macro_line}")
     if not det_risks:
         det_risks.append("특이 운영 리스크 없음(기계적 체크 기준)")
     det_research = ResearchGovOutput(
-        briefing=_clip(f"뉴스/시장 브리프: {hl_text or '주요 헤드라인 없음'}", 480),
+        briefing=_clip(
+            "뉴스/시장 브리프: "
+            + (hl_text or "주요 헤드라인 없음")
+            + (f" | 매크로: {macro_line}" if macro_line else ""),
+            480,
+        ),
         evidence_cards=det_evidence[:8],
         risk_watchlist=det_risks[:8],
         unknowns=["헤드라인 기반이며 세부 내용(원문) 미검증"] if det_evidence else [],
@@ -2998,6 +3102,136 @@ def _median(values: Sequence[float]) -> float:
     return float((rows[mid - 1] + rows[mid]) / 2.0)
 
 
+def _mean(values: Sequence[float]) -> float:
+    rows = [float(v) for v in list(values or [])]
+    if not rows:
+        return 0.0
+    return float(sum(rows) / float(len(rows)))
+
+
+def _percentile(values: Sequence[float], pct: float) -> float:
+    rows = [float(v) for v in list(values or [])]
+    if not rows:
+        return 0.0
+    rows.sort()
+    if len(rows) == 1:
+        return float(rows[0])
+    p = _clamp(float(pct), 0.0, 100.0) / 100.0
+    idx = p * float(len(rows) - 1)
+    lo = int(math.floor(idx))
+    hi = int(math.ceil(idx))
+    if lo == hi:
+        return float(rows[lo])
+    w = float(idx - lo)
+    return float(rows[lo] * (1.0 - w) + rows[hi] * w)
+
+
+def _summarize_recent_decision_health(
+    *,
+    repo: PostgresRepo,
+    now_kst: datetime,
+    days: int = 3,
+    hours: int | None = None,
+    rows: Sequence[Mapping[str, Any]] | None = None,
+    window_name: str | None = None,
+) -> dict[str, Any]:
+    window_hours = int(max(1, int(hours))) if hours is not None else None
+    window_days = int(max(1, int(days))) if hours is None else None
+    since = now_kst - (timedelta(hours=window_hours) if window_hours is not None else timedelta(days=window_days or 3))
+    if rows is None:
+        source_rows = (
+            repo.fetch_decisions(judge_type="SAFE", limit=2000)
+            if hasattr(repo, "fetch_decisions")
+            else repo.fetch_latest_decisions(limit=2000)
+        )
+    else:
+        source_rows = [r for r in list(rows or []) if isinstance(r, Mapping)]
+
+    action_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    gate_counts: dict[str, int] = {
+        "regime_blocked": 0,
+        "risk_veto": 0,
+        "ops_veto": 0,
+        "market_edge_blocked": 0,
+        "market_cost_blocked": 0,
+    }
+    buy_expected_cost: list[float] = []
+    buy_expected_net_edge: list[float] = []
+
+    total = 0
+    for r in source_rows:
+        ts_kst = _as_kst_dt(r.get("ts"))
+        if ts_kst is None or ts_kst < since:
+            continue
+        total += 1
+        action = str(r.get("action") or "").strip().upper() or "UNKNOWN"
+        action_counts[action] = int(action_counts.get(action, 0) + 1)
+
+        reasons = [str(x).strip().upper() for x in list(r.get("selected_reasons") or []) if str(x).strip()]
+        for rc in reasons:
+            reason_counts[rc] = int(reason_counts.get(rc, 0) + 1)
+
+        gates = dict(r.get("gates") or {}) if isinstance(r.get("gates"), Mapping) else {}
+        if _as_bool(gates.get("regime_trade_allowed"), default=True) is False:
+            gate_counts["regime_blocked"] = int(gate_counts["regime_blocked"] + 1)
+        if _as_bool(gates.get("risk_veto"), default=False):
+            gate_counts["risk_veto"] = int(gate_counts["risk_veto"] + 1)
+        if _as_bool(gates.get("ops_veto"), default=False):
+            gate_counts["ops_veto"] = int(gate_counts["ops_veto"] + 1)
+        if _as_bool(gates.get("market_edge_gate_blocked"), default=False):
+            gate_counts["market_edge_blocked"] = int(gate_counts["market_edge_blocked"] + 1)
+        if _as_bool(gates.get("market_cost_gate_blocked"), default=False):
+            gate_counts["market_cost_blocked"] = int(gate_counts["market_cost_blocked"] + 1)
+
+        if action == "BUY":
+            ec = _as_float(gates.get("market_expected_cost_bps"), default=float("nan"))
+            ne = _as_float(gates.get("market_expected_net_edge_bps"), default=float("nan"))
+            if math.isfinite(ec):
+                buy_expected_cost.append(float(ec))
+            if math.isfinite(ne):
+                buy_expected_net_edge.append(float(ne))
+
+    hold_n = int(action_counts.get("HOLD", 0))
+    pause_n = int(action_counts.get("PAUSE", 0))
+    buy_n = int(action_counts.get("BUY", 0))
+    hold_ratio = (float(hold_n) / float(total) * 100.0) if total > 0 else 0.0
+    buy_ratio = (float(buy_n) / float(total) * 100.0) if total > 0 else 0.0
+    pause_ratio = (float(pause_n) / float(total) * 100.0) if total > 0 else 0.0
+
+    top_reasons = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[:8]
+    top_reason_payload = [
+        {
+            "reason_code": str(code),
+            "count": int(cnt),
+            "ratio_pct": float(round((float(cnt) / float(total) * 100.0) if total > 0 else 0.0, 2)),
+        }
+        for code, cnt in top_reasons
+    ]
+    dominant_reason = str(top_reason_payload[0]["reason_code"]) if top_reason_payload else ""
+    over_blocked = bool(total >= 100 and hold_ratio >= 95.0 and buy_ratio <= 1.5)
+
+    label = str(window_name or ("execution" if window_hours is not None else "short")).strip().lower()
+    window_label = f"{window_hours}h" if window_hours is not None else f"{window_days}d"
+    return {
+        "window_name": str(label),
+        "window_label": str(window_label),
+        "window_days": int(window_days or 0),
+        "window_hours": int(window_hours or 0),
+        "total_decisions": int(total),
+        "action_counts": {str(k): int(v) for k, v in action_counts.items()},
+        "buy_ratio_pct": float(round(buy_ratio, 2)),
+        "hold_ratio_pct": float(round(hold_ratio, 2)),
+        "pause_ratio_pct": float(round(pause_ratio, 2)),
+        "top_reason_codes": top_reason_payload,
+        "dominant_reason_code": str(dominant_reason),
+        "gate_block_counts": {str(k): int(v) for k, v in gate_counts.items()},
+        "buy_expected_cost_bps_avg": float(round(_mean(buy_expected_cost), 3)) if buy_expected_cost else None,
+        "buy_expected_net_edge_bps_avg": float(round(_mean(buy_expected_net_edge), 3)) if buy_expected_net_edge else None,
+        "over_blocked": bool(over_blocked),
+    }
+
+
 def _summarize_recent_outcomes(
     *,
     repo: PostgresRepo,
@@ -3098,6 +3332,64 @@ def _summarize_recent_trade_performance(
         "avg_hold_minutes": float(round(avg_hold, 2)),
         "median_hold_minutes": float(round(_median(hold_minutes), 2)),
         "fee_to_realized_ratio": (float(round(fee_to_realized_ratio, 4)) if fee_to_realized_ratio is not None else None),
+    }
+
+
+def _summarize_recent_execution_quality(
+    *,
+    repo: PostgresRepo,
+    now_kst: datetime,
+    days: int = 3,
+    hours: int | None = None,
+    rows: Sequence[Mapping[str, Any]] | None = None,
+    window_name: str | None = None,
+) -> dict[str, Any]:
+    window_hours = int(max(1, int(hours))) if hours is not None else None
+    window_days = int(max(1, int(days))) if hours is None else None
+    since = now_kst - (timedelta(hours=window_hours) if window_hours is not None else timedelta(days=window_days or 3))
+    if rows is None:
+        source_rows = repo.fetch_execution_metrics(limit=5000) if hasattr(repo, "fetch_execution_metrics") else []
+    else:
+        source_rows = [r for r in list(rows or []) if isinstance(r, Mapping)]
+
+    slip_vals: list[float] = []
+    spread_vals: list[float] = []
+    fill_vals: list[float] = []
+    latency_vals: list[float] = []
+    samples = 0
+    for r in source_rows:
+        ts_kst = _as_kst_dt(r.get("ts_submit")) or _as_kst_dt(r.get("ts_last_fill")) or _as_kst_dt(r.get("ts_first_fill"))
+        if ts_kst is None or ts_kst < since:
+            continue
+        samples += 1
+        slip = _as_float(r.get("slippage_bps_vs_submit"), default=float("nan"))
+        spread = _as_float(r.get("spread_bps_at_submit"), default=float("nan"))
+        fill = _as_float(r.get("filled_ratio"), default=float("nan"))
+        lat = _as_float(r.get("latency_ms_submit_to_fill"), default=float("nan"))
+        if math.isfinite(slip):
+            slip_vals.append(float(slip))
+        if math.isfinite(spread):
+            spread_vals.append(float(spread))
+        if math.isfinite(fill):
+            fill_vals.append(float(fill))
+        if math.isfinite(lat):
+            latency_vals.append(float(lat))
+
+    label = str(window_name or ("execution" if window_hours is not None else "short")).strip().lower()
+    window_label = f"{window_hours}h" if window_hours is not None else f"{window_days}d"
+    return {
+        "window_name": str(label),
+        "window_label": str(window_label),
+        "window_days": int(window_days or 0),
+        "window_hours": int(window_hours or 0),
+        "samples": int(samples),
+        "avg_slippage_bps_vs_submit": (float(round(_mean(slip_vals), 3)) if slip_vals else None),
+        "p90_slippage_bps_vs_submit": (float(round(_percentile(slip_vals, 90.0), 3)) if slip_vals else None),
+        "avg_spread_bps_at_submit": (float(round(_mean(spread_vals), 3)) if spread_vals else None),
+        "p90_spread_bps_at_submit": (float(round(_percentile(spread_vals, 90.0), 3)) if spread_vals else None),
+        "avg_fill_ratio": (float(round(_mean(fill_vals), 4)) if fill_vals else None),
+        "p10_fill_ratio": (float(round(_percentile(fill_vals, 10.0), 4)) if fill_vals else None),
+        "avg_latency_ms_submit_to_fill": (float(round(_mean(latency_vals), 1)) if latency_vals else None),
     }
 
 
@@ -3205,6 +3497,13 @@ def _build_learning_context(*, repo: PostgresRepo, now_kst: datetime, rules_raw:
 
     outcome_rows = repo.fetch_decision_outcomes(limit=max_rows)
     trade_rows = repo.fetch_realized_trades(limit=max_rows)
+    if hasattr(repo, "fetch_decisions"):
+        decision_rows = repo.fetch_decisions(judge_type="SAFE", limit=max_rows)
+    elif hasattr(repo, "fetch_latest_decisions"):
+        decision_rows = repo.fetch_latest_decisions(limit=max_rows)
+    else:
+        decision_rows = []
+    exec_metric_rows = repo.fetch_execution_metrics(limit=max_rows) if hasattr(repo, "fetch_execution_metrics") else []
     outcome_windows = {
         "execution": _summarize_recent_outcomes(
             repo=repo,
@@ -3232,6 +3531,66 @@ def _build_learning_context(*, repo: PostgresRepo, now_kst: datetime, rules_raw:
             now_kst=now_kst,
             days=anchor_days,
             rows=outcome_rows,
+            window_name="anchor",
+        ),
+    }
+    decision_windows = {
+        "execution": _summarize_recent_decision_health(
+            repo=repo,
+            now_kst=now_kst,
+            hours=execution_hours,
+            rows=decision_rows,
+            window_name="execution",
+        ),
+        "short": _summarize_recent_decision_health(
+            repo=repo,
+            now_kst=now_kst,
+            days=short_days,
+            rows=decision_rows,
+            window_name="short",
+        ),
+        "medium": _summarize_recent_decision_health(
+            repo=repo,
+            now_kst=now_kst,
+            days=medium_days,
+            rows=decision_rows,
+            window_name="medium",
+        ),
+        "anchor": _summarize_recent_decision_health(
+            repo=repo,
+            now_kst=now_kst,
+            days=anchor_days,
+            rows=decision_rows,
+            window_name="anchor",
+        ),
+    }
+    execution_quality_windows = {
+        "execution": _summarize_recent_execution_quality(
+            repo=repo,
+            now_kst=now_kst,
+            hours=execution_hours,
+            rows=exec_metric_rows,
+            window_name="execution",
+        ),
+        "short": _summarize_recent_execution_quality(
+            repo=repo,
+            now_kst=now_kst,
+            days=short_days,
+            rows=exec_metric_rows,
+            window_name="short",
+        ),
+        "medium": _summarize_recent_execution_quality(
+            repo=repo,
+            now_kst=now_kst,
+            days=medium_days,
+            rows=exec_metric_rows,
+            window_name="medium",
+        ),
+        "anchor": _summarize_recent_execution_quality(
+            repo=repo,
+            now_kst=now_kst,
+            days=anchor_days,
+            rows=exec_metric_rows,
             window_name="anchor",
         ),
     }
@@ -3267,13 +3626,27 @@ def _build_learning_context(*, repo: PostgresRepo, now_kst: datetime, rules_raw:
     }
     execution_outcomes = outcome_windows["execution"]
     short_outcomes = outcome_windows["short"]
+    execution_decisions = decision_windows["execution"]
+    short_decisions = decision_windows["short"]
     execution_performance = performance_windows["execution"]
     short_performance = performance_windows["short"]
+    execution_quality = execution_quality_windows["execution"]
+    short_quality = execution_quality_windows["short"]
     recent_outcomes = execution_outcomes if int(execution_outcomes.get("total_trades") or 0) >= min_recent_trades else short_outcomes
+    recent_decision_health = (
+        execution_decisions
+        if int(execution_decisions.get("total_decisions") or 0) >= min_recent_trades
+        else short_decisions
+    )
     recent_performance = (
         execution_performance
         if int(execution_performance.get("trades_count") or 0) >= min_recent_trades
         else short_performance
+    )
+    recent_execution_quality = (
+        execution_quality
+        if int(execution_quality.get("samples") or 0) >= min_recent_trades
+        else short_quality
     )
     recent_meeting_lessons = (
         _build_recent_meeting_lessons(
@@ -3289,8 +3662,12 @@ def _build_learning_context(*, repo: PostgresRepo, now_kst: datetime, rules_raw:
     return {
         "recent_outcomes": dict(recent_outcomes),
         "outcome_windows": {k: dict(v) for k, v in outcome_windows.items()},
+        "recent_decision_health": dict(recent_decision_health),
+        "decision_windows": {k: dict(v) for k, v in decision_windows.items()},
         "recent_performance": dict(recent_performance),
         "performance_windows": {k: dict(v) for k, v in performance_windows.items()},
+        "recent_execution_quality": dict(recent_execution_quality),
+        "execution_quality_windows": {k: dict(v) for k, v in execution_quality_windows.items()},
         "latest_daily_review": _latest_daily_review_snapshot(repo=repo),
         "recent_meeting_lessons": list(recent_meeting_lessons),
         "latest_weekly_priority": _latest_weekly_priority_snapshot(repo=repo),
@@ -3657,9 +4034,21 @@ def run_governance_meeting_now(
         research_findings = dict((research_report or {}).get("findings") or {}) if isinstance(research_report, Mapping) else {}
         headlines_compact = [h for h in list(research_findings.get("headlines") or []) if isinstance(h, Mapping)][:10]
         research_summary = str((research_report or {}).get("summary") or "").strip()
+        research_macro = (
+            dict(research_findings.get("macro_context") or {})
+            if isinstance(research_findings.get("macro_context"), Mapping)
+            else {}
+        )
+        quant_macro = (
+            dict(quant_findings.get("macro_context") or {})
+            if isinstance(quant_findings.get("macro_context"), Mapping)
+            else {}
+        )
+        macro_context = dict(research_macro or quant_macro)
         research_brief = {
             "headlines": headlines_compact,
             "headlines_text": summarize_headlines_text(headlines_compact, max_items=6) or research_summary,
+            "macro_context": macro_context,
         }
 
         # Account state snapshot (paper sizing / context)

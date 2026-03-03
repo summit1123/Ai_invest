@@ -12,6 +12,7 @@ from ai_invest.config.capital_policy import resolve_capital_policy
 from ai_invest.config.llm_router import llm_route_for_agent
 from ai_invest.config.rules_loader import RulesConfig, load_rules
 from ai_invest.market_data.features import build_alpha_features_from_1m_candles
+from ai_invest.market_data.macro import fetch_macro_context
 from ai_invest.market_data.universe_selector import resolve_dynamic_universe
 from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_market_snapshot
 from ai_invest.research.rss import fetch_crypto_headlines
@@ -179,15 +180,19 @@ def _store_report(
 def _build_features(*, symbol: str, lookback_minutes: int, alpha_cfg) -> tuple[dict[str, float], dict[str, float]]:
     snap = fetch_market_snapshot(symbol)
     candles = fetch_candles_minutes(symbol, unit=1, count=max(120, int(lookback_minutes)))
+    opens = [float(c.get("opening_price") or c["trade_price"]) for c in candles]
     highs = [float(c["high_price"]) for c in candles]
     lows = [float(c["low_price"]) for c in candles]
     closes = [float(c["trade_price"]) for c in candles]
     volumes = [float(c["candle_acc_trade_volume"]) for c in candles]
+    turnovers = [float(c.get("candle_acc_trade_price") or 0.0) for c in candles]
     alpha_features = build_alpha_features_from_1m_candles(
+        opens=opens,
         highs=highs,
         lows=lows,
         closes=closes,
         volumes=volumes,
+        turnover_values=turnovers,
         ema_fast=int(alpha_cfg.ema_fast),
         ema_slow=int(alpha_cfg.ema_slow),
         ret_short_bars=int(alpha_cfg.ret_short_mins),
@@ -206,11 +211,15 @@ def _build_features(*, symbol: str, lookback_minutes: int, alpha_cfg) -> tuple[d
         {
             "mom_s": float(alpha_res.mom_s),
             "rev_s": float(alpha_res.rev_s),
+            "alpha_raw": float(alpha_res.alpha_raw),
             "alpha": float(alpha_res.alpha),
             "signal_target_pct": float(alpha_res.signal_target_pct),
             "strength": float(alpha_res.strength),
             "vol_scale": float(alpha_res.vol_scale),
             "strategy_tag_candidate": str(alpha_res.strategy_tag_candidate),
+            "regime": str(alpha_res.regime),
+            "trend_strength": float(alpha_res.trend_strength),
+            "shock_strength": float(alpha_res.shock_strength),
         }
     )
     return snapshot, features
@@ -500,10 +509,12 @@ def _quick_backtest_candidate(
             "backtest_score": -99.0,
         }
 
+    opens = [float(c.get("opening_price") or c.get("trade_price") or 0.0) for c in candles]
     highs = [float(c.get("high_price") or 0.0) for c in candles]
     lows = [float(c.get("low_price") or 0.0) for c in candles]
     closes = [float(c.get("trade_price") or 0.0) for c in candles]
     volumes = [float(c.get("candle_acc_trade_volume") or 0.0) for c in candles]
+    turnovers = [float(c.get("candle_acc_trade_price") or 0.0) for c in candles]
     n = min(len(highs), len(lows), len(closes), len(volumes))
     if n < 120:
         return {
@@ -547,10 +558,12 @@ def _quick_backtest_candidate(
             continue
         start = max(0, i - lookback + 1)
         f = build_alpha_features_from_1m_candles(
+            opens=opens[start : i + 1],
             highs=highs[start : i + 1],
             lows=lows[start : i + 1],
             closes=closes[start : i + 1],
             volumes=volumes[start : i + 1],
+            turnover_values=turnovers[start : i + 1],
             ema_fast=int(alpha_cfg.ema_fast),
             ema_slow=int(alpha_cfg.ema_slow),
             ret_short_bars=int(alpha_cfg.ret_short_mins),
@@ -716,6 +729,33 @@ def run_agent_work_cycle(
     lookback_minutes = max(120, int(alpha_cfg.lookback_minutes))
 
     need_market_ctx = bool({"research_agent", "quant_strategist"} & selected)
+    macro_cfg = (
+        ((rules_raw.get("research") or {}).get("macro_context") or {})
+        if isinstance(rules_raw, Mapping)
+        else {}
+    )
+    macro_context_enabled = bool(_as_float(macro_cfg.get("enabled"), default=1.0) > 0.0)
+    macro_timeout_sec = max(3, int(_as_float(macro_cfg.get("timeout_sec"), default=6.0)))
+    macro_context: dict[str, Any] = {
+        "as_of_utc": _utcnow().isoformat(),
+        "status": "DISABLED",
+        "risk_mode": "UNKNOWN",
+        "fear_greed_index": {},
+        "crypto_market": {},
+        "errors": [],
+    }
+    if need_market_ctx and bool(macro_context_enabled):
+        try:
+            macro_context = fetch_macro_context(timeout_sec=int(macro_timeout_sec))
+        except Exception as exc:
+            macro_context = {
+                "as_of_utc": _utcnow().isoformat(),
+                "status": "FAIL",
+                "risk_mode": "UNKNOWN",
+                "fear_greed_index": {},
+                "crypto_market": {},
+                "errors": [f"macro_context_failed:{str(exc)[:120]}"],
+            }
     learning_feedback: dict[str, Any] = {"enabled": False, "profiles": {}, "summary": {}}
     candidates: list[dict[str, Any]] = (
         _quant_candidate_rows(
@@ -818,6 +858,7 @@ def run_agent_work_cycle(
                     "web_search_timeout_sec": int(web_search_timeout_sec),
                     "rss_timeout_sec": int(rss_timeout_sec),
                 },
+                "macro_context": dict(macro_context),
                 "assigned_tasks": [dict(t.get("payload") or {}) for t in research_tasks[:5]],
             },
             risks={"watchlist": list(brief.risk_watchlist)},
@@ -963,6 +1004,7 @@ def run_agent_work_cycle(
                     },
                     "ranked": sorted(backtests, key=lambda x: float(x.get("backtest_score") or -999.0), reverse=True)[:8],
                 },
+                "macro_context": dict(macro_context),
                 "learning_feedback": {
                     "enabled": bool(learning_feedback.get("enabled")) if isinstance(learning_feedback, Mapping) else False,
                     "summary": (

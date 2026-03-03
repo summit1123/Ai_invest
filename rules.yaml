@@ -105,6 +105,9 @@ research:
     enabled: true
     provider: auto
     timeout_sec: 10
+  macro_context:
+    enabled: true
+    timeout_sec: 6
   headline_limit: 14
   rss_timeout_sec: 12
 strategy:
@@ -115,20 +118,21 @@ strategy:
     exit_rsi: 45
     atr_ref_pct: 1.3
     entry_alpha: 0.75
-    strong_alpha: 0.65
+    strong_alpha: 0.9
     atr_block_pct: 2.5
     ret_long_mins: 60
     rev_vol_z_min: 1.3
     stop_atr_mult: 1.1
-    vol_scale_max: 1.0
-    vol_scale_min: 1.0
-    max_target_pct: 100.0
+    vol_scale_max: 0.8
+    vol_scale_min: 0.5
+    max_target_pct: 35.0
     mom_weight_ret: 0.4
     mom_weight_rsi: 0.2
     mom_weight_vol: 0.15
     ret_short_mins: 15
     trail_atr_mult: 0.9
-    base_target_pct: 100.0
+    trail_activation_minutes: 15
+    base_target_pct: 20.0
     rev_ret_15m_max: -0.008
     rev_rsi_now_min: 50
     cooldown_minutes: 152
@@ -143,23 +147,34 @@ strategy:
     cooldown_override_enabled: true
     rev_penalty_when_trend_weak: 0.8
     daily_loss_entry_block_ratio: 0.8
+    entry_confirm_bars: 2
+    min_edge_dynamic_enabled: true
+    min_edge_liq_k: 8.0
+    min_edge_atr_k: 4.0
+    min_edge_atr_ref_pct: 1.3
+    liq_dv_z_ref: 1.0
+    min_edge_dynamic_cap: 20.0
+    spread_dynamic_enabled: true
+    spread_dynamic_atr_k: 0.35
+    spread_dynamic_liq_k: 2.0
+    spread_dynamic_liq_ref: 1.0
+    spread_dynamic_liq_scale: 0.8
+    spread_dynamic_min_mult: 0.8
+    spread_dynamic_max_mult: 1.8
 universe:
   mode: paper
   market: upbit
   dynamic:
-    enabled: true
+    enabled: false
     max_candidates: 12
     quote_currency: KRW
     exclude_symbols: []
     include_symbols: []
     min_24h_turnover_krw: 5000000000
     top_n_by_24h_turnover: 40
-    enforce_static_allowlist: false
+    enforce_static_allowlist: true
   symbols:
   - KRW-BTC
-  - KRW-ETH
-  - KRW-XRP
-  - KRW-SOL
   trade_side: long_only
   max_open_positions: 1
 execution:
@@ -194,18 +209,22 @@ cost_guard:
 governance:
   micro_mode:
     enabled: true
-    min_alpha: 0.85
+    min_alpha: 0.65
     entry_mode: adaptive
-    max_spread_bps: 1.165
+    max_spread_bps: 8.0
     plan_hold_only: true
-    max_position_pct: 100.0
+    max_position_pct: 20.0
     max_daily_loss_pct: 0.5
-    max_trades_per_day: 10
+    max_trades_per_day: 3
     require_market_long: false
     allow_plan_led_entry: true
+    enabled_live: false
+    alpha_margin: 0.1
+    edge_margin_bps: 10.0
     realtime_max_spread_mult: 1.15
     realtime_min_alpha_delta: -0.08
     realtime_between_meetings: true
+    inter_slot_symbol_policy: plan_only
     realtime_symbol_max_age_min: 180
     ignore_market_edge_in_plan_led: true
     ignore_market_cooldown_in_plan_led: true
@@ -244,7 +263,7 @@ governance:
         min_alpha: 0.75
         min_vol_z: 0.0
         min_atr_pct: 0.08
-        max_spread_bps: 1.5
+        max_spread_bps: 8.0
         sustain_seconds: 180
         min_pass_conditions: 3
       auto_promote_to: PAPER
@@ -304,6 +323,7 @@ paper_mode:
     relaxed_min_expectancy_pct: 0.0
     allow_soft_plan_block_bypass: true
 scheduling:
+  rules_hot_reload_enabled: true
   candle_timeframes:
   - 1m
   - 15m
@@ -341,12 +361,12 @@ adaptive_tuning:
   bounds:
     governance.micro_mode.min_alpha:
     - 0.1
-    - 0.85
+    - 0.75
     strategy.alpha_score.entry_alpha:
     - 0.2
     - 0.75
     governance.micro_mode.max_spread_bps:
-    - 1.0
+    - 4.0
     - 15.0
     strategy.alpha_score.cooldown_minutes:
     - 5
@@ -355,6 +375,17 @@ adaptive_tuning:
     - 30
     - 360
   enabled: true
+  blocked_regimes:
+  - SHOCK
+  min_execution_trades_for_patch: 3
+  max_paths_per_patch: 1
+  single_direction_per_cycle: true
+  path_priority:
+  - strategy.alpha_score.entry_alpha
+  - governance.micro_mode.min_alpha
+  - strategy.alpha_score.cooldown_minutes
+  - governance.plan_continuity.min_hold_minutes
+  - governance.micro_mode.max_spread_bps
   windows:
     short_days: 14
     anchor_days: 270

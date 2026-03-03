@@ -84,17 +84,40 @@ class AlphaScoreConfig:
     # Dynamic entry alpha adjustment coefficients (cost-aware).
     entry_alpha_spread_k: float
     entry_alpha_fee_k: float
+    # Regime switch thresholds.
+    regime_trend_threshold: float
+    regime_shock_threshold: float
+    trend_ema_gap_ref: float
+    trend_ret_ref: float
+    shock_vol_z_ref: float
+    shock_atr_ref: float
+    # Candle/flow feature thresholds.
+    trend_confirm_min_dv_z: float
+    trend_wick_max: float
+    range_ret_damp_ref: float
+    # Regime-specific alpha mix weights.
+    trend_weight_clv: float
+    trend_weight_flow: float
+    trend_weight_body: float
+    trend_weight_wick_pen: float
+    range_weight_rsi: float
+    range_weight_clv: float
+    range_weight_dv: float
 
 
 @dataclass(frozen=True)
 class AlphaScoreResult:
     mom_s: float
     rev_s: float
+    alpha_raw: float
     alpha: float
     strength: float
     vol_scale: float
     signal_target_pct: float
     strategy_tag_candidate: str
+    regime: str
+    trend_strength: float
+    shock_strength: float
 
 
 def load_alpha_score_config(*, rules_raw: Mapping[str, Any]) -> AlphaScoreConfig:
@@ -140,6 +163,22 @@ def load_alpha_score_config(*, rules_raw: Mapping[str, Any]) -> AlphaScoreConfig
         rev_penalty_when_trend_weak=_as_float(cfg.get("rev_penalty_when_trend_weak"), default=0.80),
         entry_alpha_spread_k=_as_float(cfg.get("entry_alpha_spread_k"), default=0.03),
         entry_alpha_fee_k=_as_float(cfg.get("entry_alpha_fee_k"), default=0.05),
+        regime_trend_threshold=_as_float(cfg.get("regime_trend_threshold"), default=0.58),
+        regime_shock_threshold=_as_float(cfg.get("regime_shock_threshold"), default=0.72),
+        trend_ema_gap_ref=_as_float(cfg.get("trend_ema_gap_ref"), default=0.003),
+        trend_ret_ref=_as_float(cfg.get("trend_ret_ref"), default=0.010),
+        shock_vol_z_ref=_as_float(cfg.get("shock_vol_z_ref"), default=2.5),
+        shock_atr_ref=_as_float(cfg.get("shock_atr_ref"), default=2.2),
+        trend_confirm_min_dv_z=_as_float(cfg.get("trend_confirm_min_dv_z"), default=0.2),
+        trend_wick_max=_as_float(cfg.get("trend_wick_max"), default=0.006),
+        range_ret_damp_ref=_as_float(cfg.get("range_ret_damp_ref"), default=0.012),
+        trend_weight_clv=_as_float(cfg.get("trend_weight_clv"), default=0.10),
+        trend_weight_flow=_as_float(cfg.get("trend_weight_flow"), default=0.08),
+        trend_weight_body=_as_float(cfg.get("trend_weight_body"), default=0.06),
+        trend_weight_wick_pen=_as_float(cfg.get("trend_weight_wick_pen"), default=0.12),
+        range_weight_rsi=_as_float(cfg.get("range_weight_rsi"), default=0.55),
+        range_weight_clv=_as_float(cfg.get("range_weight_clv"), default=0.25),
+        range_weight_dv=_as_float(cfg.get("range_weight_dv"), default=0.20),
     )
 
 
@@ -152,6 +191,11 @@ def compute_alpha_score(*, features: Mapping[str, Any], cfg: AlphaScoreConfig) -
     ema20 = _as_float(features.get("ema20"), default=0.0)
     ema60 = _as_float(features.get("ema60"), default=0.0)
     atr_pct = _as_float(features.get("atr_pct"), default=0.0)
+    body_pct = _as_float(features.get("body_pct"), default=0.0)
+    wick_pct = _as_float(features.get("wick_pct"), default=0.0)
+    clv = _as_float(features.get("clv"), default=0.0)
+    dv_z = _as_float(features.get("dv_zscore"), default=0.0)
+    oflow = _as_float(features.get("oflow"), default=0.0)
 
     s_rsi = clamp((rsi - 50.0) / 10.0, 0.0, 1.0)
     s_vol = clamp((vol_z - 1.0) / 0.8, 0.0, 1.0)
@@ -173,7 +217,74 @@ def compute_alpha_score(*, features: Mapping[str, Any], cfg: AlphaScoreConfig) -
     rev_s = 0.25 * (c_prev + c_now + c_ret + c_vol)
     trend_weak = bool((ema20 <= ema60) or (ret_60m < 0.0))
     rev_adj = rev_s * (float(cfg.rev_penalty_when_trend_weak) if trend_weak else 1.0)
-    alpha = max(mom_s, rev_adj)
+    ema_gap = ((ema20 - ema60) / ema60) if abs(ema60) > 1e-9 else 0.0
+    trend_strength = clamp(
+        (max(0.0, ema_gap) / max(float(cfg.trend_ema_gap_ref), 1e-9))
+        + (max(0.0, ret_60m) / max(float(cfg.trend_ret_ref), 1e-9)),
+        0.0,
+        1.0,
+    )
+    shock_vol = clamp(abs(vol_z) / max(float(cfg.shock_vol_z_ref), 1e-9), 0.0, 1.0)
+    shock_atr = clamp(max(0.0, atr_pct) / max(float(cfg.shock_atr_ref), 1e-9), 0.0, 1.0)
+    shock_wick = clamp(
+        max(0.0, wick_pct - float(cfg.trend_wick_max)) / max(float(cfg.trend_wick_max), 1e-9),
+        0.0,
+        1.0,
+    )
+    shock_strength = clamp((0.55 * shock_vol) + (0.30 * shock_atr) + (0.15 * shock_wick), 0.0, 1.0)
+
+    regime = "RANGE"
+    if shock_strength >= float(cfg.regime_shock_threshold):
+        regime = "SHOCK"
+    elif trend_strength >= float(cfg.regime_trend_threshold):
+        regime = "TREND"
+
+    clv_long = clamp((clv + 1.0) * 0.5, 0.0, 1.0)
+    clv_reversal = clamp((-clv + 1.0) * 0.5, 0.0, 1.0)
+    flow_long = clamp((oflow + 1.0) * 0.5, 0.0, 1.0)
+    body_score = clamp(body_pct / 0.004, 0.0, 1.0)
+    wick_penalty = clamp(wick_pct / max(float(cfg.trend_wick_max), 1e-9), 0.0, 1.0)
+    dv_score = clamp((dv_z - float(cfg.trend_confirm_min_dv_z)) / 2.0, 0.0, 1.0)
+    dv_range = clamp(dv_z / 3.0, 0.0, 1.0)
+    ret_damp = 1.0 - clamp(abs(ret_15m) / max(float(cfg.range_ret_damp_ref), 1e-9), 0.0, 1.0)
+
+    trend_alpha = clamp(
+        mom_s
+        + (float(cfg.trend_weight_clv) * (clv_long - 0.5))
+        + (float(cfg.trend_weight_flow) * (flow_long - 0.5))
+        + (float(cfg.trend_weight_body) * (body_score - 0.4))
+        - (float(cfg.trend_weight_wick_pen) * wick_penalty),
+        0.0,
+        1.0,
+    )
+    if dv_z < float(cfg.trend_confirm_min_dv_z):
+        trend_alpha *= 0.75
+    if wick_pct > float(cfg.trend_wick_max):
+        trend_alpha *= 0.65
+    trend_alpha = clamp(trend_alpha * (0.85 + 0.15 * dv_score), 0.0, 1.0)
+
+    range_w_sum = max(
+        1e-9,
+        float(cfg.range_weight_rsi) + float(cfg.range_weight_clv) + float(cfg.range_weight_dv),
+    )
+    range_alpha = (
+        (float(cfg.range_weight_rsi) * rev_adj)
+        + (float(cfg.range_weight_clv) * clv_reversal)
+        + (float(cfg.range_weight_dv) * dv_range)
+    ) / range_w_sum
+    range_alpha = clamp(range_alpha * ret_damp, 0.0, 1.0)
+
+    if regime == "TREND":
+        alpha_raw = trend_alpha
+        tag = "MOM"
+    elif regime == "RANGE":
+        alpha_raw = range_alpha
+        tag = "REV" if range_alpha >= trend_alpha else "MOM"
+    else:
+        alpha_raw = 0.0
+        tag = "MOM"
+
+    alpha = clamp(alpha_raw, 0.0, 1.0)
     den = max(1e-9, 1.0 - float(cfg.entry_alpha))
     strength = clamp((alpha - float(cfg.entry_alpha)) / den, 0.0, 1.0)
     if atr_pct <= 0:
@@ -182,13 +293,16 @@ def compute_alpha_score(*, features: Mapping[str, Any], cfg: AlphaScoreConfig) -
         vol_scale = clamp(float(cfg.atr_ref_pct) / float(atr_pct), float(cfg.vol_scale_min), float(cfg.vol_scale_max))
     raw_target = float(cfg.base_target_pct) + (float(cfg.max_target_pct) - float(cfg.base_target_pct)) * float(strength)
     signal_target = clamp(raw_target * vol_scale, 0.0, float(cfg.max_target_pct))
-    tag = "REV" if rev_adj >= mom_s and rev_adj > 0 else "MOM"
     return AlphaScoreResult(
         mom_s=float(mom_s),
         rev_s=float(rev_s),
+        alpha_raw=float(alpha_raw),
         alpha=float(alpha),
         strength=float(strength),
         vol_scale=float(vol_scale),
         signal_target_pct=float(signal_target),
         strategy_tag_candidate=str(tag),
+        regime=str(regime),
+        trend_strength=float(trend_strength),
+        shock_strength=float(shock_strength),
     )

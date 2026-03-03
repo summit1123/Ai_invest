@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import time
 import uuid
-from dataclasses import asdict
-from datetime import datetime, timezone
+from dataclasses import asdict, replace
+from datetime import datetime, timedelta, timezone
 from math import ceil
+from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
@@ -16,7 +20,11 @@ from ai_invest.agents.regime_agent import regime_agent_opine
 from ai_invest.agents.risk_agent import risk_agent_opine
 from ai_invest.config.capital_policy import resolve_capital_policy
 from ai_invest.config.rules_loader import RulesConfig, load_rules
+from ai_invest.domain.reason_codes import ReasonCode
+from ai_invest.execution.live_execution import LiveExecutor
+from ai_invest.execution.live_sync import sync_symbol_account_state
 from ai_invest.execution.paper_execution import PaperExecutor
+from ai_invest.execution.upbit_private import UpbitPrivateApiError, UpbitPrivateClient
 from ai_invest.judge.ai_judge import ai_judge_shadow_decide
 from ai_invest.judge.safe_judge import safe_judge_decide
 from ai_invest.learning.outcome_evaluator import evaluate_closed_trade
@@ -89,6 +97,21 @@ def _as_int(value: Any, *, default: int = 0) -> int:
         return int(float(s)) if s else int(default)
     except Exception:
         return int(default)
+
+
+def _as_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return bool(value)
+    s = str(value).strip().lower()
+    if not s:
+        return bool(default)
+    return s in {"1", "true", "yes", "y", "on"}
+
+
+def _env_bool(name: str, *, default: bool = False) -> bool:
+    return _as_bool(os.environ.get(name), default=default)
 
 
 def _latest_symbol_learning_feedback(*, repo: PostgresRepo, symbol: str) -> dict[str, Any]:
@@ -283,12 +306,68 @@ def default_context(*, daily_loss_pct: float = 0.0) -> dict[str, Any]:
     }
 
 
+def _rules_hash(*, raw_rules: Mapping[str, Any]) -> str:
+    try:
+        payload = json.dumps(raw_rules, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        payload = str(raw_rules)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_universe_id(*, raw_rules: Mapping[str, Any], rules: RulesConfig) -> str:
+    uv = (raw_rules.get("universe") or {}) if isinstance(raw_rules, Mapping) else {}
+    dyn = (uv.get("dynamic") or {}) if isinstance(uv, Mapping) else {}
+    static_symbols = [str(s).strip().upper() for s in list(rules.universe.symbols) if str(s).strip()]
+    payload = {
+        "market": str(rules.universe.market).strip().upper(),
+        "mode": str(rules.universe.mode).strip().lower(),
+        "symbols": sorted(set(static_symbols)),
+        "max_open_positions": int(rules.universe.max_open_positions),
+        "dynamic_enabled": bool(dyn.get("enabled", False)),
+        "dynamic_top_n": _as_int(dyn.get("top_n_by_24h_turnover"), default=0),
+        "dynamic_max_candidates": _as_int(dyn.get("max_candidates"), default=0),
+        "dynamic_enforce_static_allowlist": bool(dyn.get("enforce_static_allowlist", False)),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+    return f"uv-{digest[:16]}"
+
+
+def _load_runtime_rules(*, rules_path: Path) -> tuple[RulesConfig, dict[str, Any], int, str, str]:
+    rules = load_rules(rules_path)
+    raw = yaml.safe_load(rules_path.read_text(encoding="utf-8"))
+    raw_rules = dict(raw) if isinstance(raw, Mapping) else dict(rules.raw or {})
+    mtime_ns = int(rules_path.stat().st_mtime_ns)
+    rules_hash = _rules_hash(raw_rules=raw_rules)
+    universe_id = _build_universe_id(raw_rules=raw_rules, rules=rules)
+    return rules, raw_rules, mtime_ns, rules_hash, universe_id
+
+
 def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
-    rules = load_rules("rules.yaml")
-    raw_rules = yaml.safe_load(open("rules.yaml", "r", encoding="utf-8"))
+    rules_path = Path("rules.yaml")
+    rules, raw_rules, rules_mtime_ns, rules_hash, universe_id = _load_runtime_rules(rules_path=rules_path)
+    universe_cfg = (raw_rules.get("universe") or {}) if isinstance(raw_rules, Mapping) else {}
+    universe_mode = str((universe_cfg.get("mode") or "paper")).strip().lower()
+    is_live_mode = bool(universe_mode == "live")
+    governance_cfg = (raw_rules.get("governance") or {}) if isinstance(raw_rules, Mapping) else {}
+    activation_gate_cfg = (governance_cfg.get("activation_gate") or {}) if isinstance(governance_cfg, Mapping) else {}
+
+    live_execution_enabled = bool(activation_gate_cfg.get("live_execution_enabled", False))
+    live_env_enabled = _env_bool("ENABLE_LIVE_TRADING", default=False)
+    if is_live_mode:
+        if not live_execution_enabled:
+            raise RuntimeError("Live mode blocked: governance.activation_gate.live_execution_enabled=false")
+        if not live_env_enabled:
+            raise RuntimeError("Live mode blocked: ENABLE_LIVE_TRADING is not true")
 
     repo = PostgresRepo()
-    executor = PaperExecutor(repo)
+    live_client: UpbitPrivateClient | None = None
+    if is_live_mode:
+        live_client = UpbitPrivateClient.from_env()
+        executor = LiveExecutor(repo, live_client)
+    else:
+        executor = PaperExecutor(repo)
     notifier = NotificationService(repo)
 
     run_id = uuid.uuid4()
@@ -297,11 +376,16 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
     repo.insert_run(
         DbRun(
             run_id=run_id,
-            run_type="PAPER",
+            run_type=("LIVE" if is_live_mode else "PAPER"),
             started_at=now0,
             ended_at=None,
-            description="paper loop (dev)",
-            config={"rules_version": rules.version},
+            description="runtime loop (dev)",
+            config={
+                "rules_version": rules.version,
+                "mode": universe_mode,
+                "rules_hash": rules_hash,
+                "universe_id": universe_id,
+            },
             git_commit=None,
         )
     )
@@ -311,7 +395,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             created_by="system",
             parent_version=None,
             status="ACTIVE",
-            summary="bootstrap from rules.yaml (paper loop)",
+            summary=f"bootstrap from rules.yaml ({universe_mode} loop, hash={rules_hash[:12]})",
             rules_dsl=raw_rules,
             diff={},
             backtest_report={},
@@ -319,30 +403,156 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
     )
 
     default_symbol = rules.universe.symbols[0]
-    universe_cfg = (raw_rules.get("universe") or {}) if isinstance(raw_rules, Mapping) else {}
     dynamic_cfg = (universe_cfg.get("dynamic") or {}) if isinstance(universe_cfg, Mapping) else {}
     enforce_static_allowlist = bool(dynamic_cfg.get("enforce_static_allowlist", False))
     # Seed paper cash once so position sizing can use target_position_pct realistically.
     paper_cfg = raw_rules.get("paper", {}) if isinstance(raw_rules, dict) else {}
     seed_cash = float((paper_cfg or {}).get("initial_cash_krw") or 0.0)
-    if seed_cash > 0:
+    if (not is_live_mode) and seed_cash > 0:
         repo.ensure_paper_seed_cash(currency=_quote_currency(default_symbol), amount=seed_cash)
-    timeframe_entry = str(raw_rules.get("signal", {}).get("timeframe_entry", "15m"))
-    tf_min = _timeframe_to_minutes(timeframe_entry)
-    alpha_cfg = load_alpha_score_config(rules_raw=raw_rules)
-    alpha_lookback = max(120, int(alpha_cfg.lookback_minutes))
-    decision_interval_sec = max(
-        1,
-        int(_as_float((raw_rules.get("scheduling", {}) or {}).get("decision_interval_sec"), default=15.0)),
-    )
-    governance_cfg = (raw_rules.get("governance") or {}) if isinstance(raw_rules, Mapping) else {}
-    micro_cfg = (governance_cfg.get("micro_mode") or {}) if isinstance(governance_cfg, Mapping) else {}
-    universe_mode = str((universe_cfg.get("mode") or "paper")).strip().lower()
-    realtime_between_meetings = bool(micro_cfg.get("realtime_between_meetings", True))
-    realtime_symbol_max_age_min = max(15, _as_int(micro_cfg.get("realtime_symbol_max_age_min"), default=180))
+
+    scheduling_cfg = (raw_rules.get("scheduling") or {}) if isinstance(raw_rules, Mapping) else {}
+    hot_reload_enabled = bool(scheduling_cfg.get("rules_hot_reload_enabled", True))
     cap_runtime_state: dict[str, dict[str, Any]] = {}
+    entry_confirm_state: dict[str, int] = {}
+    symbol_rr_cursor = 0
 
     for _i in range(cycles):
+        if bool(hot_reload_enabled):
+            try:
+                latest_mtime_ns = int(rules_path.stat().st_mtime_ns)
+            except Exception:
+                latest_mtime_ns = rules_mtime_ns
+            if latest_mtime_ns != rules_mtime_ns:
+                try:
+                    prev_rule_version_id = rule_version_id
+                    prev_rules_hash = str(rules_hash)
+                    prev_universe_id = str(universe_id)
+                    new_rules, new_raw, new_mtime_ns, new_rules_hash, new_universe_id = _load_runtime_rules(
+                        rules_path=rules_path
+                    )
+                    reloaded_universe_cfg = (
+                        (new_raw.get("universe") or {}) if isinstance(new_raw, Mapping) else {}
+                    )
+                    reloaded_mode = str((reloaded_universe_cfg.get("mode") or "paper")).strip().lower()
+                    if reloaded_mode != universe_mode:
+                        repo.insert_event(
+                            DbEvent(
+                                event_id=uuid.uuid4(),
+                                ts=_utcnow(),
+                                event_type="RULES_RELOAD_SKIPPED",
+                                entity_type="rule_versions",
+                                entity_id=str(prev_rule_version_id),
+                                run_id=run_id,
+                                rule_version_id=prev_rule_version_id,
+                                payload={
+                                    "reason": "mode_mismatch",
+                                    "runtime_mode": str(universe_mode),
+                                    "requested_mode": str(reloaded_mode),
+                                    "rules_hash_prev": prev_rules_hash,
+                                    "rules_hash_new": new_rules_hash,
+                                },
+                            )
+                        )
+                        rules_mtime_ns = new_mtime_ns
+                    else:
+                        rules = new_rules
+                        raw_rules = new_raw
+                        rules_mtime_ns = new_mtime_ns
+                        rules_hash = new_rules_hash
+                        universe_id = new_universe_id
+                        universe_cfg = (
+                            (raw_rules.get("universe") or {}) if isinstance(raw_rules, Mapping) else {}
+                        )
+                        governance_cfg = (
+                            (raw_rules.get("governance") or {}) if isinstance(raw_rules, Mapping) else {}
+                        )
+                        activation_gate_cfg = (
+                            (governance_cfg.get("activation_gate") or {})
+                            if isinstance(governance_cfg, Mapping)
+                            else {}
+                        )
+                        dynamic_cfg = (
+                            (universe_cfg.get("dynamic") or {}) if isinstance(universe_cfg, Mapping) else {}
+                        )
+                        enforce_static_allowlist = bool(dynamic_cfg.get("enforce_static_allowlist", False))
+                        default_symbol = rules.universe.symbols[0]
+                        rule_version_id = uuid.uuid4()
+                        repo.insert_rule_version(
+                            DbRuleVersion(
+                                rule_version_id=rule_version_id,
+                                created_by="runtime_hot_reload",
+                                parent_version=prev_rule_version_id,
+                                status="ACTIVE",
+                                summary=f"hot reload from rules.yaml (hash={rules_hash[:12]})",
+                                rules_dsl=raw_rules,
+                                diff={
+                                    "rules_hash_prev": prev_rules_hash,
+                                    "rules_hash_new": rules_hash,
+                                    "universe_id_prev": prev_universe_id,
+                                    "universe_id_new": universe_id,
+                                },
+                                backtest_report={},
+                            )
+                        )
+                        repo.insert_event(
+                            DbEvent(
+                                event_id=uuid.uuid4(),
+                                ts=_utcnow(),
+                                event_type="RULES_RELOADED",
+                                entity_type="rule_versions",
+                                entity_id=str(rule_version_id),
+                                run_id=run_id,
+                                rule_version_id=rule_version_id,
+                                payload={
+                                    "parent_rule_version_id": str(prev_rule_version_id),
+                                    "rules_hash_prev": prev_rules_hash,
+                                    "rules_hash_new": rules_hash,
+                                    "universe_id_prev": prev_universe_id,
+                                    "universe_id_new": universe_id,
+                                },
+                            )
+                        )
+                except Exception as exc:
+                    repo.insert_event(
+                        DbEvent(
+                            event_id=uuid.uuid4(),
+                            ts=_utcnow(),
+                            event_type="RULES_RELOAD_FAILED",
+                            entity_type="rule_versions",
+                            entity_id=str(rule_version_id),
+                            run_id=run_id,
+                            rule_version_id=rule_version_id,
+                            payload={"error": str(exc)[:300]},
+                        )
+                    )
+
+        universe_cfg = (raw_rules.get("universe") or {}) if isinstance(raw_rules, Mapping) else {}
+        governance_cfg = (raw_rules.get("governance") or {}) if isinstance(raw_rules, Mapping) else {}
+        dynamic_cfg = (universe_cfg.get("dynamic") or {}) if isinstance(universe_cfg, Mapping) else {}
+        enforce_static_allowlist = bool(dynamic_cfg.get("enforce_static_allowlist", False))
+        default_symbol = rules.universe.symbols[0]
+        timeframe_entry = str((raw_rules.get("signal") or {}).get("timeframe_entry", "15m"))
+        tf_min = _timeframe_to_minutes(timeframe_entry)
+        alpha_cfg = load_alpha_score_config(rules_raw=raw_rules)
+        alpha_cfg_raw = (
+            ((raw_rules.get("strategy") or {}).get("alpha_score") or {})
+            if isinstance(raw_rules, Mapping)
+            else {}
+        )
+        alpha_lookback = max(120, int(alpha_cfg.lookback_minutes))
+        entry_confirm_bars = max(1, _as_int(alpha_cfg_raw.get("entry_confirm_bars"), default=1))
+        decision_interval_sec = max(
+            1,
+            int(_as_float((raw_rules.get("scheduling", {}) or {}).get("decision_interval_sec"), default=15.0)),
+        )
+        micro_cfg = (governance_cfg.get("micro_mode") or {}) if isinstance(governance_cfg, Mapping) else {}
+        realtime_between_meetings = bool(micro_cfg.get("realtime_between_meetings", True))
+        realtime_symbol_max_age_min = max(15, _as_int(micro_cfg.get("realtime_symbol_max_age_min"), default=180))
+        inter_slot_symbol_policy = str(micro_cfg.get("inter_slot_symbol_policy") or "plan_only").strip().lower()
+        if inter_slot_symbol_policy not in {"plan_only", "allow_quant"}:
+            inter_slot_symbol_policy = "plan_only"
+
         decision_id = uuid.uuid4()
         symbol = default_symbol
         symbol_source = "default"
@@ -357,35 +567,107 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 plan_symbol = p_sym
             plan_is_hold = _plan_is_hold_activation(plan)
 
+        allowed_symbols = set(rules.universe.symbols) if enforce_static_allowlist else None
+        plan_symbol_allowed = bool(
+            plan_symbol and (allowed_symbols is None or str(plan_symbol) in allowed_symbols)
+        )
+        max_open_positions = max(1, int(rules.universe.max_open_positions))
+        candidate_symbol = str(default_symbol)
+        candidate_source = "default"
+
+        if plan_symbol_allowed and not (plan_is_hold and universe_mode == "paper" and realtime_between_meetings):
+            candidate_symbol = str(plan_symbol)
+            candidate_source = "plan_symbol"
+        elif plan_is_hold and universe_mode == "paper" and realtime_between_meetings:
+            if inter_slot_symbol_policy == "allow_quant":
+                runtime_symbol = _latest_quant_candidate_symbol(
+                    repo=repo,
+                    max_age_minutes=int(realtime_symbol_max_age_min),
+                    allowed_symbols=allowed_symbols,
+                )
+                if runtime_symbol:
+                    candidate_symbol = str(runtime_symbol)
+                    candidate_source = "quant_inter_slot"
+                    inter_slot_realtime_mode = True
+                elif plan_symbol_allowed:
+                    candidate_symbol = str(plan_symbol)
+                    candidate_source = "plan_symbol_hold_fallback"
+            elif plan_symbol_allowed:
+                candidate_symbol = str(plan_symbol)
+                candidate_source = "plan_symbol_hold_policy"
+
         open_symbols = _fetch_open_position_symbols(repo=repo)
+        open_set = set(open_symbols)
         if open_symbols:
-            if plan_symbol and plan_symbol in set(open_symbols):
-                symbol = str(plan_symbol)
+            symbol_pool = sorted(set(str(s).strip().upper() for s in open_symbols if str(s or "").strip()))
+            can_add_new_symbol = len(open_set) < int(max_open_positions)
+            if can_add_new_symbol and candidate_symbol and candidate_symbol not in open_set:
+                symbol_pool.append(str(candidate_symbol))
+            if plan_symbol and plan_symbol in open_set:
+                symbol_pool.append(str(plan_symbol))
+            symbol_pool = sorted(set(symbol_pool))
+            if not symbol_pool:
+                symbol_pool = [str(default_symbol)]
+            symbol = str(symbol_pool[int(symbol_rr_cursor % len(symbol_pool))])
+            symbol_rr_cursor += 1
+            if symbol in open_set and plan_symbol and symbol == str(plan_symbol):
                 symbol_source = "open_position_plan_symbol"
-            else:
-                symbol = str(open_symbols[0])
-                symbol_source = "open_position_fallback"
+            elif symbol in open_set:
+                symbol_source = "open_position_round_robin"
                 if plan_symbol and plan_symbol != symbol:
                     manage_open_position_only = True
-        elif plan_symbol and (not enforce_static_allowlist or plan_symbol in set(rules.universe.symbols)) and (
-            not (plan_is_hold and universe_mode == "paper" and realtime_between_meetings)
-        ):
-            symbol = str(plan_symbol)
-            symbol_source = "plan_symbol"
-        elif plan_is_hold and universe_mode == "paper" and realtime_between_meetings:
-            allowed_symbols = set(rules.universe.symbols) if enforce_static_allowlist else None
-            runtime_symbol = _latest_quant_candidate_symbol(
-                repo=repo,
-                max_age_minutes=int(realtime_symbol_max_age_min),
-                allowed_symbols=allowed_symbols,
-            )
-            if runtime_symbol:
-                symbol = str(runtime_symbol)
-                symbol_source = "quant_inter_slot"
-                inter_slot_realtime_mode = True
-            elif plan_symbol and (not enforce_static_allowlist or plan_symbol in set(rules.universe.symbols)):
-                symbol = str(plan_symbol)
-                symbol_source = "plan_symbol_hold_fallback"
+            else:
+                symbol_source = f"{candidate_source}_under_cap"
+        else:
+            symbol = str(candidate_symbol)
+            symbol_source = str(candidate_source)
+
+        if is_live_mode and live_client is not None:
+            try:
+                sync_symbol_account_state(
+                    repo=repo,
+                    client=live_client,
+                    symbol=symbol,
+                    run_id=run_id,
+                    rule_version_id=rule_version_id,
+                )
+            except (UpbitPrivateApiError, Exception) as exc:
+                now_fail = _utcnow()
+                err_msg = f"live account sync failed for {symbol}: {exc}"
+                print(f"[경고] {err_msg}")
+                pause_event_id = uuid.uuid4()
+                repo.insert_event(
+                    DbEvent(
+                        event_id=pause_event_id,
+                        ts=now_fail,
+                        event_type="PAUSE",
+                        entity_type="pause_log",
+                        entity_id="AUTO",
+                        run_id=run_id,
+                        rule_version_id=rule_version_id,
+                        payload={"symbol": symbol, "reason_type": "LIVE_SYNC_FAIL", "error": str(exc)},
+                    )
+                )
+                repo.insert_pause_log(
+                    DbPauseLog(
+                        pause_id=uuid.uuid4(),
+                        ts_pause=now_fail,
+                        ts_resume=None,
+                        reason_type="LIVE_SYNC_FAIL",
+                        severity="HIGH",
+                        auto_resumable=False,
+                        resume_policy={},
+                        notes=err_msg,
+                        run_id=run_id,
+                    )
+                )
+                notifier.notify_pause(
+                    event_id=pause_event_id,
+                    symbol=symbol,
+                    reason_type="LIVE_SYNC_FAIL",
+                    run_id=run_id,
+                )
+                break
 
         try:
             snapshot = fetch_market_snapshot(symbol)
@@ -523,6 +805,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     "best_ask": snapshot.best_ask,
                     "mid_price": snapshot.mid_price,
                     "spread_bps": snapshot.spread_bps,
+                    "rules_hash": rules_hash,
+                    "universe_id": universe_id,
                 },
             )
         )
@@ -534,15 +818,19 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         volumes = [float(c["candle_acc_trade_volume"]) for c in candles]
         feat = build_feature_snapshot_from_candles(highs=highs, lows=lows, closes=closes, volumes=volumes)
         candles_1m = fetch_candles_minutes(symbol, unit=1, count=int(alpha_lookback))
+        opens_1m = [float(c.get("opening_price") or c["trade_price"]) for c in candles_1m]
         highs_1m = [float(c["high_price"]) for c in candles_1m]
         lows_1m = [float(c["low_price"]) for c in candles_1m]
         closes_1m = [float(c["trade_price"]) for c in candles_1m]
         volumes_1m = [float(c["candle_acc_trade_volume"]) for c in candles_1m]
+        turnovers_1m = [float(c.get("candle_acc_trade_price") or 0.0) for c in candles_1m]
         alpha_features = build_alpha_features_from_1m_candles(
+            opens=opens_1m,
             highs=highs_1m,
             lows=lows_1m,
             closes=closes_1m,
             volumes=volumes_1m,
+            turnover_values=turnovers_1m,
             ema_fast=int(alpha_cfg.ema_fast),
             ema_slow=int(alpha_cfg.ema_slow),
             ret_short_bars=int(alpha_cfg.ret_short_mins),
@@ -559,7 +847,13 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 entity_id=f"{symbol}:{decision_id}",
                 run_id=run_id,
                 rule_version_id=rule_version_id,
-                payload={"symbol": symbol, "decision_id": str(decision_id), "features": feat_map},
+                payload={
+                    "symbol": symbol,
+                    "decision_id": str(decision_id),
+                    "features": feat_map,
+                    "rules_hash": rules_hash,
+                    "universe_id": universe_id,
+                },
             )
         )
 
@@ -594,6 +888,11 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     "avg_entry_price": float(pos.avg_entry_price) if (pos and pos.avg_entry_price) else None,
                 },
                 "position_state": position_state.to_context(now=_utcnow()),
+                "runtime": {
+                    "rules_hash": str(rules_hash),
+                    "universe_id": str(universe_id),
+                    "universe_mode": str(universe_mode),
+                },
                 "trade_plan": {
                     "slot_key": plan.get("slot_key") if plan else None,
                     "time_horizon": plan.get("time_horizon") if plan else None,
@@ -612,6 +911,10 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     "execution_plan": dict(plan_execution_plan or {}),
                 },
                 "learning_feedback": _latest_symbol_learning_feedback(repo=repo, symbol=symbol),
+                "entry_confirmation": {
+                    "required_bars": int(entry_confirm_bars),
+                    "current_streak": int(_as_int(entry_confirm_state.get(symbol), default=0)),
+                },
             },
         )
 
@@ -620,6 +923,29 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         regime = regime_agent_opine(payload, rules=rules)
         risk = risk_agent_opine(payload, rules=rules)
         ops_op = ops_agent_opine(payload)
+        if current_qty > 0:
+            entry_confirm_state[symbol] = 0
+        elif int(entry_confirm_bars) > 1:
+            prev_streak = int(_as_int(entry_confirm_state.get(symbol), default=0))
+            if market.signal == "LONG" and bool(market.entry_allowed):
+                next_streak = prev_streak + 1
+                entry_confirm_state[symbol] = int(next_streak)
+                if next_streak < int(entry_confirm_bars):
+                    pending_reason = dict(market.reason or {})
+                    pending_reason["entry_confirm_bars"] = int(entry_confirm_bars)
+                    pending_reason["entry_confirm_streak"] = int(next_streak)
+                    market = replace(
+                        market,
+                        signal="HOLD",
+                        confidence=min(0.60, float(market.confidence)),
+                        target_position_pct=0.0,
+                        signal_target_pct=0.0,
+                        entry_allowed=False,
+                        reason_codes=[ReasonCode.RG_CAP_PENDING.value],
+                        reason=pending_reason,
+                    )
+            else:
+                entry_confirm_state[symbol] = 0
 
         now = _utcnow()
 
@@ -653,6 +979,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     payload={
                         "symbol": symbol,
                         "decision_id": str(decision_id),
+                        "rules_hash": rules_hash,
+                        "universe_id": universe_id,
                         "agent_name": agent_name,
                         "opinion_id": str(opinion_id),
                         "opinion": raw,
@@ -896,8 +1224,16 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "confidence": market.confidence,
                 "signal_target_pct": market.signal_target_pct,
                 "alpha": market.alpha,
+                "alpha_raw": market.alpha_raw,
                 "mom_s": market.mom_s,
                 "rev_s": market.rev_s,
+                "regime": market.regime,
+                "trend_strength": market.trend_strength,
+                "shock_strength": market.shock_strength,
+                "expected_edge_bps": market.expected_edge_bps,
+                "expected_cost_bps": market.expected_cost_bps,
+                "expected_net_edge_bps": market.expected_net_edge_bps,
+                "min_edge_required_bps": market.min_edge_required_bps,
                 "reason_codes": list(market.reason_codes or []),
             },
             regime={"trade_allowed": regime.trade_allowed, "reason_codes": list(regime.reason_codes or [])},
@@ -934,6 +1270,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 payload={
                     "symbol": symbol,
                     "decision_id": str(decision_id),
+                    "rules_hash": rules_hash,
+                    "universe_id": universe_id,
                     "decision": asdict(safe),
                     "trade_plan": {
                         "event_id": plan.get("event_id"),
@@ -969,6 +1307,11 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "atr_pct": feat_map.get("atr_pct"),
                 "vol_zscore": feat_map.get("vol_zscore"),
                 "alpha": market.alpha,
+                "alpha_raw": market.alpha_raw,
+                "alpha_regime": market.regime,
+                "expected_edge_bps": market.expected_edge_bps,
+                "expected_cost_bps": market.expected_cost_bps,
+                "expected_net_edge_bps": market.expected_net_edge_bps,
                 "signal_target_pct": market.signal_target_pct,
                 "effective_target_pct": safe.effective_target_pct,
                 "exit_reason": market.exit_reason,
@@ -993,6 +1336,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 ),
                 "capital_tier": capital_profile.tier_name,
                 "capital_target_cap_pct": effective_target_cap,
+                "rules_hash": rules_hash,
+                "universe_id": universe_id,
             },
         )
 
@@ -1086,6 +1431,9 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     )
                 )
 
+        if safe.action == "BUY":
+            entry_confirm_state[symbol] = 0
+
         # AI shadow decision (stored, no execution)
         ai = ai_judge_shadow_decide(
             payload,
@@ -1123,7 +1471,13 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 entity_id=str(ai_decision_id),
                 run_id=run_id,
                 rule_version_id=rule_version_id,
-                payload={"symbol": symbol, "shadow_of": str(decision_id), "decision": asdict(ai)},
+                payload={
+                    "symbol": symbol,
+                    "shadow_of": str(decision_id),
+                    "rules_hash": rules_hash,
+                    "universe_id": universe_id,
+                    "decision": asdict(ai),
+                },
             )
         )
 

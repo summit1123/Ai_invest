@@ -496,6 +496,80 @@ def _build_tuning_patch(
     return patch, diagnostics
 
 
+def _apply_patch_change_budget(
+    *,
+    rules_raw: Mapping[str, Any],
+    patch: Mapping[str, Any],
+    tuning_cfg: Mapping[str, Any],
+    composite_score: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not patch:
+        return {}, {
+            "max_paths_per_patch": int(max(1, _as_int(tuning_cfg.get("max_paths_per_patch"), default=1))),
+            "single_direction_per_cycle": bool(tuning_cfg.get("single_direction_per_cycle", True)),
+            "selected_paths": [],
+            "dropped_paths": [],
+            "desired_direction": "TIGHTEN" if float(composite_score) < 0.0 else "LOOSEN",
+        }
+
+    max_paths = max(1, _as_int(tuning_cfg.get("max_paths_per_patch"), default=1))
+    single_direction = bool(tuning_cfg.get("single_direction_per_cycle", True))
+    desired_tighten = bool(float(composite_score) < 0.0)
+
+    priority_cfg = [str(x).strip() for x in list(tuning_cfg.get("path_priority") or []) if str(x).strip()]
+    default_priority = [
+        "strategy.alpha_score.entry_alpha",
+        "governance.micro_mode.min_alpha",
+        "strategy.alpha_score.cooldown_minutes",
+        "governance.plan_continuity.min_hold_minutes",
+        "governance.micro_mode.max_spread_bps",
+    ]
+    ordered_paths = priority_cfg or default_priority
+    priority_idx = {p: i for i, p in enumerate(ordered_paths)}
+
+    items: list[tuple[str, Any, float, bool]] = []
+    dropped_paths: list[str] = []
+    for path, proposed in dict(patch).items():
+        base = _as_float(_path_get(rules_raw, path), default=0.0)
+        proposed_f = _as_float(proposed, default=base)
+        is_tighten = _is_tightening_path(path, base=float(base), proposed=float(proposed_f))
+        if single_direction and bool(is_tighten) != bool(desired_tighten):
+            dropped_paths.append(str(path))
+            continue
+        magnitude = abs(float(proposed_f) - float(base))
+        items.append((str(path), proposed, float(magnitude), bool(is_tighten)))
+
+    if not items:
+        # If directional filter removed everything, fallback to original patch but still enforce change budget.
+        for path, proposed in dict(patch).items():
+            base = _as_float(_path_get(rules_raw, path), default=0.0)
+            proposed_f = _as_float(proposed, default=base)
+            magnitude = abs(float(proposed_f) - float(base))
+            is_tighten = _is_tightening_path(path, base=float(base), proposed=float(proposed_f))
+            items.append((str(path), proposed, float(magnitude), bool(is_tighten)))
+
+    items.sort(
+        key=lambda x: (
+            priority_idx.get(str(x[0]), 10_000),
+            -float(x[2]),
+        )
+    )
+    selected = items[:max_paths]
+    selected_paths = [str(x[0]) for x in selected]
+    dropped_paths.extend([str(x[0]) for x in items[max_paths:]])
+
+    out: dict[str, Any] = {}
+    for path, proposed, _magnitude, _tight in selected:
+        out[str(path)] = proposed
+    return out, {
+        "max_paths_per_patch": int(max_paths),
+        "single_direction_per_cycle": bool(single_direction),
+        "selected_paths": list(selected_paths),
+        "dropped_paths": list(dict.fromkeys(dropped_paths)),
+        "desired_direction": "TIGHTEN" if desired_tighten else "LOOSEN",
+    }
+
+
 def _apply_whitelisted_patch(
     *,
     rules_raw: Mapping[str, Any],
@@ -798,6 +872,32 @@ def run_adaptive_tuning_cycle(*, repo: PostgresRepo, rules_path: Path) -> dict[s
 
     metrics = _collect_multi_window_metrics(repo, now=now, cfg=tuning_cfg)
     regime = _determine_regime(metrics["short"])
+    blocked_regimes = {str(x).strip().upper() for x in list(tuning_cfg.get("blocked_regimes") or ["SHOCK"]) if str(x).strip()}
+    if str(regime).upper() in blocked_regimes:
+        payload = {
+            "status": "skipped",
+            "reason": "regime_blocked_by_policy",
+            "regime": str(regime),
+            "blocked_regimes": sorted(blocked_regimes),
+            "metrics": {k: v.to_dict() for k, v in metrics.items()},
+        }
+        _emit_event(repo, event_type="DYNAMIC_RULE_PATCH_SKIPPED", payload=payload)
+        return payload
+
+    min_exec_trades = max(0, _as_int(tuning_cfg.get("min_execution_trades_for_patch"), default=3))
+    execution_trades = int((metrics.get("execution") or WindowMetrics(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)).trades_count)
+    if execution_trades < int(min_exec_trades):
+        payload = {
+            "status": "skipped",
+            "reason": "insufficient_execution_samples",
+            "regime": str(regime),
+            "execution_trades_count": int(execution_trades),
+            "min_execution_trades_for_patch": int(min_exec_trades),
+            "metrics": {k: v.to_dict() for k, v in metrics.items()},
+        }
+        _emit_event(repo, event_type="DYNAMIC_RULE_PATCH_SKIPPED", payload=payload)
+        return payload
+
     weights = _resolve_regime_weights(tuning_cfg, regime)
     composite = _weighted_composite_score(metrics=metrics, weights=weights)
     patch, diagnostics = _build_tuning_patch(
@@ -807,6 +907,14 @@ def run_adaptive_tuning_cycle(*, repo: PostgresRepo, rules_path: Path) -> dict[s
         regime=regime,
         composite_score=composite,
     )
+    patch, governance_diag = _apply_patch_change_budget(
+        rules_raw=rules_raw,
+        patch=patch,
+        tuning_cfg=tuning_cfg,
+        composite_score=composite,
+    )
+    diagnostics = dict(diagnostics)
+    diagnostics["change_governance"] = dict(governance_diag)
     whitelist = [str(x) for x in list(tuning_cfg.get("whitelist_paths") or []) if str(x).strip()]
     if not whitelist:
         whitelist = list(patch.keys())

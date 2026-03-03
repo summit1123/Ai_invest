@@ -61,6 +61,25 @@ class FeatureTests(unittest.TestCase):
         self.assertIn("ema20", out)
         self.assertIn("ema60", out)
 
+    def test_build_alpha_features_prefers_turnover_when_available(self) -> None:
+        highs = [101.0 + (i * 0.01) for i in range(80)]
+        lows = [99.0 + (i * 0.01) for i in range(80)]
+        closes = [100.0 + (i * 0.01) for i in range(80)]
+        volumes = [1.0 for _ in range(80)]
+        turnovers = [100000.0 + (i * 1000.0) for i in range(80)]
+        out = build_alpha_features_from_1m_candles(
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            volumes=volumes,
+            turnover_values=turnovers,
+            ema_fast=20,
+            ema_slow=60,
+            ret_short_bars=15,
+            ret_long_bars=60,
+        )
+        self.assertGreater(out.get("dv_zscore", 0.0), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
