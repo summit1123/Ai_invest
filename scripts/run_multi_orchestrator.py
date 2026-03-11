@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -14,7 +14,13 @@ from typing import Any
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 DEFAULT_STATUS_FILE = ROOT / "runtime" / "orchestrator_status.json"
+
+from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+from ai_invest.runtime.preflight import build_startup_preflight, format_preflight_report  # noqa: E402
+
+load_dotenv()
 
 
 def _load_rules() -> dict[str, Any]:
@@ -179,6 +185,7 @@ def main() -> int:
     p.add_argument("--no-governance", action="store_true", help="disable governance loop worker")
     p.add_argument("--no-review", action="store_true", help="disable review loop worker")
     p.add_argument("--no-adaptive", action="store_true", help="disable adaptive tuning worker")
+    p.add_argument("--skip-preflight", action="store_true", help="skip startup preflight checks")
     p.add_argument("--dry-run", action="store_true", help="print commands and exit")
     args = p.parse_args()
 
@@ -218,10 +225,20 @@ def main() -> int:
     )
 
     if not commands:
-        print("[중단] 실행할 워커가 없습니다. --no-* 옵션을 확인하세요.")
+        print("[stop] no workers selected; check --no-* flags", flush=True)
         return 2
 
-    print("[설정] unified orchestrator workers")
+    if not bool(args.dry_run) and not bool(args.skip_preflight):
+        report = build_startup_preflight(
+            rules_raw=rules,
+            require_trading=not bool(args.no_paper),
+        )
+        for line in format_preflight_report(report):
+            print(line, flush=True)
+        if not report.ok:
+            return 2
+
+    print("[config] unified orchestrator workers", flush=True)
     for name, cmd in commands:
         print(f"- {name}: {' '.join(cmd)}", flush=True)
 
@@ -234,7 +251,7 @@ def main() -> int:
     stopping = False
 
     def _start_worker(name: str, cmd: list[str]) -> None:
-        print(f"[시작] {name}", flush=True)
+        print(f"[start] {name}", flush=True)
         procs[name] = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
@@ -269,14 +286,14 @@ def main() -> int:
     def _stop_all(sig: int | None = None, _frame=None) -> None:
         nonlocal stopping
         stopping = True
-        print(f"[종료] signal={sig}", flush=True)
+        print(f"[stop] signal={sig}", flush=True)
         try:
             _write_status_file(status_file, _snapshot_status())
         except Exception:
             pass
         for name, proc in list(procs.items()):
             if proc.poll() is None:
-                print(f"[종료요청] {name} pid={proc.pid}", flush=True)
+                print(f"[terminate] {name} pid={proc.pid}", flush=True)
                 proc.terminate()
         t0 = time.time()
         while time.time() - t0 < 8.0:
@@ -285,7 +302,7 @@ def main() -> int:
             time.sleep(0.2)
         for name, proc in list(procs.items()):
             if proc.poll() is None:
-                print(f"[강제종료] {name} pid={proc.pid}", flush=True)
+                print(f"[kill] {name} pid={proc.pid}", flush=True)
                 proc.kill()
         try:
             _write_status_file(status_file, _snapshot_status())
@@ -316,7 +333,7 @@ def main() -> int:
                 st["restarts"] = int(st.get("restarts") or 0) + 1
                 worker_state[name] = st
                 print(
-                    f"[재기동] {name} exited code={code}, restarting in {float(args.restart_delay_sec):.1f}s",
+                    f"[restart] {name} exited code={code}, restarting in {float(args.restart_delay_sec):.1f}s",
                     flush=True,
                 )
                 time.sleep(float(args.restart_delay_sec))

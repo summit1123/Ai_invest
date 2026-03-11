@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import base64
@@ -9,17 +9,15 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
 
 try:
     import psycopg
 except ModuleNotFoundError as exc:  # pragma: no cover
     raise SystemExit(
-        "[실패] Python 의존성이 설치되어 있지 않습니다(psycopg 누락).\n"
-        "아래 중 하나로 실행하세요:\n"
-        "  1) uv sync && .venv/bin/python scripts/smoke_tests.py\n"
-        "  2) uv run python scripts/smoke_tests.py\n"
+        "[FAIL] Missing Python dependency: psycopg.\n"
+        "Run one of the following first:\n"
+        "  1) python -m pip install -e .\n"
+        "  2) python -m pip install 'psycopg[binary]'\n"
     ) from exc
 import requests
 
@@ -40,8 +38,8 @@ def load_env(path: Path) -> dict[str, str]:
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line or line.startswith("#") or "=" not in line:
             continue
-        k, v = line.split("=", 1)
-        env[k.strip()] = v.strip()
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip()
     return env
 
 
@@ -52,7 +50,7 @@ def to_psycopg_dsn(dsn: str) -> str:
 
 
 def parse_bool(value: str) -> bool:
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def b64url(data: bytes) -> str:
@@ -72,7 +70,7 @@ def build_upbit_jwt(access_key: str, secret_key: str) -> str:
 def test_db(env: dict[str, str]) -> TestResult:
     dsn = env.get("POSTGRES_DSN", "")
     if not dsn:
-        return TestResult("DB", False, "POSTGRES_DSN 누락")
+        return TestResult("DB", False, "POSTGRES_DSN missing")
     require_pgvector = parse_bool(env.get("REQUIRE_PGVECTOR", ""))
 
     dsn = to_psycopg_dsn(dsn)
@@ -84,38 +82,38 @@ def test_db(env: dict[str, str]) -> TestResult:
                 cur.execute("select extname from pg_extension where extname='vector'")
                 vector_exists = bool(cur.fetchone())
         if not vector_exists and require_pgvector:
-            return TestResult("DB", False, f"연결 성공({db}/{user}), vector 확장 없음(REQUIRE_PGVECTOR=true)")
+            return TestResult("DB", False, f"Connected ({db}/{user}) but pgvector extension missing")
         if not vector_exists:
-            return TestResult("DB", True, f"연결 성공({db}/{user}), vector 확장 없음(선택)")
-        return TestResult("DB", True, f"연결 성공({db}/{user}), vector 확장 확인")
+            return TestResult("DB", True, f"Connected ({db}/{user}), pgvector not installed")
+        return TestResult("DB", True, f"Connected ({db}/{user}), pgvector installed")
     except Exception as exc:
-        return TestResult("DB", False, f"연결 실패: {exc}")
+        return TestResult("DB", False, f"Connection failed: {exc}")
 
 
 def test_telegram(env: dict[str, str]) -> TestResult:
     token = env.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = env.get("TELEGRAM_CHAT_ID_OPS", "")
     if not token or not chat_id:
-        return TestResult("Telegram", False, "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID_OPS 누락")
+        return TestResult("Telegram", False, "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID_OPS missing")
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    text = "[운영] 스모크 테스트: 텔레그램 알림 경로 정상"
+    text = "[ops] smoke test notification path OK"
     try:
         resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=10)
         data = resp.json()
         if resp.ok and data.get("ok"):
             message_id = data.get("result", {}).get("message_id")
-            return TestResult("Telegram", True, f"전송 성공(message_id={message_id})")
-        return TestResult("Telegram", False, f"전송 실패: {data}")
+            return TestResult("Telegram", True, f"Sent successfully (message_id={message_id})")
+        return TestResult("Telegram", False, f"Send failed: {data}")
     except Exception as exc:
-        return TestResult("Telegram", False, f"호출 실패: {exc}")
+        return TestResult("Telegram", False, f"Request failed: {exc}")
 
 
 def test_upbit_auth(env: dict[str, str]) -> TestResult:
     access_key = env.get("UPBIT_ACCESS_KEY", "")
     secret_key = env.get("UPBIT_SECRET_KEY", "")
     if not access_key or not secret_key:
-        return TestResult("Upbit", False, "UPBIT_ACCESS_KEY 또는 UPBIT_SECRET_KEY 누락")
+        return TestResult("Upbit", False, "UPBIT_ACCESS_KEY or UPBIT_SECRET_KEY missing")
 
     token = build_upbit_jwt(access_key, secret_key)
     headers = {"Authorization": f"Bearer {token}"}
@@ -124,15 +122,19 @@ def test_upbit_auth(env: dict[str, str]) -> TestResult:
         resp = requests.get("https://api.upbit.com/v1/accounts", headers=headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            return TestResult("Upbit", True, f"인증 조회 성공(accounts={len(data)})")
-        return TestResult("Upbit", False, f"인증 조회 실패(status={resp.status_code}, body={resp.text[:200]})")
+            return TestResult("Upbit", True, f"Authenticated successfully (accounts={len(data)})")
+        return TestResult(
+            "Upbit",
+            False,
+            f"Auth failed (status={resp.status_code}, body={resp.text[:200]})",
+        )
     except Exception as exc:
-        return TestResult("Upbit", False, f"호출 실패: {exc}")
+        return TestResult("Upbit", False, f"Request failed: {exc}")
 
 
 def main() -> int:
     if not ENV_PATH.exists():
-        print("[실패] .env 파일이 없습니다.")
+        print("[FAIL] .env file not found.")
         return 1
 
     env = load_env(ENV_PATH)
@@ -144,16 +146,16 @@ def main() -> int:
 
     failed = 0
     for result in results:
-        status = "성공" if result.ok else "실패"
+        status = "OK" if result.ok else "FAIL"
         print(f"[{status}] {result.name}: {result.detail}")
         if not result.ok:
             failed += 1
 
     if failed:
-        print(f"[요약] 실패 {failed}건")
+        print(f"[SUMMARY] {failed} checks failed")
         return 2
 
-    print("[요약] 모든 스모크 테스트 통과")
+    print("[SUMMARY] All smoke checks passed")
     return 0
 
 

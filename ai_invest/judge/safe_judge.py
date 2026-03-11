@@ -173,8 +173,13 @@ def safe_judge_decide(
         trade_plan_cap_runtime = _dot_get(payload, "context.trade_plan.activation_gate.cap_runtime")
     except Exception:
         trade_plan_cap_runtime = None
+    context_map = payload.get("context") if isinstance(payload.get("context"), Mapping) else {}
+    runtime_controls = context_map.get("runtime_controls") if isinstance(context_map.get("runtime_controls"), Mapping) else {}
     current_position_pct = _opt_float(payload, "context.position.current_position_pct")
     cash_krw = _opt_float(payload, "context.account.cash_krw")
+    runtime_buy_enabled = bool((runtime_controls or {}).get("buy_enabled", True))
+    runtime_max_position_pct = _opt_float(payload, "context.runtime_controls.max_position_pct")
+    runtime_reason_codes = _extract_reason_codes(runtime_controls if isinstance(runtime_controls, Mapping) else None)
     market_signal_target_pct = None
     market_expected_edge_bps = None
     market_expected_cost_bps = None
@@ -210,6 +215,8 @@ def safe_judge_decide(
     regime_reason_codes = _extract_reason_codes(regime)
     risk_reason_codes = _extract_reason_codes(risk)
     ops_reason_codes = _extract_reason_codes(ops)
+    market_signal = str((market or {}).get("signal", "HOLD")).upper()
+    exit_signal = market_signal in {"SELL", "SHORT"}
     if (
         market_expected_net_edge_bps is None
         and market_expected_edge_bps is not None
@@ -241,6 +248,8 @@ def safe_judge_decide(
         effective_target_pct = plan_target_for_execution
     else:
         effective_target_pct = min(float(plan_target_for_execution), float(market_signal_target_pct))
+    if effective_target_pct is not None and runtime_max_position_pct is not None:
+        effective_target_pct = min(float(effective_target_pct), float(runtime_max_position_pct))
 
     gates: dict[str, Any] = {
         "symbol": symbol,
@@ -285,10 +294,14 @@ def safe_judge_decide(
         "effective_target_pct": effective_target_pct,
         "current_position_pct": current_position_pct,
         "cash_krw": cash_krw,
+        "runtime_buy_enabled": bool(runtime_buy_enabled),
+        "runtime_max_position_pct": runtime_max_position_pct,
+        "runtime_reason_codes": [c.value for c in runtime_reason_codes],
         "market_reason_codes": [c.value for c in market_reason_codes],
         "regime_reason_codes": [c.value for c in regime_reason_codes],
         "risk_reason_codes": [c.value for c in risk_reason_codes],
         "ops_reason_codes": [c.value for c in ops_reason_codes],
+        "exit_signal": bool(exit_signal),
     }
 
     # External agent opinions (optional but supported).
@@ -326,18 +339,17 @@ def safe_judge_decide(
     elif ops_veto:
         action = "PAUSE"
         reasons.extend(_non_pass_reasons(ops_reason_codes) or [ReasonCode.RG_DATA_BAD])
-    elif not regime_allowed:
+    elif not regime_allowed and not exit_signal:
         action = "HOLD"
         reasons.extend(_non_pass_reasons(regime_reason_codes) or [ReasonCode.RG_REGIME_BLOCKED])
-    elif risk_veto:
+    elif risk_veto and not exit_signal:
         action = "HOLD"
         reasons.extend(_non_pass_reasons(risk_reason_codes) or [ReasonCode.RG_RISK_VETO])
-    elif spread_bps > float(spread_limit_bps):
+    elif spread_bps > float(spread_limit_bps) and not exit_signal:
         action = "HOLD"
         reasons.append(ReasonCode.RG_SPREAD_TOO_WIDE)
     else:
         # Soft decision: follow market if present, else HOLD.
-        market_signal = str((market or {}).get("signal", "HOLD")).upper()
         market_alpha = None
         market_edge_gate_blocked = False
         market_cost_gate_blocked = False
@@ -359,12 +371,12 @@ def safe_judge_decide(
         if action == "BUY" and trade_plan_buy_allowed is False:
             action = "HOLD"
             reasons = [ReasonCode.RG_TRADE_PLAN_FLAT]
-        elif action == "SELL" and trade_plan_sell_allowed is False:
+        elif action == "BUY" and not bool(runtime_buy_enabled):
             action = "HOLD"
-            reasons = [ReasonCode.RG_SIGNAL_CONFLICT]
+            reasons = _non_pass_reasons(runtime_reason_codes) or [ReasonCode.RG_EXPOSURE_LIMIT]
 
         plan_decision = str(trade_plan_activation_decision_effective or trade_plan_activation_decision or "").upper()
-        if plan_decision == "HOLD" and action in {"BUY", "SELL"}:
+        if plan_decision == "HOLD" and action == "BUY":
             action = "HOLD"
             reasons = [ReasonCode.RG_TRADE_PLAN_FLAT]
 
@@ -598,6 +610,8 @@ def safe_judge_decide(
             if plan_led_ok and plan_target_for_execution is not None:
                 base_target = max(float(base_target), float(plan_target_for_execution))
             micro_target = min(float(micro_max_position_pct), float(base_target))
+            if runtime_max_position_pct is not None:
+                micro_target = min(float(micro_target), float(runtime_max_position_pct))
             effective_target_pct = float(max(0.0, micro_target))
             gates["effective_target_pct"] = float(effective_target_pct)
             reasons = [ReasonCode.RG_CAP_PROMOTED]

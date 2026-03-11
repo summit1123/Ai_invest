@@ -115,6 +115,8 @@ def market_agent_opine(
     )
     plan_time_horizon = str(trade_plan.get("time_horizon") or "").strip().lower()
     learning_feedback = context.get("learning_feedback") if isinstance(context.get("learning_feedback"), Mapping) else {}
+    research_signal = context.get("research_signal") if isinstance(context.get("research_signal"), Mapping) else {}
+    runtime_controls = context.get("runtime_controls") if isinstance(context.get("runtime_controls"), Mapping) else {}
     learning_enabled = bool(learning_feedback.get("enabled", False))
     learning_profile = (
         learning_feedback.get("symbol_profile") if isinstance(learning_feedback.get("symbol_profile"), Mapping) else {}
@@ -130,6 +132,29 @@ def market_agent_opine(
     feedback_latency_ratio = _as_float(feedback_outcome_stats.get("oc_execution_latency_ratio"), default=0.0)
     feedback_win_rate = _as_float(feedback_trade_stats.get("win_rate_trades"), default=0.0)
     feedback_avg_pnl_bps = _as_float(feedback_trade_stats.get("avg_pnl_bps"), default=0.0)
+    runtime_mode = str(runtime_controls.get("mode") or "NORMAL").strip().upper() or "NORMAL"
+    runtime_buy_enabled = bool(runtime_controls.get("buy_enabled", True))
+    runtime_target_scale = max(0.0, _as_float(runtime_controls.get("target_scale"), default=1.0))
+    runtime_entry_alpha_adj = _as_float(runtime_controls.get("entry_alpha_adj"), default=0.0)
+    runtime_min_edge_bps_adj = max(0.0, _as_float(runtime_controls.get("min_edge_bps_adj"), default=0.0))
+    runtime_max_position_pct = max(
+        0.0,
+        _as_float(runtime_controls.get("max_position_pct"), default=float(rules.risk.max_position_pct_per_symbol)),
+    )
+    runtime_allow_reversal = bool(runtime_controls.get("allow_reversal_entries", True))
+    runtime_actionable_floor_pct = max(
+        0.0,
+        _as_float(runtime_controls.get("actionable_target_floor_pct"), default=0.0),
+    )
+    runtime_actionable_floor_alpha_margin = max(
+        0.0,
+        _as_float(runtime_controls.get("actionable_floor_alpha_margin"), default=0.05),
+    )
+    news_shock_score = max(
+        0.0,
+        _as_float(runtime_controls.get("news_shock_score"), default=_as_float(research_signal.get("shock_score"), default=0.0)),
+    )
+    runtime_reason_codes = [str(x).strip() for x in list(runtime_controls.get("reason_codes") or []) if str(x).strip()]
     now = _now_utc(payload)
 
     cfg = load_alpha_score_config(rules_raw=rules.raw)
@@ -207,7 +232,7 @@ def market_agent_opine(
     dynamic_edge_penalty = min(float(dynamic_edge_penalty), float(min_edge_dynamic_cap))
     min_edge_required_bps = float(base_min_edge_bps) + (
         float(dynamic_edge_penalty) if bool(min_edge_dynamic_enabled) else 0.0
-    )
+    ) + float(runtime_min_edge_bps_adj)
 
     current_qty = _as_float(pos_ctx.get("current_qty"), default=0.0)
     has_position = current_qty > 0.0
@@ -216,7 +241,10 @@ def market_agent_opine(
 
     pre_block_reason: str | None = None
     pre_block_code: str | None = None
-    if bool(ops.get("pause_state")):
+    if (not has_position) and (not bool(runtime_buy_enabled)):
+        pre_block_reason = "RUNTIME_BUY_DISABLED"
+        pre_block_code = str((runtime_reason_codes or [ReasonCode.RG_EXPOSURE_LIMIT.value])[0])
+    elif bool(ops.get("pause_state")):
         pre_block_reason = "PAUSE"
         pre_block_code = ReasonCode.OP_PAUSE_TRIGGERED.value
     elif str(ops.get("reconciliation_status") or "OK").upper() == "FAIL":
@@ -486,8 +514,48 @@ def market_agent_opine(
             entry_alpha_feedback_adj -= 0.02
 
     entry_alpha_floor = max(0.10, float(cfg.entry_alpha) - 0.04)
-    entry_alpha_effective = float(entry_alpha_dynamic) + float(entry_alpha_feedback_adj) + float(entry_alpha_trades_adj)
+    entry_alpha_effective = (
+        float(entry_alpha_dynamic)
+        + float(entry_alpha_feedback_adj)
+        + float(entry_alpha_trades_adj)
+        + float(runtime_entry_alpha_adj)
+    )
     entry_alpha_effective = min(0.95, max(float(entry_alpha_floor), float(entry_alpha_effective)))
+
+    if (
+        (not has_position)
+        and (not bool(runtime_allow_reversal))
+        and str(alpha_strategy_tag).upper() == "REV"
+    ):
+        return MarketOpinion(
+            signal="HOLD",
+            confidence=0.55,
+            target_position_pct=0.0,
+            signal_target_pct=0.0,
+            alpha=alpha_val,
+            mom_s=alpha_mom,
+            rev_s=alpha_rev,
+            strength=alpha_strength,
+            vol_scale=alpha_vol_scale,
+            strategy_tag=state.strategy_tag,
+            entry_allowed=False,
+            exit_reason=None,
+            reason_codes=[ReasonCode.RG_NEWS_RISK.value],
+            reason={
+                "runtime_mode": str(runtime_mode),
+                "news_shock_score": float(news_shock_score),
+                "strategy_tag": str(alpha_strategy_tag),
+                "runtime_allow_reversal": bool(runtime_allow_reversal),
+            },
+            alpha_raw=alpha_raw,
+            regime=alpha_regime,
+            trend_strength=alpha_trend_strength,
+            shock_strength=alpha_shock_strength,
+            expected_edge_bps=expected_edge_bps,
+            expected_cost_bps=expected_cost_bps,
+            expected_net_edge_bps=expected_net_edge_bps,
+            min_edge_required_bps=min_edge_required_bps,
+        )
 
     if float(expected_cost_bps) > float(rules.cost_guard.max_total_cost_bps):
         return MarketOpinion(
@@ -566,12 +634,49 @@ def market_agent_opine(
         )
 
     if alpha_val >= float(entry_alpha_effective):
+        effective_signal_target = float(alpha_signal_target) * float(runtime_target_scale)
+        effective_signal_target = min(float(effective_signal_target), float(runtime_max_position_pct))
+        if (
+            float(runtime_actionable_floor_pct) > 0.0
+            and float(alpha_val) >= float(entry_alpha_effective) + float(runtime_actionable_floor_alpha_margin)
+        ):
+            effective_signal_target = max(float(effective_signal_target), float(runtime_actionable_floor_pct))
+        effective_signal_target = min(float(effective_signal_target), float(runtime_max_position_pct))
+        if float(effective_signal_target) <= 0.0:
+            return MarketOpinion(
+                signal="HOLD",
+                confidence=0.55,
+                target_position_pct=0.0,
+                signal_target_pct=0.0,
+                alpha=alpha_val,
+                mom_s=alpha_mom,
+                rev_s=alpha_rev,
+                strength=alpha_strength,
+                vol_scale=alpha_vol_scale,
+                strategy_tag=state.strategy_tag,
+                entry_allowed=False,
+                exit_reason=None,
+                reason_codes=[ReasonCode.RG_EXPOSURE_LIMIT.value],
+                reason={
+                    "runtime_mode": str(runtime_mode),
+                    "runtime_target_scale": float(runtime_target_scale),
+                    "runtime_max_position_pct": float(runtime_max_position_pct),
+                },
+                alpha_raw=alpha_raw,
+                regime=alpha_regime,
+                trend_strength=alpha_trend_strength,
+                shock_strength=alpha_shock_strength,
+                expected_edge_bps=expected_edge_bps,
+                expected_cost_bps=expected_cost_bps,
+                expected_net_edge_bps=expected_net_edge_bps,
+                min_edge_required_bps=min_edge_required_bps,
+            )
         conf = min(0.95, 0.50 + alpha_val * 0.45)
         return MarketOpinion(
             signal="LONG",
             confidence=float(conf),
-            target_position_pct=float(alpha_signal_target),
-            signal_target_pct=float(alpha_signal_target),
+            target_position_pct=float(effective_signal_target),
+            signal_target_pct=float(effective_signal_target),
             alpha=alpha_val,
             mom_s=alpha_mom,
             rev_s=alpha_rev,
@@ -589,7 +694,7 @@ def market_agent_opine(
                 "shock_strength": alpha_shock_strength,
                 "mom_s": alpha_mom,
                 "rev_s": alpha_rev,
-                "signal_target_pct": alpha_signal_target,
+                "signal_target_pct": float(effective_signal_target),
                 "strategy_tag": alpha_strategy_tag,
                 "entry_alpha": float(cfg.entry_alpha),
                 "entry_alpha_dynamic": float(entry_alpha_dynamic),
@@ -597,6 +702,13 @@ def market_agent_opine(
                 "entry_alpha_trades_adj": float(entry_alpha_trades_adj),
                 "entry_alpha_floor": float(entry_alpha_floor),
                 "entry_alpha_effective": float(entry_alpha_effective),
+                "runtime_mode": str(runtime_mode),
+                "runtime_target_scale": float(runtime_target_scale),
+                "runtime_entry_alpha_adj": float(runtime_entry_alpha_adj),
+                "runtime_min_edge_bps_adj": float(runtime_min_edge_bps_adj),
+                "runtime_max_position_pct": float(runtime_max_position_pct),
+                "runtime_actionable_floor_pct": float(runtime_actionable_floor_pct),
+                "news_shock_score": float(news_shock_score),
                 "spread_bps": float(spread_bps),
                 "fee_total_bps": float(fee_total_bps),
                 "predicted_slippage_bps": float(predicted_slippage_bps),

@@ -1,13 +1,19 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from ai_invest.config.llm_router import LLMRoute
-from ai_invest.llm.openai_http import OpenAIConfigError, OpenAIRequestError, OpenAITextResult, openai_generate_text
 from ai_invest.agents.prompt_contract import research_daily_system_prompt
+from ai_invest.config.llm_router import LLMRoute
+from ai_invest.llm.openai_http import (
+    OpenAIConfigError,
+    OpenAIRequestError,
+    OpenAITextResult,
+    openai_generate_text,
+)
+from ai_invest.research.news_signal import build_news_signal
 from ai_invest.research.rss import summarize_headlines_text
 
 
@@ -18,11 +24,13 @@ def _parse_bool(value: str, *, default: bool = False) -> bool:
     return v in {"1", "true", "yes", "y", "on"}
 
 
-def _clip(s: str, n: int) -> str:
-    s = str(s or "")
-    if len(s) <= n:
-        return s
-    return s[: max(0, n - 1)] + "…"
+def _clip(text: str, n: int) -> str:
+    text = str(text or "")
+    if len(text) <= n:
+        return text
+    if n <= 3:
+        return text[:n]
+    return text[: n - 3] + "..."
 
 
 def _safe_json(obj: Any) -> str:
@@ -36,11 +44,11 @@ def _json_list(value: Any, *, max_items: int) -> list[str]:
     if not isinstance(value, list):
         return []
     out: list[str] = []
-    for x in value:
-        s = str(x or "").strip()
-        if not s:
+    for item in value:
+        text = str(item or "").strip()
+        if not text:
             continue
-        out.append(s)
+        out.append(text)
         if len(out) >= max_items:
             break
     return out
@@ -72,41 +80,61 @@ def _deterministic_brief(
     vol_z = features.get("vol_zscore")
 
     pause_state = bool((ops.get("pause") or {}).get("paused") or ops.get("pause_state") or False)
-    recon_status = str(((ops.get("latest_reconciliation") or {}).get("status")) or ops.get("reconciliation_status") or "OK").upper()
+    recon_status = str(
+        ((ops.get("latest_reconciliation") or {}).get("status"))
+        or ops.get("reconciliation_status")
+        or "OK"
+    ).upper()
+    risk_watchlist_seed: list[str] = []
+    if pause_state:
+        risk_watchlist_seed.append("ops pause active")
+    if recon_status == "FAIL":
+        risk_watchlist_seed.append("reconciliation fail")
+    news_signal = build_news_signal(headlines=headlines, risk_watchlist=risk_watchlist_seed)
 
     summary = (
-        f"{symbol} 시장 브리프: 현재가={last_price} spread_bps={spread_bps} "
-        f"RSI14={rsi_14} ATR%={atr_pct} VolZ={vol_z}"
+        f"{symbol} daily research brief "
+        f"price={last_price} spread_bps={spread_bps} "
+        f"RSI14={rsi_14} ATR%={atr_pct} VolZ={vol_z} "
+        f"news_severity={news_signal.get('severity')} "
+        f"shock={float(news_signal.get('shock_score') or 0.0):.2f}"
     )
 
     findings: list[str] = []
-    if isinstance(spread_bps, (int, float)) and float(spread_bps) >= 10:
-        findings.append(f"유동성 경고: 스프레드 {float(spread_bps):.2f}bps")
+    if isinstance(spread_bps, (int, float)) and float(spread_bps) >= 10.0:
+        findings.append(f"Liquidity warning: spread {float(spread_bps):.2f}bps")
     if isinstance(atr_pct, (int, float)) and float(atr_pct) >= 2.5:
-        findings.append(f"변동성 경고: ATR% {float(atr_pct):.2f}")
+        findings.append(f"Volatility warning: ATR% {float(atr_pct):.2f}")
 
-    # Headlines as findings (titles only; raw list stored elsewhere).
-    hl_text = summarize_headlines_text(list(headlines), max_items=6)
-    if hl_text:
-        findings.append("주요 뉴스:")
-        findings.extend([line for line in hl_text.splitlines() if line.strip()])
+    headline_text = summarize_headlines_text(list(headlines), max_items=6)
+    if headline_text:
+        findings.append("Top headlines:")
+        findings.extend([line for line in headline_text.splitlines() if line.strip()])
+
+    if str(news_signal.get("severity") or "NORMAL").upper() != "NORMAL":
+        findings.append(
+            "News risk elevated: "
+            f"severity={news_signal.get('severity')} shock={float(news_signal.get('shock_score') or 0.0):.2f}"
+        )
 
     risk_watchlist: list[str] = []
     if pause_state:
-        risk_watchlist.append("시스템 PAUSE 상태(실행 차단)")
+        risk_watchlist.append("System pause is active")
     if recon_status == "FAIL":
-        risk_watchlist.append("정합성 FAIL(운영 리스크)")
+        risk_watchlist.append("Reconciliation failed")
+    if float(news_signal.get("shock_score") or 0.0) >= 0.45:
+        risk_watchlist.append("News shock risk elevated")
     if not risk_watchlist:
-        risk_watchlist.append("특이 리스크 없음(기계적 체크 기준)")
+        risk_watchlist.append("No critical operating risk detected")
 
     next_actions: list[str] = []
     if pause_state or recon_status == "FAIL":
-        next_actions.append("ops: pause_log / reconciliation_checks 확인 후 원인 제거")
-    next_actions.append("research: 주요 뉴스 헤드라인 추적(과장/루머 필터링)")
-    next_actions.append("quant: spread/ATR 급등 시 진입 보수적으로 조정 검토(다음 회의 안건)")
+        next_actions.append("ops: inspect pause log and latest reconciliation before resuming")
+    next_actions.append("research: monitor follow-up headlines and separate facts from rumors")
+    next_actions.append("quant: review spread and ATR jump before relaxing entry conditions")
 
     return ResearchBrief(
-        title="일일 리서치 브리프(뉴스+시장)",
+        title="Daily research brief",
         summary=summary,
         key_findings=findings[:14] if findings else [],
         risk_watchlist=risk_watchlist[:8],
@@ -132,7 +160,13 @@ def research_agent_daily_brief(
     """
 
     headlines = list(headlines or [])
-    fallback = _deterministic_brief(symbol=symbol, snapshot=snapshot, features=features, ops=ops, headlines=headlines)
+    fallback = _deterministic_brief(
+        symbol=symbol,
+        snapshot=snapshot,
+        features=features,
+        ops=ops,
+        headlines=headlines,
+    )
 
     if llm_route is not None:
         use_llm = bool(llm_route.enabled) and bool(os.environ.get("OPENAI_API_KEY", "").strip())
@@ -148,16 +182,24 @@ def research_agent_daily_brief(
         "features": dict(features),
         "ops": dict(ops),
         "headlines": [
-            {"source": h.get("source"), "title": h.get("title"), "url": h.get("url"), "published_at": h.get("published_at")}
-            for h in headlines[:20]
-            if isinstance(h, Mapping)
+            {
+                "source": item.get("source"),
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "published_at": item.get("published_at"),
+            }
+            for item in headlines[:20]
+            if isinstance(item, Mapping)
         ],
-        "fallback": {"summary": fallback.summary, "risk_watchlist": fallback.risk_watchlist},
+        "fallback": {
+            "summary": fallback.summary,
+            "risk_watchlist": fallback.risk_watchlist,
+            "key_findings": fallback.key_findings,
+        },
     }
 
     system_prompt = research_daily_system_prompt()
-
-    user_prompt = "입력 JSON:\n" + _safe_json(ctx)
+    user_prompt = "Input JSON:\n" + _safe_json(ctx)
 
     try:
         res: OpenAITextResult = openai_generate_text(

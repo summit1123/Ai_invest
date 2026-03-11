@@ -15,6 +15,7 @@ from ai_invest.market_data.features import build_alpha_features_from_1m_candles
 from ai_invest.market_data.macro import fetch_macro_context
 from ai_invest.market_data.universe_selector import resolve_dynamic_universe
 from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_market_snapshot
+from ai_invest.research.news_signal import build_news_signal
 from ai_invest.research.rss import fetch_crypto_headlines
 from ai_invest.strategy.alpha_score import compute_alpha_score, load_alpha_score_config
 from ai_invest.storage.postgres import DbAgentDailyReport, DbEvent, PostgresRepo
@@ -836,6 +837,10 @@ def run_agent_work_cycle(
                     "published_at": h.get("published_at"),
                 }
             )
+        news_signal = build_news_signal(
+            headlines=compact_headlines,
+            risk_watchlist=list(brief.risk_watchlist),
+        )
         research_id = _store_report(
             repo=repo,
             report_date_kst=now_kst,
@@ -850,6 +855,7 @@ def run_agent_work_cycle(
                 "llm_meta": brief.llm_meta,
                 "symbol": symbol,
                 "headlines": compact_headlines,
+                "news_signal": dict(news_signal),
                 "research_fetch": {
                     "headline_limit": int(headline_limit),
                     "web_search_enabled": bool(web_search_enabled),

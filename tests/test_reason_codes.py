@@ -39,6 +39,7 @@ class ReasonCodesTests(unittest.TestCase):
         self.assertEqual(parse_reason_code("RG_MICRO_BLOCKED_COOLDOWN"), ReasonCode.RG_MICRO_BLOCKED_COOLDOWN)
         self.assertEqual(parse_reason_code("RG_MICRO_BLOCKED_EDGE"), ReasonCode.RG_MICRO_BLOCKED_EDGE)
         self.assertEqual(parse_reason_code("RG_MICRO_BLOCKED_POLICY"), ReasonCode.RG_MICRO_BLOCKED_POLICY)
+        self.assertEqual(parse_reason_code("RG_NEWS_RISK"), ReasonCode.RG_NEWS_RISK)
 
 
 if __name__ == "__main__":

@@ -32,7 +32,9 @@ from ai_invest.market_data.features import build_alpha_features_from_1m_candles,
 from ai_invest.market_data.upbit_public import MarketSnapshot, UpbitPublicApiError, fetch_candles_minutes, fetch_market_snapshot
 from ai_invest.notifications.service import NotificationService
 from ai_invest.ops.reconciliation import record_reconciliation_check
+from ai_invest.research.news_signal import build_news_signal
 from ai_invest.runtime.position_state import parse_position_state, with_hwm_update
+from ai_invest.runtime.runtime_controls import build_runtime_controls
 from ai_invest.storage.postgres import (
     DbAgentOpinion,
     DbDecision,
@@ -143,6 +145,38 @@ def _latest_symbol_learning_feedback(*, repo: PostgresRepo, symbol: str) -> dict
         "top_symbol": str(learning_map.get("top_symbol") or ""),
         "symbol_profile": dict(profile_map),
     }
+
+
+def _latest_research_signal(*, repo: PostgresRepo, symbol: str) -> dict[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    row = repo.fetch_latest_agent_daily_report(agent_name="research_agent")
+    if not isinstance(row, Mapping):
+        return {"enabled": False, "symbol": sym}
+
+    findings = row.get("findings") if isinstance(row.get("findings"), Mapping) else {}
+    report_symbol = str(findings.get("symbol") or "").strip().upper()
+    if report_symbol and report_symbol != sym:
+        return {"enabled": False, "symbol": sym}
+
+    created_at = row.get("created_at")
+    age_minutes = None
+    if isinstance(created_at, datetime):
+        ts = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+        age_minutes = max(0.0, (_utcnow() - ts.astimezone(timezone.utc)).total_seconds() / 60.0)
+
+    signal = findings.get("news_signal") if isinstance(findings.get("news_signal"), Mapping) else {}
+    if not signal:
+        headlines = findings.get("headlines") if isinstance(findings.get("headlines"), list) else []
+        risks_map = row.get("risks") if isinstance(row.get("risks"), Mapping) else {}
+        watchlist = risks_map.get("watchlist") if isinstance(risks_map.get("watchlist"), list) else []
+        signal = build_news_signal(headlines=headlines, risk_watchlist=watchlist)
+
+    out = dict(signal)
+    out["enabled"] = bool(out.get("enabled", False))
+    out["symbol"] = sym
+    out["report_id"] = str(row.get("report_id") or "")
+    out["report_age_minutes"] = float(age_minutes) if age_minutes is not None else None
+    return out
 
 
 def _resolve_cap_config(activation_gate: Mapping[str, Any]) -> dict[str, Any]:
@@ -861,6 +895,26 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         latest_recon = repo.fetch_latest_reconciliation(symbol=symbol)
         recon_status = str((latest_recon or {}).get("status") or "OK").upper()
         ops = {"rate_limit_alert": False, "reconciliation_status": recon_status, "pause_state": pause_state}
+        learning_feedback = _latest_symbol_learning_feedback(repo=repo, symbol=symbol)
+        research_signal = _latest_research_signal(repo=repo, symbol=symbol)
+        runtime_controls = build_runtime_controls(
+            rules_raw=raw_rules,
+            account={
+                "daily_loss_pct": float(daily_loss_pct),
+                "daily_trades_count": int(daily_trades_count),
+                "cash_krw": float(cash),
+                "equity_krw": float(equity),
+                "position_value_krw": float(pos_value),
+                "capital_profile": capital_profile.as_dict(),
+            },
+            risk_limits={
+                "max_daily_loss_pct": float(rules.risk.max_daily_loss_pct),
+                "max_slippage_bps": float(rules.cost_guard.max_predicted_slippage_bps),
+                "max_spread_bps_entry": float(rules.cost_guard.max_spread_bps_entry),
+            },
+            learning_feedback=learning_feedback,
+            research_signal=research_signal,
+        )
         payload = build_common_payload(
             run_id=run_id,
             rule_version_id=rule_version_id,
@@ -910,7 +964,9 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     "activation_gate": dict(plan_activation_gate or {}),
                     "execution_plan": dict(plan_execution_plan or {}),
                 },
-                "learning_feedback": _latest_symbol_learning_feedback(repo=repo, symbol=symbol),
+                "learning_feedback": dict(learning_feedback),
+                "research_signal": dict(research_signal),
+                "runtime_controls": dict(runtime_controls),
                 "entry_confirmation": {
                     "required_bars": int(entry_confirm_bars),
                     "current_streak": int(_as_int(entry_confirm_state.get(symbol), default=0)),
@@ -1021,6 +1077,13 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         runtime_execution_plan = dict(plan_execution_plan or {})
         runtime_allowed_actions = dict(plan_allowed_actions)
         runtime_target_pct = plan_target_pct
+        runtime_control_cap = _as_float(runtime_controls.get("max_position_pct"), default=runtime_target_pct)
+        if runtime_control_cap > 0:
+            runtime_target_pct = min(float(runtime_target_pct), float(runtime_control_cap))
+        if not bool(runtime_controls.get("buy_enabled", True)):
+            runtime_allowed_actions["buy"] = False
+            runtime_activation_gate["runtime_buy_blocked"] = True
+            runtime_activation_gate["runtime_reason_codes"] = list(runtime_controls.get("reason_codes") or [])
         runtime_decision_effective = (
             str(runtime_activation_gate.get("decision_effective") or plan_activation_decision_effective or "").strip().upper()
             or str(runtime_activation_gate.get("decision") or plan_activation_decision or "").strip().upper()

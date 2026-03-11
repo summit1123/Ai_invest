@@ -59,7 +59,7 @@ class SafeJudgeTests(unittest.TestCase):
 
     def test_spread_gate_holds(self) -> None:
         payload = base_payload()
-        payload["snapshot"]["spread_bps"] = self.rules.cost_guard.max_spread_bps_entry + 0.01
+        payload["snapshot"]["spread_bps"] = 50.0
 
         decision = safe_judge_decide(payload, rules=self.rules)
         self.assertEqual(decision.action, "HOLD")
@@ -131,7 +131,7 @@ class SafeJudgeTests(unittest.TestCase):
         self.assertEqual(decision.action, "HOLD")
         self.assertEqual(decision.selected_reasons, [ReasonCode.RG_TRADE_PLAN_FLAT.value])
 
-    def test_trade_plan_disallow_sell_blocks_sell(self) -> None:
+    def test_trade_plan_disallow_sell_still_allows_exit(self) -> None:
         payload = base_payload()
         payload["context"]["trade_plan"] = {"allowed_actions": {"buy": True, "sell": False}, "target_position_pct": 10.0}
 
@@ -143,8 +143,8 @@ class SafeJudgeTests(unittest.TestCase):
             risk={"veto": False},
             ops={"veto": False},
         )
-        self.assertEqual(decision.action, "HOLD")
-        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_SIGNAL_CONFLICT.value])
+        self.assertEqual(decision.action, "SELL")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_PASS.value])
 
     def test_effective_target_uses_min_of_plan_and_signal(self) -> None:
         payload = base_payload()
@@ -199,7 +199,7 @@ class SafeJudgeTests(unittest.TestCase):
         self.assertEqual(decision.action, "BUY")
         self.assertAlmostEqual(float(decision.effective_target_pct or 0.0), 2.5, places=6)
 
-    def test_activation_gate_hold_blocks_sell_and_buy(self) -> None:
+    def test_activation_gate_hold_allows_sell_but_blocks_buy(self) -> None:
         payload = base_payload()
         payload["context"]["trade_plan"] = {
             "allowed_actions": {"buy": True, "sell": True},
@@ -215,8 +215,8 @@ class SafeJudgeTests(unittest.TestCase):
             risk={"veto": False},
             ops={"veto": False},
         )
-        self.assertEqual(decision_sell.action, "HOLD")
-        self.assertEqual(decision_sell.selected_reasons, [ReasonCode.RG_TRADE_PLAN_FLAT.value])
+        self.assertEqual(decision_sell.action, "SELL")
+        self.assertEqual(decision_sell.selected_reasons, [ReasonCode.RG_PASS.value])
 
         decision_buy = safe_judge_decide(
             payload,
@@ -228,6 +228,49 @@ class SafeJudgeTests(unittest.TestCase):
         )
         self.assertEqual(decision_buy.action, "HOLD")
         self.assertEqual(decision_buy.selected_reasons, [ReasonCode.RG_MICRO_BLOCKED_POLICY.value])
+
+    def test_regime_blocked_still_allows_sell_exit(self) -> None:
+        payload = base_payload()
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "SELL", "confidence": 0.66},
+            regime={"trade_allowed": False},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "SELL")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_PASS.value])
+
+    def test_risk_veto_still_allows_sell_exit(self) -> None:
+        payload = base_payload()
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "SELL", "confidence": 0.66},
+            regime={"trade_allowed": True},
+            risk={"veto": True},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "SELL")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_PASS.value])
+
+    def test_spread_gate_still_allows_sell_exit(self) -> None:
+        payload = base_payload()
+        payload["snapshot"]["spread_bps"] = 50.0
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "SELL", "confidence": 0.66},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "SELL")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_PASS.value])
 
     def test_hold_uses_market_reason_codes(self) -> None:
         payload = base_payload()
@@ -478,6 +521,40 @@ class SafeJudgeTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "HOLD")
         self.assertLessEqual(len(decision.selected_reasons), 3)
+
+    def test_runtime_controls_can_block_buy(self) -> None:
+        payload = base_payload()
+        payload["context"]["runtime_controls"] = {
+            "buy_enabled": False,
+            "reason_codes": [ReasonCode.RG_NEWS_RISK.value],
+        }
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "BUY", "confidence": 0.70, "signal_target_pct": 4.0},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_NEWS_RISK.value])
+
+    def test_runtime_controls_cap_effective_target(self) -> None:
+        payload = base_payload()
+        payload["context"]["trade_plan"] = {"allowed_actions": {"buy": True, "sell": True}, "target_position_pct": 8.0}
+        payload["context"]["runtime_controls"] = {"buy_enabled": True, "max_position_pct": 2.0}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={"signal": "BUY", "confidence": 0.72, "signal_target_pct": 6.0},
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "BUY")
+        self.assertAlmostEqual(float(decision.effective_target_pct or 0.0), 2.0, places=6)
 
 
 if __name__ == "__main__":

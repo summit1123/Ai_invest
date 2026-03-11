@@ -311,6 +311,17 @@ governance:
   meeting_on_the_hour_only: false
   default_target_position_pct: 100.0
   prework_refresh_cooldown_min: 3
+runtime_controller:
+  enabled: true
+  eval_min_samples: 8
+  small_account_equity_krw: 300000.0
+  min_order_buffer_mult: 1.02
+  actionable_floor_alpha_margin: 0.05
+  shock_defensive_threshold: 0.45
+  shock_block_threshold: 0.78
+  allow_reversal_on_elevated_news: false
+  performance_credit_bps: 25.0
+  performance_penalty_bps: 25.0
 paper_mode:
   data_collection:
     enabled: true
