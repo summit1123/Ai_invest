@@ -209,7 +209,7 @@ def build_runtime_controls(
     )
 
     max_position_pct = _clamp(float(hard_cap_pct) * float(target_scale), 0.0, float(max_position_pct_per_symbol))
-    min_order_krw = max(0.0, _as_float(((rules_raw.get("execution") or {}).get("min_order_krw")), default=10_000.0))
+    min_order_krw = max(0.0, _as_float(((rules_raw.get("execution") or {}).get("min_order_krw")), default=5_000.0))
     actionable_target_floor_pct = 0.0
     if equity_krw > 0 and min_order_krw > 0 and equity_krw <= float(cfg["small_account_equity_krw"]):
         actionable_target_floor_pct = (float(min_order_krw) / float(equity_krw)) * 100.0 * float(cfg["min_order_buffer_mult"])

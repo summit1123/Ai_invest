@@ -9,8 +9,12 @@ from ai_invest.meetings.governance_meeting import _infer_time_horizon
 from ai_invest.meetings.governance_meeting import (
     AllowedActions,
     FinalTradePlan,
+    OpsDraft,
+    QuantPlanDraft,
+    RiskDraft,
     _build_execution_plan,
     _build_plan_consistency_checks,
+    enforce_final_trade_plan,
     _final_plan_declares_no_trade,
     _governance_llm_call_timeout_sec,
     _run_with_timeout,
@@ -182,6 +186,20 @@ def test_final_plan_declares_no_trade_on_zero_target() -> None:
     assert "target_position_pct<=0" in reasons
 
 
+def test_final_plan_buy_disabled_with_positive_target_is_not_no_trade() -> None:
+    plan = FinalTradePlan(
+        symbol="KRW-BTC",
+        target_position_pct=6.0,
+        allowed_actions=AllowedActions(buy=False, sell=True),
+        valid_from_kst="2026-02-24T11:00:00+09:00",
+        valid_to_kst="2026-02-24T12:00:00+09:00",
+        notes="회의는 정책 cap만 유지하고 진입은 런타임 재평가",
+    )
+    declared, reasons = _final_plan_declares_no_trade(final_plan=plan)
+    assert declared is False
+    assert reasons == []
+
+
 def test_consistency_check_blocks_data_collection_promotion_when_no_trade_declared() -> None:
     checks = _build_plan_consistency_checks(
         hard_plan_block=False,
@@ -234,3 +252,151 @@ def test_execution_plan_target_remains_equal_to_resolved_plan_target() -> None:
         live_execution_enabled=False,
     )
     assert float(execution_plan.final_numbers.target_position_pct) == 3.0
+
+
+def test_execution_plan_preserves_target_for_conditional_hold() -> None:
+    rules = load_rules("rules.yaml")
+    final_plan = FinalTradePlan(
+        symbol="KRW-BTC",
+        target_position_pct=6.0,
+        allowed_actions=AllowedActions(buy=False, sell=True),
+        rebalance_band_pct=0.4,
+        cooldown_minutes=180,
+        valid_from_kst="2026-02-24T11:00:00+09:00",
+        valid_to_kst="2026-02-24T12:00:00+09:00",
+        constraints={},
+        rationale={},
+        evidence_refs=[],
+        open_questions=[],
+        conflict_resolution=[],
+        notes="",
+    )
+    plan_v2 = _to_final_trade_plan_v2(
+        final_plan=final_plan,
+        rules_raw={},
+        fact_pack=_base_fact_pack(),
+        activation_gate={
+            "decision": "PAPER",
+            "decision_effective": "HOLD",
+            "hold_mode": "HOLD_CONDITIONAL",
+            "inter_slot_realtime_mode": True,
+            "conditional_activation": {"enabled": True},
+        },
+    )
+    execution_plan = _build_execution_plan(
+        final_plan=final_plan,
+        plan_v2=plan_v2,
+        rules=rules,
+        rules_raw={},
+        capital_profile={"max_target_position_pct": 20.0},
+        risk_max_position_pct=20.0,
+        activation_decision="HOLD",
+        live_execution_enabled=True,
+        conditional_hold_target_allowed=True,
+    )
+    assert float(execution_plan.final_numbers.target_position_pct) == 6.0
+    assert bool(execution_plan.gates["conditional_hold_target_allowed"]) is True
+    assert bool(execution_plan.gates["paper_only"]) is False
+    assert bool(plan_v2.confidence.paper_only_recommended) is False
+
+
+def test_enforce_final_trade_plan_keeps_target_under_live_soft_veto() -> None:
+    plan = FinalTradePlan(
+        symbol="KRW-BTC",
+        target_position_pct=6.0,
+        allowed_actions=AllowedActions(buy=True, sell=True),
+        valid_from_kst="2026-02-24T11:00:00+09:00",
+        valid_to_kst="2026-02-24T12:00:00+09:00",
+        constraints={},
+        rationale={},
+        evidence_refs=[],
+        open_questions=[],
+        conflict_resolution=[],
+        notes="",
+    )
+    out = enforce_final_trade_plan(
+        plan=plan,
+        quant=QuantPlanDraft(
+            symbol="KRW-BTC",
+            target_position_pct=6.0,
+            allowed_actions=AllowedActions(buy=True, sell=True),
+            notes="",
+        ),
+        risk=RiskDraft(
+            veto=True,
+            max_position_pct=20.0,
+            max_loss_per_trade_pct=0.5,
+            max_daily_loss_pct=1.5,
+            notes="",
+        ),
+        ops=OpsDraft(
+            veto=False,
+            trade_window_allowed=True,
+            notes="",
+        ),
+        fact_pack={
+            "ops_state": {"pause": {"paused": False}, "latest_reconciliation": {"status": "OK"}},
+            "raw_rules_hint": {
+                "universe": {"mode": "live"},
+                "governance": {"activation_gate": {"conditional_activation": {"enabled": True}}},
+                "paper_mode": {"data_collection": {"allow_soft_plan_block_bypass": False}},
+            },
+        },
+        allowed_symbols={"KRW-BTC"},
+        fallback_symbol="KRW-BTC",
+        hard_max_position_pct=20.0,
+    )
+    assert out.allowed_actions.buy is True
+    assert float(out.target_position_pct) == 6.0
+
+
+def test_enforce_final_trade_plan_recovers_policy_cap_when_soft_veto_zeroes_meeting_plan() -> None:
+    plan = FinalTradePlan(
+        symbol="KRW-BTC",
+        target_position_pct=0.0,
+        allowed_actions=AllowedActions(buy=False, sell=True),
+        valid_from_kst="2026-02-24T11:00:00+09:00",
+        valid_to_kst="2026-02-24T12:00:00+09:00",
+        constraints={},
+        rationale={},
+        evidence_refs=[],
+        open_questions=[],
+        conflict_resolution=[],
+        notes="",
+    )
+    out = enforce_final_trade_plan(
+        plan=plan,
+        quant=QuantPlanDraft(
+            symbol="KRW-BTC",
+            target_position_pct=8.0,
+            allowed_actions=AllowedActions(buy=True, sell=True),
+            notes="",
+        ),
+        risk=RiskDraft(
+            veto=True,
+            max_position_pct=20.0,
+            max_loss_per_trade_pct=0.5,
+            max_daily_loss_pct=1.5,
+            notes="",
+        ),
+        ops=OpsDraft(
+            veto=False,
+            trade_window_allowed=True,
+            notes="",
+        ),
+        fact_pack={
+            "ops_state": {"pause": {"paused": False}, "latest_reconciliation": {"status": "OK"}},
+            "raw_rules_hint": {
+                "universe": {"mode": "live"},
+                "governance": {"activation_gate": {"conditional_activation": {"enabled": True}}},
+                "paper_mode": {"data_collection": {"allow_soft_plan_block_bypass": False}},
+            },
+        },
+        allowed_symbols={"KRW-BTC"},
+        fallback_symbol="KRW-BTC",
+        hard_max_position_pct=20.0,
+    )
+    assert out.allowed_actions.buy is False
+    assert out.allowed_actions.sell is True
+    assert float(out.target_position_pct) == 8.0
+    assert any("policy cap 8.0%" in str(x) for x in list(out.conflict_resolution or []))

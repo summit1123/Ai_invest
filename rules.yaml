@@ -73,7 +73,7 @@ risk:
   max_weekly_loss_pct: 4.0
   max_risk_per_trade_pct: 0.35
   max_total_exposure_pct: 100.0
-  max_position_pct_per_symbol: 100.0
+  max_position_pct_per_symbol: 50.0
   cooldown_minutes_after_trigger: 180
   consecutive_loss_cooldown_count: 3
 paper:
@@ -179,7 +179,7 @@ universe:
   max_open_positions: 1
 execution:
   order_style: limit_post_only_first
-  min_order_krw: 10000
+  min_order_krw: 5000
   default_ord_type: limit
   max_reprice_count: 3
   fallback_to_market: false
@@ -232,18 +232,18 @@ governance:
     tiers:
     - name: seed_small
       min_equity_krw: 0
-      max_target_position_pct: 100.0
-      max_position_pct_per_symbol: 100.0
+      max_target_position_pct: 20.0
+      max_position_pct_per_symbol: 20.0
       cooldown_minutes_after_trigger: 240
     - name: core
       min_equity_krw: 3000000
-      max_target_position_pct: 100.0
-      max_position_pct_per_symbol: 100.0
+      max_target_position_pct: 35.0
+      max_position_pct_per_symbol: 35.0
       cooldown_minutes_after_trigger: 180
     - name: expanded
       min_equity_krw: 10000000
-      max_target_position_pct: 100.0
-      max_position_pct_per_symbol: 100.0
+      max_target_position_pct: 50.0
+      max_position_pct_per_symbol: 50.0
       cooldown_minutes_after_trigger: 120
     enabled: true
   activation_gate:
@@ -257,7 +257,7 @@ governance:
       enabled: true
       promotion:
         promotion_ttl_minutes: 120
-        target_position_pct_cap: 100.0
+        target_position_pct_cap: 20.0
         cooldown_after_promotion_minutes: 60
       conditions:
         min_alpha: 0.75
@@ -309,7 +309,7 @@ governance:
   require_prework_reports: true
   max_open_meeting_minutes: 20
   meeting_on_the_hour_only: false
-  default_target_position_pct: 100.0
+  default_target_position_pct: 20.0
   prework_refresh_cooldown_min: 3
 runtime_controller:
   enabled: true
@@ -325,7 +325,7 @@ runtime_controller:
 paper_mode:
   data_collection:
     enabled: true
-    force_plan_target_pct: 100.0
+    force_plan_target_pct: 20.0
     force_plan_buy_allowed: true
     relaxed_min_win_rate_pct: 25.0
     relaxed_min_profit_factor: 1.05

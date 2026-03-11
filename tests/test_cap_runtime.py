@@ -5,6 +5,7 @@ from ai_invest.meetings.governance_meeting import (
     _build_inputs_hash_payload,
     _initial_cap_runtime,
     _normalized_conditional_activation_config,
+    _should_enable_inter_slot_realtime_mode,
     _stable_hash,
 )
 from ai_invest.runtime.paper_loop import _cap_required_passes
@@ -33,6 +34,35 @@ def test_cap_default_config_and_runtime_seed():
     runtime_seed = _initial_cap_runtime(conditional_activation=cfg, decision_interval_sec=15)
     assert runtime_seed["required_passes"] == 12
     assert runtime_seed["consecutive_passes"] == 0
+
+
+def test_inter_slot_realtime_mode_only_enabled_for_live_conditional_hold():
+    cfg = _normalized_conditional_activation_config(rules_raw={"governance": {"activation_gate": {"conditional_activation": {"enabled": True}}}})
+
+    assert _should_enable_inter_slot_realtime_mode(
+        universe_mode="live",
+        live_execution_enabled=True,
+        hard_plan_block=False,
+        final_plan_no_trade=False,
+        activation_decision_effective="PAPER",
+        conditional_activation=cfg,
+    ) is True
+    assert _should_enable_inter_slot_realtime_mode(
+        universe_mode="paper",
+        live_execution_enabled=True,
+        hard_plan_block=False,
+        final_plan_no_trade=False,
+        activation_decision_effective="PAPER",
+        conditional_activation=cfg,
+    ) is False
+    assert _should_enable_inter_slot_realtime_mode(
+        universe_mode="live",
+        live_execution_enabled=True,
+        hard_plan_block=True,
+        final_plan_no_trade=False,
+        activation_decision_effective="PAPER",
+        conditional_activation=cfg,
+    ) is False
 
 
 def test_inputs_hash_is_deterministic_with_ordering_noise():

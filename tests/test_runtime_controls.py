@@ -67,3 +67,24 @@ def test_runtime_controls_remain_normal_with_good_feedback() -> None:
     assert str(out["mode"]) == "NORMAL"
     assert float(out["target_scale"]) > 0.60
     assert float(out["entry_alpha_adj"]) < 0.10
+
+
+def test_runtime_controls_default_min_order_floor_matches_small_account() -> None:
+    out = build_runtime_controls(
+        rules_raw={
+            "governance": {"default_target_position_pct": 20.0},
+            "risk": {"max_position_pct_per_symbol": 20.0},
+        },
+        account={
+            "equity_krw": 50_100.0,
+            "cash_krw": 50_100.0,
+            "daily_loss_pct": 0.0,
+            "capital_profile": {"max_target_position_pct": 20.0, "max_position_pct_per_symbol": 20.0},
+        },
+        risk_limits={"max_daily_loss_pct": 1.5},
+        learning_feedback={},
+        research_signal={},
+    )
+
+    # Default runtime min order should align with Upbit KRW market minimum (5,000 KRW).
+    assert 10.0 <= float(out["actionable_target_floor_pct"]) <= 10.3

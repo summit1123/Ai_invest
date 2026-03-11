@@ -29,9 +29,26 @@ class GovernancePlanConsistencyTests(unittest.TestCase):
             soft_plan_block=False,
             soft_plan_block_reasons=[],
             activation_decision_effective="HOLD",
+            hold_mode="HOLD_STATIC",
             paper_data_collection_applied=False,
             allowed_actions={"buy": False, "sell": False},
             target_position_pct=0.0,
+            notes="",
+        )
+        self.assertTrue(bool(out.get("passed")))
+        self.assertEqual(list(out.get("failed_checks") or []), [])
+
+    def test_conditional_hold_can_keep_target_cap_while_buy_stays_disabled(self) -> None:
+        out = _build_plan_consistency_checks(
+            hard_plan_block=False,
+            hard_plan_block_reasons=[],
+            soft_plan_block=False,
+            soft_plan_block_reasons=[],
+            activation_decision_effective="HOLD",
+            hold_mode="HOLD_CONDITIONAL",
+            paper_data_collection_applied=False,
+            allowed_actions={"buy": False, "sell": True},
+            target_position_pct=8.0,
             notes="",
         )
         self.assertTrue(bool(out.get("passed")))

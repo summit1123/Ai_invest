@@ -30,6 +30,7 @@ from ai_invest.judge.safe_judge import safe_judge_decide
 from ai_invest.learning.outcome_evaluator import evaluate_closed_trade
 from ai_invest.market_data.features import build_alpha_features_from_1m_candles, build_feature_snapshot_from_candles
 from ai_invest.market_data.upbit_public import MarketSnapshot, UpbitPublicApiError, fetch_candles_minutes, fetch_market_snapshot
+from ai_invest.market_data.upbit_ws import UpbitPublicStreamError, UpbitPublicWsSnapshotHub
 from ai_invest.notifications.service import NotificationService
 from ai_invest.ops.reconciliation import record_reconciliation_check
 from ai_invest.research.news_signal import build_news_signal
@@ -403,6 +404,12 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
     else:
         executor = PaperExecutor(repo)
     notifier = NotificationService(repo)
+    market_data_cfg = (raw_rules.get("market_data") or {}) if isinstance(raw_rules, Mapping) else {}
+    public_ws_enabled = _as_bool(
+        market_data_cfg.get("public_ws_enabled"),
+        default=_env_bool("UPBIT_PUBLIC_WS_ENABLED", default=True),
+    )
+    snapshot_hub: UpbitPublicWsSnapshotHub | None = UpbitPublicWsSnapshotHub() if public_ws_enabled else None
 
     run_id = uuid.uuid4()
     rule_version_id = uuid.uuid4()
@@ -704,8 +711,20 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 break
 
         try:
-            snapshot = fetch_market_snapshot(symbol)
-        except UpbitPublicApiError as exc:
+            if snapshot_hub is not None:
+                ws_symbols = [str(symbol)]
+                if plan_symbol:
+                    ws_symbols.append(str(plan_symbol))
+                ws_symbols.extend([str(s) for s in list(open_symbols or []) if str(s or "").strip()])
+                snapshot_hub.set_symbols(ws_symbols)
+                snapshot = snapshot_hub.get_snapshot(
+                    symbol,
+                    wait_timeout_sec=min(2.0, max(0.5, float(decision_interval_sec) / 10.0)),
+                    allow_rest_fallback=True,
+                )
+            else:
+                snapshot = fetch_market_snapshot(symbol)
+        except (UpbitPublicApiError, UpbitPublicStreamError) as exc:
             # 거래소 공용 API 일시 제한(429) 등은 루프를 죽이지 않고 다음 사이클에서 재시도한다.
             print(f"[경고] market snapshot failed for {symbol}: {exc}")
             if sleep_sec is not None:
@@ -1597,3 +1616,6 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
 
         if sleep_sec is not None:
             time.sleep(float(sleep_sec))
+
+    if snapshot_hub is not None:
+        snapshot_hub.close()

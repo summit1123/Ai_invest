@@ -92,7 +92,8 @@ def governance_quant_instructions() -> str:
             "allowed_symbols 밖의 심볼 선택 금지.",
             "target_position_pct는 0~max_position_pct_per_symbol 범위.",
             "time_horizon은 auto|intraday|1d|swing 중 1개를 사용한다.",
-            "스프레드/정합성/PAUSE가 나쁘면 buy=false 또는 target_position_pct 축소.",
+            "pause/recon FAIL 같은 하드게이트면 buy=false 및 target_position_pct=0을 사용한다.",
+            "비용/스프레드/실행품질 악화는 target_position_pct 축소 또는 entry_triggers 강화로 표현하고, 소프트 리스크만으로 무조건 0%로 닫지 않는다.",
             "최근 실패유형(top_error_types)이 있으면 entry_triggers 또는 exit_triggers에 보완 조건을 1개 이상 반영한다.",
             "entry_triggers에는 진입 조건 + 무효화(invalidation) 조건을 최소 1개씩 포함한다.",
             "exit_triggers에는 이익실현/손절/시간청산 조건을 각각 최소 1개 이상 포함한다.",
@@ -121,12 +122,15 @@ def governance_risk_instructions() -> str:
         ],
         input_contract=[
             "ops_state, rules.risk, rules.cost_guard, account_state, capital_profile를 우선 참조한다.",
+            "account_state.daily_loss_pct / daily_realized_pnl_krw / account_day_kst가 있으면 이를 당일 손실 판단의 단일 기준으로 사용한다.",
         ],
         hard_rules=[
             "recon FAIL, pause 등 하드 리스크는 veto를 우선 고려.",
             "max_position_pct, max_loss_per_trade_pct, max_daily_loss_pct를 명시.",
             "required_constraints에 spread/slippage 등 실행 제약 포함.",
             "paper 테스트 모드(universe.mode=paper)에서는 이전 슬롯 buy=false 같은 계획 상태를 veto 근거로 사용하지 말고, 계좌/정합성/손실 한도 같은 하드 리스크 중심으로 판단한다.",
+            "live 조건부모드에서는 pause/recon FAIL 같은 하드 리스크가 아니면 veto=true라도 target_position_pct=0 강제를 요구하지 말고, max_position_pct/required_constraints를 보수화해 advisory로 표현한다.",
+            "recent_performance 또는 recent_outcomes의 누적 손익/승률 저하는 실험 품질 신호이지 당일 손실 한도 초과의 직접 근거가 아니다. daily_loss_pct가 없으면 '당일 손실 미확인'으로 기록한다.",
             "스키마 JSON만 출력.",
         ],
         output_schema=[
@@ -152,6 +156,7 @@ def governance_ops_instructions() -> str:
         hard_rules=[
             "reconciliation_status=FAIL이면 veto=true.",
             "paper 테스트 모드(universe.mode=paper)에서는 live_execution_enabled=false를 차단 근거로 사용하지 않는다.",
+            "live 조건부모드에서는 pause/recon FAIL/명시적 운영 장애가 아니면 veto=true를 최종 no-trade 강제근거로 쓰지 말고, trade_window_allowed/required_ops_gates로 advisory를 남긴다.",
             "required_ops_gates에 하드 게이트를 나열한다.",
             "data_quality_flags에 운영 이슈를 명시한다.",
             "스키마 JSON만 출력.",
@@ -206,7 +211,9 @@ def governance_coordinator_instructions() -> str:
             "learning_context.recent_meeting_lessons를 참조해 직전 회의의 실패 교훈이 이번 계획에 반영됐는지 확인한다.",
         ],
         hard_rules=[
-            "ops_manager.veto=true 또는 risk_manager.veto=true면 buy=false 및 target_position_pct=0을 강제한다.",
+            "pause=true 또는 reconciliation_status=FAIL 같은 하드 운영 차단이면 buy=false 및 target_position_pct=0을 강제한다.",
+            "ops_manager.veto/risk_manager.veto/trade_window 차단은 live 조건부모드에서는 conflict_resolution과 constraints에 기록하고, 기본은 HOLD_CONDITIONAL + target cap 유지로 런타임 재평가를 허용한다.",
+            "recent_performance의 손익 악화와 account_state.daily_loss_pct를 혼동하지 않는다. 최근 성과 악화는 보수화 사유이지 당일 하드 스탑의 직접 증거가 아니다.",
             "allowed_symbols 밖 심볼 금지.",
             "target_position_pct는 0~max_position_pct_per_symbol 범위.",
             "time_horizon은 auto|intraday|1d|swing 중 1개를 사용한다.",

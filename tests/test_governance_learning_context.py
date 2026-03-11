@@ -164,3 +164,64 @@ def test_learning_context_contains_recent_meeting_lessons() -> None:
     exec_quality = dict(ctx.get("recent_execution_quality") or {})
     assert int(exec_quality.get("samples") or 0) >= 1
     assert float(exec_quality.get("avg_spread_bps_at_submit") or 0.0) > 0.0
+
+
+def test_learning_context_skips_auto_closed_meeting_lessons() -> None:
+    now_kst = datetime(2026, 2, 25, 10, 0, tzinfo=KST)
+
+    class _RepoWithAutoClosed(_RepoStub):
+        def fetch_meeting_sessions(self, *, limit: int = 50):  # type: ignore[no-untyped-def]
+            _ = limit
+            return [
+                {
+                    "meeting_id": "auto-closed",
+                    "meeting_type": "DAILY_STRATEGY",
+                    "status": "CLOSED",
+                    "started_at": self._now - timedelta(hours=2),
+                    "ended_at": self._now - timedelta(hours=1, minutes=40),
+                    "summary": "자동 종료: orphan OPEN 회의 정리",
+                    "decisions": {
+                        "error": "MEETING_PATCH_ROLLOUT_RESET",
+                        "auto_closed": True,
+                    },
+                },
+                {
+                    "meeting_id": "normal-closed",
+                    "meeting_type": "DAILY_STRATEGY",
+                    "status": "CLOSED",
+                    "started_at": self._now - timedelta(hours=3),
+                    "ended_at": self._now - timedelta(hours=2, minutes=30),
+                    "summary": "최근 회의 결론: 비용 미커버 단타를 줄이고 기대값이 양수일 때만 진입.",
+                    "decisions": {
+                        "final_plan": {"symbol": "KRW-BTC", "target_position_pct": 2.0},
+                        "activation_status": "ACTIVE_DATA_COLLECTION",
+                    },
+                },
+            ]
+
+    repo = _RepoWithAutoClosed(now_kst=now_kst)
+    rules_raw = {
+        "governance": {
+            "learning_context": {
+                "max_outcome_rows": 500,
+                "recent_window_fallback_min_trades": 1,
+                "outcome_windows": {
+                    "execution_hours": 6,
+                    "short_days": 14,
+                    "medium_days": 90,
+                    "anchor_days": 270,
+                },
+                "meeting_memory": {
+                    "enabled": True,
+                    "lookback_days": 14,
+                    "max_sessions": 4,
+                    "summary_max_chars": 200,
+                },
+            }
+        }
+    }
+
+    ctx = gm._build_learning_context(repo=repo, now_kst=now_kst, rules_raw=rules_raw)
+    lessons = [x for x in list(ctx.get("recent_meeting_lessons") or []) if isinstance(x, dict)]
+    assert len(lessons) == 1
+    assert str(lessons[0].get("meeting_id") or "") == "normal-closed"

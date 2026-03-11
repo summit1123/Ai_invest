@@ -833,6 +833,27 @@ def _activation_hold_mode(*, activation_decision_effective: str, conditional_act
     return "HOLD_CONDITIONAL" if bool(conditional_activation.get("enabled")) else "HOLD_STATIC"
 
 
+def _should_enable_inter_slot_realtime_mode(
+    *,
+    universe_mode: str,
+    live_execution_enabled: bool,
+    hard_plan_block: bool,
+    final_plan_no_trade: bool,
+    activation_decision_effective: str,
+    conditional_activation: Mapping[str, Any],
+) -> bool:
+    decision = str(activation_decision_effective or "").upper()
+    if str(universe_mode or "").strip().lower() != "live":
+        return False
+    if not bool(live_execution_enabled):
+        return False
+    if bool(hard_plan_block) or bool(final_plan_no_trade):
+        return False
+    if decision not in {"PAPER", "HOLD"}:
+        return False
+    return bool(conditional_activation.get("enabled"))
+
+
 def _initial_cap_runtime(
     *,
     conditional_activation: Mapping[str, Any],
@@ -985,13 +1006,57 @@ def _contains_no_trade_language(text: str) -> bool:
 
 def _final_plan_declares_no_trade(*, final_plan: FinalTradePlan) -> tuple[bool, list[str]]:
     reasons: list[str] = []
-    if float(_as_float(final_plan.target_position_pct, default=0.0)) <= 0.0:
+    target_zero = float(_as_float(final_plan.target_position_pct, default=0.0)) <= 0.0
+    buy_disabled = not bool(final_plan.allowed_actions.buy)
+    notes_no_trade = _contains_no_trade_language(str(final_plan.notes or ""))
+    if target_zero:
         reasons.append("target_position_pct<=0")
-    if not bool(final_plan.allowed_actions.buy):
+    if target_zero and buy_disabled:
         reasons.append("allowed_actions.buy=false")
-    if _contains_no_trade_language(str(final_plan.notes or "")):
+    if notes_no_trade:
         reasons.append("notes_no_trade_language")
-    return bool(reasons), reasons
+    return bool(target_zero or notes_no_trade), reasons
+
+
+def _policy_target_cap_pct(
+    *,
+    plan: FinalTradePlan,
+    quant: QuantPlanDraft,
+    risk_max_position_pct: float,
+    hard_max_position_pct: float,
+) -> float:
+    cap = max(0.0, min(float(hard_max_position_pct), float(risk_max_position_pct)))
+    plan_target = max(0.0, float(_as_float(plan.target_position_pct, default=0.0)))
+    quant_target = max(0.0, float(_as_float(quant.target_position_pct, default=0.0)))
+    candidate = float(plan_target if plan_target > 0.0 else quant_target)
+    if candidate <= 0.0 or cap <= 0.0:
+        return 0.0
+    return max(0.0, min(float(candidate), float(cap)))
+
+
+def _should_recover_final_plan_no_trade(
+    *,
+    universe_mode: str,
+    live_execution_enabled: bool,
+    hard_plan_block: bool,
+    conditional_activation: Mapping[str, Any],
+    final_plan_no_trade_reasons: Sequence[str],
+    conditional_hold_target_pct: float,
+) -> bool:
+    if str(universe_mode or "").strip().lower() != "live":
+        return False
+    if not bool(live_execution_enabled):
+        return False
+    if bool(hard_plan_block):
+        return False
+    if not bool((conditional_activation or {}).get("enabled")):
+        return False
+    if float(conditional_hold_target_pct) <= 0.0:
+        return False
+    reasons = {str(x).strip() for x in list(final_plan_no_trade_reasons or []) if str(x).strip()}
+    if not reasons:
+        return False
+    return reasons.issubset({"target_position_pct<=0", "allowed_actions.buy=false"})
 
 
 def _build_plan_consistency_checks(
@@ -1001,6 +1066,7 @@ def _build_plan_consistency_checks(
     soft_plan_block: bool,
     soft_plan_block_reasons: Sequence[str],
     activation_decision_effective: str,
+    hold_mode: str | None = None,
     paper_data_collection_applied: bool,
     allowed_actions: Mapping[str, Any],
     target_position_pct: float,
@@ -1012,6 +1078,7 @@ def _build_plan_consistency_checks(
     sell_allowed = bool((allowed_actions or {}).get("sell"))
     target_pct = float(_as_float(target_position_pct, default=0.0))
     hold_effective = str(activation_decision_effective or "").upper() == "HOLD"
+    conditional_hold_effective = bool(hold_effective and str(hold_mode or "").upper() == "HOLD_CONDITIONAL")
     plan_execution_blocked = bool(hard_plan_block or soft_plan_block)
     notes_indicate_no_trade = _contains_no_trade_language(notes)
 
@@ -1030,13 +1097,25 @@ def _build_plan_consistency_checks(
         },
         {
             "name": "hold_decision_must_be_flat",
-            "passed": not (hold_effective and (buy_allowed or sell_allowed or target_pct > 0.0)),
+            "passed": not ((hold_effective and not conditional_hold_effective) and (buy_allowed or sell_allowed or target_pct > 0.0)),
             "actual": {
                 "buy": bool(buy_allowed),
                 "sell": bool(sell_allowed),
                 "target_position_pct": float(target_pct),
             },
-            "required": {"buy": False, "sell": False, "target_position_pct": 0.0} if hold_effective else None,
+            "required": {"buy": False, "sell": False, "target_position_pct": 0.0}
+            if (hold_effective and not conditional_hold_effective)
+            else None,
+        },
+        {
+            "name": "conditional_hold_must_keep_buy_disabled",
+            "passed": not (conditional_hold_effective and buy_allowed),
+            "actual": {
+                "buy": bool(buy_allowed),
+                "sell": bool(sell_allowed),
+                "target_position_pct": float(target_pct),
+            },
+            "required": {"buy": False} if conditional_hold_effective else None,
         },
         {
             "name": "notes_no_trade_must_not_conflict",
@@ -1073,6 +1152,7 @@ def _build_plan_consistency_checks(
         "soft_plan_block": bool(soft_plan_block),
         "soft_plan_block_reasons": [str(x) for x in list(soft_plan_block_reasons or []) if str(x).strip()],
         "activation_decision_effective": str(activation_decision_effective or ""),
+        "hold_mode": str(hold_mode or ""),
         "paper_data_collection_applied": bool(paper_data_collection_applied),
         "final_no_trade_declared": bool(no_trade_declared),
         "final_no_trade_reasons": [str(x) for x in list(no_trade_reasons or []) if str(x).strip()],
@@ -1108,7 +1188,18 @@ def _to_final_trade_plan_v2(
     conditional_activation: Mapping[str, Any] | None = None,
 ) -> FinalTradePlanV2:
     target = float(final_plan.target_position_pct)
-    if bool(final_plan.allowed_actions.buy):
+    gate = activation_gate if isinstance(activation_gate, Mapping) else {}
+    hold_mode = str(gate.get("hold_mode") or "").upper()
+    decision_effective = str(gate.get("decision_effective") or gate.get("decision") or "").upper()
+    conditional_hold_target_allowed = bool(
+        (decision_effective == "HOLD" or hold_mode == "HOLD_CONDITIONAL")
+        and (
+            bool((conditional_activation or {}).get("enabled"))
+            or hold_mode == "HOLD_CONDITIONAL"
+            or bool(gate.get("inter_slot_realtime_mode"))
+        )
+    )
+    if bool(final_plan.allowed_actions.buy) or conditional_hold_target_allowed:
         tgt_lo, tgt_hi = _bounded_pair(target * 0.7, max(target, target * 1.3), min_v=0.0, max_v=100.0)
     else:
         tgt_lo, tgt_hi = (0.0, 0.0)
@@ -1119,7 +1210,9 @@ def _to_final_trade_plan_v2(
 
     side = str(((rules_raw.get("universe") or {}).get("trade_side") or "long_only")).strip().lower()
     direction_bias = "long_only" if side in {"long_only", "long"} else ("short_only" if side in {"short_only", "short"} else "both")
-    if not bool(final_plan.allowed_actions.buy) and bool(final_plan.allowed_actions.sell):
+    if conditional_hold_target_allowed:
+        mode = "hold"
+    elif not bool(final_plan.allowed_actions.buy) and bool(final_plan.allowed_actions.sell):
         mode = "reduce"
     elif float(target) <= 0.0:
         mode = "hold"
@@ -1162,8 +1255,22 @@ def _to_final_trade_plan_v2(
     bt = _extract_quant_backtest_for_symbol(fact_pack=fact_pack, symbol=str(final_plan.symbol))
     bt_trades = int(_as_float((bt or {}).get("trades"), default=0.0))
     suff = "high" if bt_trades >= 30 else ("medium" if bt_trades >= 10 else "low")
+    conditional_activation_map = (
+        conditional_activation
+        if isinstance(conditional_activation, Mapping)
+        else (
+            activation_gate.get("conditional_activation")
+            if isinstance(activation_gate.get("conditional_activation"), Mapping)
+            else {}
+        )
+    )
     decision = str(activation_gate.get("decision") or "PAPER").upper()
-    paper_only_recommended = decision != "LIVE"
+    inter_slot_realtime_mode = bool(activation_gate.get("inter_slot_realtime_mode"))
+    live_runtime_eligible = bool(
+        bool((conditional_activation_map or {}).get("enabled"))
+        and inter_slot_realtime_mode
+    ) or decision == "LIVE"
+    paper_only_recommended = not bool(live_runtime_eligible)
 
     refs: list[dict[str, Any]] = []
     for raw_ref in list(final_plan.evidence_refs or [])[:20]:
@@ -1211,7 +1318,7 @@ def _to_final_trade_plan_v2(
         evidence_refs=refs,
         open_questions=list(final_plan.open_questions or []),
         conflict_resolution=conflicts,
-        conditional_activation=dict(conditional_activation or {}),
+        conditional_activation=dict(conditional_activation_map or {}),
         notes=str(final_plan.notes or ""),
         confidence=PlanConfidence(
             data_sufficiency=suff,
@@ -1232,6 +1339,7 @@ def _build_execution_plan(
     risk_max_position_pct: float,
     activation_decision: str,
     live_execution_enabled: bool,
+    conditional_hold_target_allowed: bool = False,
     max_trades_per_day: int = 6,
 ) -> ExecutionPlan:
     rng = plan_v2.position_policy
@@ -1264,7 +1372,9 @@ def _build_execution_plan(
     chosen_target = max(0.0, float(chosen_target))
     if chosen_target < float(tgt_lo) and float(tgt_lo) <= float(hard_cap):
         chosen_target = float(tgt_lo)
-    if str(activation_decision).upper() == "HOLD" or not bool(final_plan.allowed_actions.buy):
+    if (str(activation_decision).upper() == "HOLD" or not bool(final_plan.allowed_actions.buy)) and not bool(
+        conditional_hold_target_allowed
+    ):
         chosen_target = 0.0
 
     chosen_rebalance = min(max(float(final_plan.rebalance_band_pct), float(rb_lo)), float(rb_hi))
@@ -1310,8 +1420,9 @@ def _build_execution_plan(
             "max_daily_loss_pct": float(rules.risk.max_daily_loss_pct),
             "max_trades_per_day": int(max(0, int(max_trades_per_day))),
             "regime_trade_allowed": True,
-            "paper_only": bool(decision != "LIVE" or not live_execution_enabled),
+            "paper_only": bool(not (bool(live_execution_enabled) and (decision == "LIVE" or conditional_hold_target_allowed))),
             "activation_decision": decision,
+            "conditional_hold_target_allowed": bool(conditional_hold_target_allowed),
             "time_horizon": str(horizon),
         },
         sizing_rule="min(plan_cap_target, signal_target)",
@@ -1919,8 +2030,8 @@ def enforce_final_trade_plan(
 ) -> FinalTradePlan:
     """Hard enforcement layer (deterministic).
 
-    Safe Judge currently consumes `target_position_pct` only, so if BUY is not allowed we must
-    force `target_position_pct=0` to avoid accidental buys.
+    Keep true hard blockers fail-closed here. Soft vetoes are recorded, but in live mode the
+    runtime loop can re-evaluate them between meetings.
     """
 
     # Validity window is deterministic (do not trust model output here).
@@ -1936,11 +2047,21 @@ def enforce_final_trade_plan(
         sym = fallback_symbol if fallback_symbol in allowed_symbols else (next(iter(allowed_symbols), sym))
 
     raw_hint = (fact_pack.get("raw_rules_hint") or {}) if isinstance(fact_pack.get("raw_rules_hint"), Mapping) else {}
+    hint_governance = (raw_hint.get("governance") or {}) if isinstance(raw_hint.get("governance"), Mapping) else {}
     hint_universe = (raw_hint.get("universe") or {}) if isinstance(raw_hint.get("universe"), Mapping) else {}
     hint_paper_mode = (raw_hint.get("paper_mode") or {}) if isinstance(raw_hint.get("paper_mode"), Mapping) else {}
     hint_dc = (hint_paper_mode.get("data_collection") or {}) if isinstance(hint_paper_mode.get("data_collection"), Mapping) else {}
+    hint_activation_gate = (
+        (hint_governance.get("activation_gate") or {}) if isinstance(hint_governance.get("activation_gate"), Mapping) else {}
+    )
+    hint_conditional_activation = (
+        (hint_activation_gate.get("conditional_activation") or {})
+        if isinstance(hint_activation_gate.get("conditional_activation"), Mapping)
+        else {}
+    )
     is_paper_mode = str(hint_universe.get("mode") or "paper").strip().lower() == "paper"
     allow_soft_plan_block_bypass = bool(hint_dc.get("allow_soft_plan_block_bypass", False))
+    live_conditional_realtime_enabled = bool((not is_paper_mode) and hint_conditional_activation.get("enabled", True))
     ops_state = (fact_pack.get("ops_state") or {}) if isinstance(fact_pack.get("ops_state"), Mapping) else {}
     pause_state = bool(((ops_state.get("pause") or {}).get("paused") if isinstance(ops_state.get("pause"), Mapping) else False))
     recon_status = str(
@@ -1949,24 +2070,27 @@ def enforce_final_trade_plan(
     ).strip().upper()
     hard_ops_block = bool(pause_state or recon_status == "FAIL")
 
+    soft_veto_present = bool(ops.veto) or bool(risk.veto) or not bool(ops.trade_window_allowed)
     # Hard gate: disable BUY when true hard blockers are present.
     buy_allowed = bool(plan.allowed_actions.buy) and bool(quant.allowed_actions.buy)
     if hard_ops_block:
         buy_allowed = False
-    # In paper autonomy mode, soft LLM vetoes are advisory and do not force-flat execution.
-    elif not (is_paper_mode and allow_soft_plan_block_bypass):
-        if bool(ops.veto) or bool(risk.veto) or not bool(ops.trade_window_allowed):
+    # In paper autonomy mode and live conditional mode, meeting-time soft vetoes stay advisory.
+    elif not (is_paper_mode and allow_soft_plan_block_bypass) and not live_conditional_realtime_enabled:
+        if soft_veto_present:
             buy_allowed = False
 
-    if bool(is_paper_mode and allow_soft_plan_block_bypass and (bool(ops.veto) or bool(risk.veto) or not bool(ops.trade_window_allowed))):
+    if bool(is_paper_mode and allow_soft_plan_block_bypass and soft_veto_present):
         conflict_note = "paper 자율모드: soft veto(ops/risk/window)는 참고로 기록하고 실행차단에는 사용하지 않음"
+    elif bool(live_conditional_realtime_enabled and soft_veto_present):
+        conflict_note = "live 조건부모드: soft veto(ops/risk/window)는 회의 참고치로 기록하고 런타임에서 재평가"
     else:
         conflict_note = ""
 
-    if bool(ops.veto) or bool(risk.veto) or not bool(ops.trade_window_allowed):
+    if soft_veto_present:
         if hard_ops_block:
             conflict_note = "하드 게이트: pause/recon FAIL -> buy=false, target=0"
-        elif not (is_paper_mode and allow_soft_plan_block_bypass):
+        elif not (is_paper_mode and allow_soft_plan_block_bypass) and not live_conditional_realtime_enabled:
             conflict_note = "하드 게이트: ops/risk veto 또는 trade_window 차단 -> buy=false, target=0"
 
     if conflict_note:
@@ -1978,10 +2102,24 @@ def enforce_final_trade_plan(
     if hard_ops_block:
         buy_allowed = False
 
-    # Clamp target to risk max and hard max. If buy not allowed => target 0.
+    # Clamp target to risk max and hard max.
+    # In live conditional mode, preserve the policy cap even if meeting-time BUY stays disabled.
     max_pos = min(float(hard_max_position_pct), float(risk.max_position_pct))
     tgt = float(plan.target_position_pct)
-    tgt2 = 0.0 if not buy_allowed else max(0.0, min(float(tgt), float(max_pos)))
+    tgt_policy_cap = _policy_target_cap_pct(
+        plan=plan,
+        quant=quant,
+        risk_max_position_pct=float(risk.max_position_pct),
+        hard_max_position_pct=float(hard_max_position_pct),
+    )
+    if hard_ops_block:
+        tgt2 = 0.0
+    elif buy_allowed:
+        tgt2 = float(tgt_policy_cap)
+    elif bool(live_conditional_realtime_enabled and soft_veto_present):
+        tgt2 = float(tgt_policy_cap)
+    else:
+        tgt2 = 0.0
 
     # Constraints: start from cost_guard, then merge risk.required_constraints, then plan.constraints.
     def _num_map(obj: Any) -> dict[str, float]:
@@ -2009,9 +2147,13 @@ def enforce_final_trade_plan(
     if not buy_allowed and float(tgt2) == 0.0:
         if hard_ops_block:
             conflict.append("하드 게이트: pause/recon FAIL -> buy=false, target=0")
-        elif not (is_paper_mode and allow_soft_plan_block_bypass):
+        elif not (is_paper_mode and allow_soft_plan_block_bypass) and not live_conditional_realtime_enabled:
             conflict.append("하드 게이트: ops/risk veto 또는 trade_window 차단 -> buy=false, target=0")
-    if float(tgt2) != float(tgt):
+    if bool(live_conditional_realtime_enabled and soft_veto_present and not buy_allowed and float(tgt) <= 0.0 and float(tgt2) > 0.0):
+        conflict.append(
+            f"live 조건부모드: 회의 target 0.0%를 policy cap {tgt2:.1f}%로 복구하고 진입 타이밍은 런타임에 위임"
+        )
+    elif float(tgt2) != float(tgt):
         conflict.append(f"리스크 상한 적용: target {tgt:.1f}% -> {tgt2:.1f}% (max_pos={max_pos:.1f}%)")
 
     return plan.model_copy(
@@ -2253,6 +2395,31 @@ def _default_fact_pack(
                 }
             },
         },
+    }
+
+
+def _current_daily_account_snapshot(*, repo: PostgresRepo, equity_krw: float, now_kst: datetime) -> dict[str, Any]:
+    today_kst = str(now_kst.date().isoformat())
+    realized_pnl = 0.0
+    fees_paid = 0.0
+    trades_count = 0
+    pnl_rows = repo.fetch_pnl_daily(limit=3)
+    for row in list(pnl_rows or []):
+        if str(row.get("day") or "").strip() != today_kst:
+            continue
+        realized_pnl = float(_as_float(row.get("realized_pnl"), default=0.0))
+        fees_paid = float(_as_float(row.get("fees_paid"), default=0.0))
+        trades_count = int(_as_float(row.get("trades_count"), default=0.0))
+        break
+    daily_loss_pct = 0.0
+    if float(realized_pnl) < 0.0 and float(equity_krw) > 0.0:
+        daily_loss_pct = abs(float(realized_pnl)) / float(equity_krw) * 100.0
+    return {
+        "account_day_kst": str(today_kst),
+        "daily_realized_pnl_krw": float(realized_pnl),
+        "daily_fees_paid_krw": float(fees_paid),
+        "daily_trades_count": int(trades_count),
+        "daily_loss_pct": float(daily_loss_pct),
     }
 
 
@@ -2699,7 +2866,8 @@ def run_governance_protocol(
         evidence_refs=[str(c.url) for c in det_research.evidence_cards if c.url][:8],
         open_questions=det_research.unknowns[:8],
         conflict_resolution=[
-            "하드 룰: ops/risk veto가 있으면 BUY 차단",
+            "하드 룰: pause/recon FAIL이면 BUY 차단",
+            "soft veto(ops/risk/window)는 정책 cap과 제약으로 기록하고, live에서는 런타임 재평가에 위임",
             "비중: quant 초안과 risk 상한을 비교해 낮은 값을 채택",
             f"자본 티어 상한 적용: tier={cap_tier}, max_target={default_target:.1f}%, max_pos={max_pos:.1f}%",
         ],
@@ -3448,13 +3616,17 @@ def _build_recent_meeting_lessons(
         status = str(row.get("status") or "").upper()
         if status == "OPEN":
             continue
+        decisions = row.get("decisions") if isinstance(row.get("decisions"), Mapping) else {}
+        if bool(decisions.get("auto_closed")):
+            continue
+        if str(decisions.get("error") or "").strip().upper().startswith("MEETING_"):
+            continue
         ended_kst = _as_kst_dt(row.get("ended_at")) or _as_kst_dt(row.get("started_at"))
         if ended_kst is None or ended_kst < since:
             continue
         summary_text = _clip(_meeting_summary_text(row.get("summary")), int(summary_max_chars))
         if not summary_text:
             continue
-        decisions = row.get("decisions") if isinstance(row.get("decisions"), Mapping) else {}
         final_plan = decisions.get("final_plan") if isinstance(decisions.get("final_plan"), Mapping) else {}
         symbol = str((final_plan or {}).get("symbol") or "").strip()
         target_pct = _as_float((final_plan or {}).get("target_position_pct"), default=0.0)
@@ -4087,6 +4259,11 @@ def run_governance_meeting_now(
             max_position_pct_per_symbol=float(rules.risk.max_position_pct_per_symbol),
             cooldown_minutes_after_trigger=int(rules.risk.cooldown_minutes_after_trigger),
         )
+        daily_account_snapshot = _current_daily_account_snapshot(
+            repo=repo,
+            equity_krw=float(equity),
+            now_kst=now_kst,
+        )
         account_state = {
             "cash_krw": float(cash),
             "equity_krw": float(equity),
@@ -4096,6 +4273,7 @@ def run_governance_meeting_now(
             "open_positions": list(open_positions),
             "open_symbols": [str(x.get("symbol") or "") for x in open_positions if str(x.get("symbol") or "").strip()],
             "capital_profile": capital_profile.as_dict(),
+            **dict(daily_account_snapshot),
         }
 
         fact_pack = _default_fact_pack(
@@ -4201,6 +4379,7 @@ def run_governance_meeting_now(
             (paper_mode_cfg.get("data_collection") or {}) if isinstance(paper_mode_cfg, Mapping) else {}
         )
         is_paper_mode = str(((rules_raw.get("universe") or {}).get("mode") or "paper")).strip().lower() == "paper"
+        universe_mode = str(((rules_raw.get("universe") or {}).get("mode") or "paper")).strip().lower()
         force_plan_buy_allowed = bool(data_collection_cfg.get("force_plan_buy_allowed", True))
         force_plan_target_pct = float(_as_float(data_collection_cfg.get("force_plan_target_pct"), default=5.0))
         allow_soft_plan_block_bypass = bool(data_collection_cfg.get("allow_soft_plan_block_bypass", False))
@@ -4221,8 +4400,7 @@ def run_governance_meeting_now(
         soft_plan_block = bool(soft_plan_block_raw)
         if is_paper_mode and allow_soft_plan_block_bypass:
             soft_plan_block = False
-        plan_execution_blocked = bool(hard_plan_block or soft_plan_block)
-        final_plan_no_trade, final_plan_no_trade_reasons = _final_plan_declares_no_trade(
+        final_plan_no_trade_raw, final_plan_no_trade_reasons = _final_plan_declares_no_trade(
             final_plan=outputs.final_plan
         )
         activation_decision = _activation_decision_from_gate(
@@ -4236,6 +4414,36 @@ def run_governance_meeting_now(
             rules_raw=rules_raw,
             force_enabled=None,
         )
+        conditional_hold_target_pct = _policy_target_cap_pct(
+            plan=outputs.final_plan,
+            quant=outputs.quant,
+            risk_max_position_pct=float(outputs.risk.max_position_pct),
+            hard_max_position_pct=min(
+                float(capital_profile.max_target_position_pct),
+                float(rules.risk.max_position_pct_per_symbol),
+            ),
+        )
+        recoverable_final_plan_no_trade = _should_recover_final_plan_no_trade(
+            universe_mode=universe_mode,
+            live_execution_enabled=bool(live_execution_enabled),
+            hard_plan_block=bool(hard_plan_block),
+            conditional_activation=conditional_activation_cfg,
+            final_plan_no_trade_reasons=list(final_plan_no_trade_reasons),
+            conditional_hold_target_pct=float(conditional_hold_target_pct),
+        )
+        final_plan_no_trade = bool(final_plan_no_trade_raw and not recoverable_final_plan_no_trade)
+        inter_slot_realtime_mode = _should_enable_inter_slot_realtime_mode(
+            universe_mode=universe_mode,
+            live_execution_enabled=bool(live_execution_enabled),
+            hard_plan_block=bool(hard_plan_block),
+            final_plan_no_trade=bool(final_plan_no_trade),
+            activation_decision_effective=str(activation_decision_effective),
+            conditional_activation=conditional_activation_cfg,
+        )
+        if inter_slot_realtime_mode:
+            soft_plan_block = False
+            activation_decision_effective = "HOLD"
+        plan_execution_blocked = bool(hard_plan_block or soft_plan_block)
         hold_mode = _activation_hold_mode(
             activation_decision_effective=str(activation_decision_effective),
             conditional_activation=conditional_activation_cfg,
@@ -4260,10 +4468,20 @@ def run_governance_meeting_now(
         activation_gate["soft_plan_block_reasons"] = list(soft_plan_block_reasons)
         activation_gate["soft_plan_block_bypassed"] = bool(soft_plan_block_raw and not soft_plan_block)
         activation_gate["paper_soft_block_bypass_enabled"] = bool(allow_soft_plan_block_bypass)
+        activation_gate["inter_slot_realtime_mode"] = bool(inter_slot_realtime_mode)
         activation_gate["plan_execution_blocked"] = bool(plan_execution_blocked)
         activation_gate["hold_mode"] = str(hold_mode)
         activation_gate["conditional_activation"] = dict(conditional_activation_cfg)
         activation_gate["cap_runtime"] = dict(cap_runtime_seed)
+        if inter_slot_realtime_mode:
+            activation_gate["inter_slot_realtime_reason"] = "meeting sets policy cap; realtime loop owns entry timing until next meeting"
+        if final_plan_no_trade_raw:
+            activation_gate["final_plan_no_trade_raw"] = True
+            activation_gate["final_plan_no_trade_raw_reasons"] = list(final_plan_no_trade_reasons)
+        if recoverable_final_plan_no_trade:
+            activation_gate["final_plan_no_trade_recovered"] = True
+            activation_gate["final_plan_no_trade_recovered_reasons"] = list(final_plan_no_trade_reasons)
+            activation_gate["conditional_hold_target_pct"] = float(conditional_hold_target_pct)
         if final_plan_no_trade:
             activation_gate["final_plan_no_trade_declared"] = True
             activation_gate["final_plan_no_trade_reasons"] = list(final_plan_no_trade_reasons)
@@ -4274,6 +4492,10 @@ def run_governance_meeting_now(
 
         resolved_allowed_actions = outputs.final_plan.allowed_actions.model_dump()
         resolved_target_position_pct = float(outputs.final_plan.target_position_pct)
+        if recoverable_final_plan_no_trade:
+            resolved_allowed_actions["buy"] = False
+            resolved_allowed_actions["sell"] = True
+            resolved_target_position_pct = float(conditional_hold_target_pct)
         if final_plan_no_trade:
             resolved_allowed_actions["buy"] = False
             resolved_target_position_pct = 0.0
@@ -4310,9 +4532,15 @@ def run_governance_meeting_now(
             ]
 
         if str(activation_decision_effective).upper() == "HOLD":
-            resolved_allowed_actions["buy"] = False
-            resolved_allowed_actions["sell"] = False
-            resolved_target_position_pct = 0.0
+            if inter_slot_realtime_mode:
+                resolved_allowed_actions["buy"] = False
+                resolved_allowed_actions["sell"] = True
+                activation_gate = dict(activation_gate)
+                activation_gate["conditional_hold_target_pct"] = float(resolved_target_position_pct)
+            else:
+                resolved_allowed_actions["buy"] = False
+                resolved_allowed_actions["sell"] = False
+                resolved_target_position_pct = 0.0
 
         hold_only_plan = (float(resolved_target_position_pct) <= 0.0) or (not bool(resolved_allowed_actions.get("buy")))
         if str(activation_decision_effective).upper() == "HOLD":
@@ -4398,6 +4626,7 @@ def run_governance_meeting_now(
             "[resolved_execution]",
             f"- activation_status={str(activation_status)}",
             f"- decision_effective={str(activation_gate.get('decision_effective') or activation_gate.get('decision') or '')}",
+            f"- inter_slot_realtime_mode={bool(inter_slot_realtime_mode)}",
             f"- plan_execution_blocked={bool(plan_execution_blocked)}",
             f"- allowed_actions.buy={bool(resolved_allowed_actions.get('buy'))}",
             f"- allowed_actions.sell={bool(resolved_allowed_actions.get('sell'))}",
@@ -4417,6 +4646,7 @@ def run_governance_meeting_now(
             soft_plan_block=bool(soft_plan_block),
             soft_plan_block_reasons=list(soft_plan_block_reasons),
             activation_decision_effective=str(activation_decision_effective),
+            hold_mode=str(hold_mode),
             paper_data_collection_applied=bool(paper_data_collection_applied),
             allowed_actions=resolved_allowed_actions,
             target_position_pct=float(resolved_target_position_pct),
@@ -4451,6 +4681,7 @@ def run_governance_meeting_now(
             risk_max_position_pct=float(outputs.risk.max_position_pct),
             activation_decision=str(activation_decision_effective),
             live_execution_enabled=bool(live_execution_enabled),
+            conditional_hold_target_allowed=bool(inter_slot_realtime_mode),
         )
         fee_total_bps = float(
             _as_float(((rules_raw.get("fees") or {}).get("fallback_bid_fee_bps")), default=5.0)
@@ -4465,7 +4696,13 @@ def run_governance_meeting_now(
         }
         gate_cfg_raw = (gov_cfg.get("activation_gate") or {}) if isinstance(gov_cfg, Mapping) else {}
         paper_live_policy = {
-            "live_allowed": bool(str(activation_decision_effective).upper() == "LIVE" and live_execution_enabled),
+            "live_allowed": bool(
+                bool(live_execution_enabled)
+                and (
+                    str(activation_decision_effective).upper() == "LIVE"
+                    or bool(inter_slot_realtime_mode)
+                )
+            ),
             "promotion_rules": [
                 f"min_backtest_trades>={int(_as_float(gate_cfg_raw.get('min_backtest_trades'), default=3.0))}",
                 f"min_win_rate_pct>={float(_as_float(gate_cfg_raw.get('min_win_rate_pct'), default=40.0)):.1f}",
