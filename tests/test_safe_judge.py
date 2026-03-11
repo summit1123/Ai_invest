@@ -24,6 +24,7 @@ def base_payload() -> dict:
 class SafeJudgeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.rules = load_rules("rules.yaml")
+        self.rules.raw.setdefault("universe", {})["mode"] = "paper"
 
     def test_pause_state_overrides(self) -> None:
         payload = base_payload()

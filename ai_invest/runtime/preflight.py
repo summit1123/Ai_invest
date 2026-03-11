@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from ai_invest.storage.postgres import connect_postgres, get_postgres_connect_timeout_sec, to_psycopg_dsn
+
 
 def _as_bool(value: Any, *, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -50,6 +52,7 @@ def build_startup_preflight(
     rules_raw: Mapping[str, Any],
     env: Mapping[str, str] | None = None,
     require_trading: bool = True,
+    probe_postgres: bool = True,
 ) -> PreflightReport:
     env_map = dict(os.environ if env is None else env)
     universe = (rules_raw.get("universe") or {}) if isinstance(rules_raw, Mapping) else {}
@@ -71,13 +74,37 @@ def build_startup_preflight(
             detail=f"mode={mode}",
         )
     )
+    postgres_dsn = str(env_map.get("POSTGRES_DSN", "")).strip()
+    postgres_present = bool(postgres_dsn)
     checks.append(
         PreflightCheck(
             name="storage.postgres",
-            ok=bool(str(env_map.get("POSTGRES_DSN", "")).strip()),
-            detail="POSTGRES_DSN present" if str(env_map.get("POSTGRES_DSN", "")).strip() else "POSTGRES_DSN missing",
+            ok=postgres_present,
+            detail="POSTGRES_DSN present" if postgres_present else "POSTGRES_DSN missing",
         )
     )
+    if postgres_present and probe_postgres:
+        timeout = get_postgres_connect_timeout_sec(env=env_map)
+        try:
+            with connect_postgres(to_psycopg_dsn(postgres_dsn), connect_timeout_sec=timeout) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("select 1")
+                    cur.fetchone()
+            checks.append(
+                PreflightCheck(
+                    name="storage.postgres_connectivity",
+                    ok=True,
+                    detail=f"postgres connect ok (timeout={timeout}s)",
+                )
+            )
+        except Exception as exc:
+            checks.append(
+                PreflightCheck(
+                    name="storage.postgres_connectivity",
+                    ok=False,
+                    detail=f"postgres connect failed within {timeout}s: {str(exc)[:180]}",
+                )
+            )
     checks.append(
         PreflightCheck(
             name="universe.selection",

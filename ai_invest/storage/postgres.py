@@ -28,6 +28,25 @@ def get_postgres_dsn() -> str:
     return to_psycopg_dsn(dsn)
 
 
+def get_postgres_connect_timeout_sec(*, env: Mapping[str, str] | None = None) -> int:
+    env_map = os.environ if env is None else env
+    raw = str(env_map.get("POSTGRES_CONNECT_TIMEOUT_SEC", "")).strip()
+    try:
+        timeout = int(raw) if raw else 5
+    except Exception:
+        timeout = 5
+    return max(1, timeout)
+
+
+def connect_postgres(
+    dsn: str | None = None,
+    *,
+    connect_timeout_sec: int | None = None,
+) -> psycopg.Connection:
+    timeout = int(connect_timeout_sec) if connect_timeout_sec is not None else get_postgres_connect_timeout_sec()
+    return psycopg.connect(dsn or get_postgres_dsn(), connect_timeout=timeout)
+
+
 def json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
@@ -317,7 +336,7 @@ class PostgresRepo:
         self._dsn = dsn or get_postgres_dsn()
 
     def connect(self) -> psycopg.Connection:
-        return psycopg.connect(self._dsn)
+        return connect_postgres(self._dsn)
 
     def insert_event(self, event: DbEvent) -> None:
         with self.connect() as conn, conn.cursor() as cur:

@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from ai_invest.runtime.preflight import build_startup_preflight
+import ai_invest.runtime.preflight as preflight
 
 
 def _rules(*, mode: str = "paper", live_enabled: bool = False, symbols: list[str] | None = None) -> dict:
@@ -20,10 +20,11 @@ def _rules(*, mode: str = "paper", live_enabled: bool = False, symbols: list[str
 
 
 def test_paper_preflight_requires_postgres() -> None:
-    report = build_startup_preflight(
+    report = preflight.build_startup_preflight(
         rules_raw=_rules(mode="paper"),
         env={},
         require_trading=True,
+        probe_postgres=False,
     )
 
     assert report.ok is False
@@ -32,10 +33,11 @@ def test_paper_preflight_requires_postgres() -> None:
 
 
 def test_live_trading_preflight_requires_live_flags() -> None:
-    report = build_startup_preflight(
+    report = preflight.build_startup_preflight(
         rules_raw=_rules(mode="live", live_enabled=False),
         env={"POSTGRES_DSN": "postgresql://user:pass@localhost:5432/db"},
         require_trading=True,
+        probe_postgres=False,
     )
 
     assert report.ok is False
@@ -46,10 +48,11 @@ def test_live_trading_preflight_requires_live_flags() -> None:
 
 
 def test_live_non_trading_preflight_skips_broker_credentials() -> None:
-    report = build_startup_preflight(
+    report = preflight.build_startup_preflight(
         rules_raw=_rules(mode="live", live_enabled=False),
         env={"POSTGRES_DSN": "postgresql://user:pass@localhost:5432/db"},
         require_trading=False,
+        probe_postgres=False,
     )
 
     assert report.ok is True
@@ -58,7 +61,7 @@ def test_live_non_trading_preflight_skips_broker_credentials() -> None:
 
 
 def test_live_trading_preflight_passes_with_required_inputs() -> None:
-    report = build_startup_preflight(
+    report = preflight.build_startup_preflight(
         rules_raw=_rules(mode="live", live_enabled=True),
         env={
             "POSTGRES_DSN": "postgresql://user:pass@localhost:5432/db",
@@ -67,6 +70,24 @@ def test_live_trading_preflight_passes_with_required_inputs() -> None:
             "UPBIT_SECRET_KEY": "secret",
         },
         require_trading=True,
+        probe_postgres=False,
     )
 
     assert report.ok is True
+
+
+def test_preflight_reports_postgres_connectivity_failure(monkeypatch) -> None:
+    def _boom(*args, **kwargs):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(preflight, "connect_postgres", _boom)
+
+    report = preflight.build_startup_preflight(
+        rules_raw=_rules(mode="paper"),
+        env={"POSTGRES_DSN": "postgresql://user:pass@localhost:5432/db"},
+        require_trading=True,
+        probe_postgres=True,
+    )
+
+    assert report.ok is False
+    assert any(check.name == "storage.postgres_connectivity" and check.ok is False for check in report.checks)

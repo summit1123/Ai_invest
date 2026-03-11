@@ -162,7 +162,7 @@ strategy:
     spread_dynamic_min_mult: 0.8
     spread_dynamic_max_mult: 1.8
 universe:
-  mode: paper
+  mode: live
   market: upbit
   dynamic:
     enabled: false
@@ -267,7 +267,7 @@ governance:
         sustain_seconds: 180
         min_pass_conditions: 3
       auto_promote_to: PAPER
-    live_execution_enabled: false
+    live_execution_enabled: true
   catchup_enabled: true
   plan_continuity:
     enabled: true
