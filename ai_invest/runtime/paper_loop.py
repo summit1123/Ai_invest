@@ -1078,7 +1078,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         runtime_allowed_actions = dict(plan_allowed_actions)
         runtime_target_pct = plan_target_pct
         runtime_control_cap = _as_float(runtime_controls.get("max_position_pct"), default=runtime_target_pct)
-        if runtime_control_cap > 0:
+        if runtime_target_pct is not None and runtime_control_cap > 0:
             runtime_target_pct = min(float(runtime_target_pct), float(runtime_control_cap))
         if not bool(runtime_controls.get("buy_enabled", True)):
             runtime_allowed_actions["buy"] = False

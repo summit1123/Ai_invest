@@ -3109,6 +3109,10 @@ def _mean(values: Sequence[float]) -> float:
     return float(sum(rows) / float(len(rows)))
 
 
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, value)))
+
+
 def _percentile(values: Sequence[float], pct: float) -> float:
     rows = [float(v) for v in list(values or [])]
     if not rows:

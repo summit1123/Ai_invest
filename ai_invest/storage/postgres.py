@@ -14,6 +14,24 @@ class PostgresConfigError(RuntimeError):
     pass
 
 
+class _RepoConnectionContext:
+    def __init__(self, repo: PostgresRepo) -> None:
+        self._repo = repo
+
+    def __enter__(self) -> psycopg.Connection:
+        return self._repo._get_or_create_connection()
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc is not None:
+            try:
+                conn = self._repo._conn
+                if conn is not None and not conn.closed:
+                    conn.rollback()
+            except Exception:
+                pass
+        return False
+
+
 def to_psycopg_dsn(dsn: str) -> str:
     # Allow SQLAlchemy-style DSN in .env while using psycopg directly.
     if dsn.startswith("postgresql+psycopg://"):
@@ -334,9 +352,28 @@ class DbMeetingMessage:
 class PostgresRepo:
     def __init__(self, dsn: str | None = None) -> None:
         self._dsn = dsn or get_postgres_dsn()
+        self._conn: psycopg.Connection | None = None
 
-    def connect(self) -> psycopg.Connection:
-        return connect_postgres(self._dsn)
+    def _get_or_create_connection(self) -> psycopg.Connection:
+        conn = self._conn
+        if conn is None or conn.closed:
+            conn = connect_postgres(self._dsn)
+            self._conn = conn
+        return conn
+
+    def connect(self) -> _RepoConnectionContext:
+        return _RepoConnectionContext(self)
+
+    def close(self) -> None:
+        conn = self._conn
+        self._conn = None
+        if conn is None:
+            return
+        try:
+            if not conn.closed:
+                conn.close()
+        except Exception:
+            pass
 
     def insert_event(self, event: DbEvent) -> None:
         with self.connect() as conn, conn.cursor() as cur:
