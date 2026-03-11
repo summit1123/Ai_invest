@@ -18,7 +18,12 @@ sys.path.insert(0, str(ROOT))
 DEFAULT_STATUS_FILE = ROOT / "runtime" / "orchestrator_status.json"
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+from ai_invest.runtime.orchestrator_state import (  # noqa: E402
+    orchestrator_status_signature,
+    persist_orchestrator_status_event,
+)
 from ai_invest.runtime.preflight import build_startup_preflight, format_preflight_report  # noqa: E402
+from ai_invest.storage.postgres import PostgresConfigError, PostgresRepo  # noqa: E402
 
 load_dotenv()
 
@@ -249,6 +254,12 @@ def main() -> int:
     procs: dict[str, subprocess.Popen[str]] = {}
     worker_state: dict[str, dict[str, Any]] = {}
     stopping = False
+    last_status_signature: str | None = None
+    try:
+        status_repo: PostgresRepo | None = PostgresRepo()
+    except PostgresConfigError as exc:
+        status_repo = None
+        print(f"[warn] orchestrator status persistence disabled: {exc}", flush=True)
 
     def _start_worker(name: str, cmd: list[str]) -> None:
         print(f"[start] {name}", flush=True)
@@ -283,12 +294,31 @@ def main() -> int:
             "workers": worker_state,
         }
 
+    def _persist_status_snapshot(snapshot: dict[str, Any]) -> None:
+        nonlocal last_status_signature
+        signature = orchestrator_status_signature(snapshot)
+        if signature == last_status_signature:
+            return
+        last_status_signature = signature
+        if status_repo is None:
+            return
+        try:
+            persist_orchestrator_status_event(
+                repo=status_repo,
+                status=snapshot,
+                source_status_file=status_file,
+            )
+        except Exception as exc:
+            print(f"[warn] failed to persist orchestrator status: {exc}", flush=True)
+
     def _stop_all(sig: int | None = None, _frame=None) -> None:
         nonlocal stopping
         stopping = True
         print(f"[stop] signal={sig}", flush=True)
         try:
-            _write_status_file(status_file, _snapshot_status())
+            snapshot = _snapshot_status()
+            _write_status_file(status_file, snapshot)
+            _persist_status_snapshot(snapshot)
         except Exception:
             pass
         for name, proc in list(procs.items()):
@@ -305,7 +335,9 @@ def main() -> int:
                 print(f"[kill] {name} pid={proc.pid}", flush=True)
                 proc.kill()
         try:
-            _write_status_file(status_file, _snapshot_status())
+            snapshot = _snapshot_status()
+            _write_status_file(status_file, snapshot)
+            _persist_status_snapshot(snapshot)
         except Exception:
             pass
 
@@ -315,7 +347,9 @@ def main() -> int:
     cmd_map = {name: cmd for name, cmd in commands}
     for name, cmd in commands:
         _start_worker(name, cmd)
-    _write_status_file(status_file, _snapshot_status())
+    snapshot = _snapshot_status()
+    _write_status_file(status_file, snapshot)
+    _persist_status_snapshot(snapshot)
 
     try:
         while not stopping:
@@ -338,7 +372,9 @@ def main() -> int:
                 )
                 time.sleep(float(args.restart_delay_sec))
                 _start_worker(name, cmd_map[name])
-            _write_status_file(status_file, _snapshot_status())
+            snapshot = _snapshot_status()
+            _write_status_file(status_file, snapshot)
+            _persist_status_snapshot(snapshot)
     finally:
         _stop_all()
     return 0

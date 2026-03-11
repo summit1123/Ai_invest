@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Annotated
 
@@ -13,6 +14,8 @@ from ai_invest.ops.read_api import (
     build_ops_status_snapshot,
     build_pause_explanation,
     build_pnl_snapshot,
+    build_state_at,
+    build_state_compare,
     utc_now_iso,
 )
 from ai_invest.storage.postgres import PostgresRepo
@@ -36,6 +39,19 @@ def _require_ops_api_key(x_ops_api_key: Annotated[str | None, Header()] = None) 
         return
     if str(x_ops_api_key or "").strip() != expected:
         raise HTTPException(status_code=401, detail="invalid ops api key")
+
+
+def _parse_ts_arg(name: str, value: str) -> datetime:
+    raw = str(value or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"{name} is required")
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid {name}: {exc}") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 @app.get("/healthz", dependencies=[Depends(_require_ops_api_key)], tags=["ops"])
@@ -77,3 +93,26 @@ def why_no_trade(
 ) -> dict[str, Any]:
     repo = PostgresRepo()
     return ok(build_no_trade_snapshot(repo=repo, symbol=symbol, status_path=_status_path()))
+
+
+@app.get("/api/v1/ops/state-at", dependencies=[Depends(_require_ops_api_key)], tags=["ops"])
+def state_at(
+    ts: str = Query(..., description="ISO-8601 timestamp"),
+    symbol: str = Query("KRW-BTC"),
+) -> dict[str, Any]:
+    repo = PostgresRepo()
+    return ok(build_state_at(repo=repo, ts_at=_parse_ts_arg("ts", ts), symbol=symbol))
+
+
+@app.get("/api/v1/ops/compare", dependencies=[Depends(_require_ops_api_key)], tags=["ops"])
+def compare_states(
+    from_ts: str = Query(..., description="Start ISO-8601 timestamp"),
+    to_ts: str = Query(..., description="End ISO-8601 timestamp"),
+    symbol: str = Query("KRW-BTC"),
+) -> dict[str, Any]:
+    from_dt = _parse_ts_arg("from_ts", from_ts)
+    to_dt = _parse_ts_arg("to_ts", to_ts)
+    if from_dt > to_dt:
+        raise HTTPException(status_code=400, detail="from_ts must be earlier than or equal to to_ts")
+    repo = PostgresRepo()
+    return ok(build_state_compare(repo=repo, from_ts=from_dt, to_ts=to_dt, symbol=symbol))

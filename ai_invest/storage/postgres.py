@@ -45,6 +45,12 @@ def _parse_iso_dt(value: Any) -> datetime | None:
     return dt
 
 
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _is_trade_plan_payload_active(payload: Mapping[str, Any], *, now_utc: datetime) -> bool:
     vf = _parse_iso_dt(payload.get("valid_from_kst") or payload.get("valid_from"))
     vt = _parse_iso_dt(payload.get("valid_to_kst") or payload.get("valid_to"))
@@ -744,6 +750,250 @@ class PostgresRepo:
             "total_unrealized_pnl_pct_on_equity": float(total_unrealized_pct_on_equity),
             "positions_count": len(positions),
             "positions": positions,
+        }
+
+    def fetch_cash_balance_at(self, *, currency: str, ts_at: datetime) -> float:
+        ccy = str(currency or "").strip().upper()
+        if not ccy:
+            return 0.0
+        ts_utc = _ensure_utc(ts_at)
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select coalesce(sum(amount - coalesce(fee_amount, 0.0)), 0.0)
+                from ledger_entries
+                where currency=%s
+                  and ts <= %s
+                """,
+                (ccy, ts_utc),
+            )
+            row = cur.fetchone()
+        try:
+            return float(row[0]) if row else 0.0
+        except Exception:
+            return 0.0
+
+    def fetch_fill_activity_before(
+        self,
+        *,
+        ts_at: datetime,
+        symbol: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        ts_utc = _ensure_utc(ts_at)
+        lim = max(1, int(limit))
+        with self.connect() as conn, conn.cursor() as cur:
+            if symbol:
+                cur.execute(
+                    """
+                    select
+                      f.fill_id,
+                      f.order_id,
+                      f.ts_filled,
+                      o.ts_created,
+                      o.symbol,
+                      o.side,
+                      f.price,
+                      f.quantity,
+                      f.fee,
+                      f.fee_currency,
+                      f.liquidity
+                    from fills f
+                    join orders o on o.order_id = f.order_id
+                    where f.ts_filled <= %s
+                      and o.symbol = %s
+                    order by f.ts_filled asc, f.fill_id asc
+                    limit %s
+                    """,
+                    (ts_utc, symbol, lim),
+                )
+            else:
+                cur.execute(
+                    """
+                    select
+                      f.fill_id,
+                      f.order_id,
+                      f.ts_filled,
+                      o.ts_created,
+                      o.symbol,
+                      o.side,
+                      f.price,
+                      f.quantity,
+                      f.fee,
+                      f.fee_currency,
+                      f.liquidity
+                    from fills f
+                    join orders o on o.order_id = f.order_id
+                    where f.ts_filled <= %s
+                    order by f.ts_filled asc, f.fill_id asc
+                    limit %s
+                    """,
+                    (ts_utc, lim),
+                )
+            rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for fill_id, order_id, ts_filled, ts_created, sym, side, price, quantity, fee, fee_currency, liquidity in rows:
+            out.append(
+                {
+                    "fill_id": str(fill_id),
+                    "order_id": str(order_id),
+                    "ts_filled": ts_filled,
+                    "ts_created": ts_created,
+                    "symbol": sym,
+                    "side": side,
+                    "price": price,
+                    "quantity": quantity,
+                    "fee": fee,
+                    "fee_currency": fee_currency,
+                    "liquidity": liquidity,
+                }
+            )
+        return out
+
+    def fetch_latest_market_quote_before(self, *, symbol: str, ts_at: datetime) -> dict[str, Any] | None:
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return None
+        ts_utc = _ensure_utc(ts_at)
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select ts, symbol, best_bid, best_ask, mid_price, spread_abs, spread_bps, source
+                from market_quotes
+                where symbol=%s
+                  and ts <= %s
+                order by ts desc
+                limit 1
+                """,
+                (sym, ts_utc),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        ts, sym2, best_bid, best_ask, mid_price, spread_abs, spread_bps, source = row
+        return {
+            "ts": ts,
+            "symbol": sym2,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid_price": mid_price,
+            "spread_abs": spread_abs,
+            "spread_bps": spread_bps,
+            "source": source,
+        }
+
+    def fetch_portfolio_overview_at(self, *, ts_at: datetime, quote_currency: str = "KRW") -> dict[str, Any]:
+        ccy = str(quote_currency or "").strip().upper() or "KRW"
+        ts_utc = _ensure_utc(ts_at)
+        cash = float(self.fetch_cash_balance_at(currency=ccy, ts_at=ts_utc))
+        fills = self.fetch_fill_activity_before(ts_at=ts_utc, limit=10000)
+
+        position_state: dict[str, dict[str, Any]] = {}
+        for row in fills:
+            sym = str(row.get("symbol") or "").strip().upper()
+            side = str(row.get("side") or "").strip().upper()
+            qty = float(row.get("quantity") or 0.0)
+            price = float(row.get("price") or 0.0)
+            fill_ts = row.get("ts_filled")
+            if not sym or side not in {"BUY", "SELL"} or qty <= 0 or price <= 0:
+                continue
+            pos = position_state.setdefault(sym, {"qty": 0.0, "avg_entry_price": None, "ts_updated": fill_ts})
+            current_qty = float(pos.get("qty") or 0.0)
+            avg_entry_raw = pos.get("avg_entry_price")
+            avg_entry = float(avg_entry_raw) if avg_entry_raw is not None else None
+            if side == "BUY":
+                new_qty = current_qty + qty
+                if new_qty > 0:
+                    if current_qty > 0 and avg_entry is not None:
+                        new_avg = ((current_qty * avg_entry) + (qty * price)) / new_qty
+                    else:
+                        new_avg = price
+                else:
+                    new_avg = None
+                pos["qty"] = float(new_qty)
+                pos["avg_entry_price"] = float(new_avg) if new_avg is not None else None
+            else:
+                new_qty = current_qty - qty
+                if new_qty <= 1e-12:
+                    pos["qty"] = 0.0
+                    pos["avg_entry_price"] = None
+                else:
+                    pos["qty"] = float(new_qty)
+            pos["ts_updated"] = fill_ts
+
+        positions: list[dict[str, Any]] = []
+        position_value = 0.0
+        total_entry_value = 0.0
+        total_unrealized_pnl = 0.0
+        for sym in sorted(position_state):
+            pos = position_state[sym]
+            qty_f = float(pos.get("qty") or 0.0)
+            if abs(qty_f) <= 1e-12:
+                continue
+            avg_f_raw = pos.get("avg_entry_price")
+            avg_f = float(avg_f_raw) if avg_f_raw is not None else None
+            quote = self.fetch_latest_market_quote_before(symbol=sym, ts_at=ts_utc)
+            mid_raw = (quote or {}).get("mid_price")
+            mid_f = float(mid_raw) if mid_raw is not None else None
+            mark = mid_f if mid_f is not None else (avg_f if avg_f is not None else 0.0)
+            value = float(qty_f) * float(mark)
+            unrealized = ((float(mark) - float(avg_f)) * float(qty_f)) if avg_f is not None else None
+            entry_value = (float(qty_f) * float(avg_f)) if avg_f is not None else None
+            position_value += float(value)
+            if entry_value is not None:
+                total_entry_value += float(entry_value)
+            if unrealized is not None:
+                total_unrealized_pnl += float(unrealized)
+            pnl_pct = None
+            if avg_f is not None and float(avg_f) > 0:
+                pnl_pct = (float(mark) / float(avg_f) - 1.0) * 100.0
+            if unrealized is None:
+                pnl_direction = "FLAT"
+            elif unrealized > 0:
+                pnl_direction = "PLUS"
+            elif unrealized < 0:
+                pnl_direction = "MINUS"
+            else:
+                pnl_direction = "FLAT"
+            positions.append(
+                {
+                    "symbol": sym,
+                    "qty": qty_f,
+                    "avg_entry_price": avg_f,
+                    "entry_value_krw": float(entry_value) if entry_value is not None else None,
+                    "mark_price": float(mark),
+                    "mid_price": mid_f,
+                    "value_krw": float(value),
+                    "unrealized_pnl_krw": unrealized,
+                    "unrealized_pnl_pct": float(pnl_pct) if pnl_pct is not None else None,
+                    "pnl_direction": pnl_direction,
+                    "ts_updated": pos.get("ts_updated"),
+                    "quote_ts": (quote or {}).get("ts"),
+                }
+            )
+
+        equity = float(cash) + float(position_value)
+        exposure_pct = (float(position_value) / float(equity) * 100.0) if float(equity) > 0 else 0.0
+        total_unrealized_pct_on_entry = (
+            (float(total_unrealized_pnl) / float(total_entry_value) * 100.0) if float(total_entry_value) > 0 else 0.0
+        )
+        total_unrealized_pct_on_equity = (
+            (float(total_unrealized_pnl) / float(equity) * 100.0) if float(equity) > 0 else 0.0
+        )
+        return {
+            "quote_currency": ccy,
+            "cash_krw": float(cash),
+            "position_value_krw": float(position_value),
+            "equity_krw": float(equity),
+            "exposure_pct": float(exposure_pct),
+            "total_entry_value_krw": float(total_entry_value),
+            "total_unrealized_pnl_krw": float(total_unrealized_pnl),
+            "total_unrealized_pnl_pct_on_entry": float(total_unrealized_pct_on_entry),
+            "total_unrealized_pnl_pct_on_equity": float(total_unrealized_pct_on_equity),
+            "positions_count": len(positions),
+            "positions": positions,
+            "reconstructed_at": ts_utc,
+            "reconstruction_source": "ledger_entries+fills+orders+market_quotes",
         }
 
     def paper_seed_exists(self, *, currency: str) -> bool:
@@ -1530,6 +1780,84 @@ class PostgresRepo:
             "expected_rr": expected_rr,
         }
 
+    def fetch_decisions_before(
+        self,
+        *,
+        ts_at: datetime,
+        judge_type: str | None = None,
+        symbol: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        ts_utc = _ensure_utc(ts_at)
+        lim = max(1, int(limit))
+        clauses = ["ts <= %s"]
+        params: list[Any] = [ts_utc]
+        if judge_type:
+            clauses.append("judge_type = %s")
+            params.append(judge_type)
+        if symbol:
+            clauses.append("symbol = %s")
+            params.append(symbol)
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                select decision_id, ts, symbol, judge_type, action, score, confidence, gates,
+                       selected_reasons, rejected_reasons, expected_cost_bps, expected_rr, run_id, rule_version_id
+                from decisions
+                where {' and '.join(clauses)}
+                order by ts desc
+                limit %s
+                """,
+                (*params, lim),
+            )
+            rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for (
+            decision_id,
+            ts,
+            sym,
+            judge_type_row,
+            action,
+            score,
+            confidence,
+            gates,
+            selected_reasons,
+            rejected_reasons,
+            expected_cost_bps,
+            expected_rr,
+            run_id,
+            rule_version_id,
+        ) in rows:
+            out.append(
+                {
+                    "decision_id": str(decision_id),
+                    "ts": ts,
+                    "symbol": sym,
+                    "judge_type": judge_type_row,
+                    "action": action,
+                    "score": score,
+                    "confidence": confidence,
+                    "gates": gates,
+                    "selected_reasons": selected_reasons,
+                    "rejected_reasons": rejected_reasons,
+                    "expected_cost_bps": expected_cost_bps,
+                    "expected_rr": expected_rr,
+                    "run_id": str(run_id) if run_id else None,
+                    "rule_version_id": str(rule_version_id) if rule_version_id else None,
+                }
+            )
+        return out
+
+    def fetch_latest_decision_before(
+        self,
+        *,
+        ts_at: datetime,
+        judge_type: str = "SAFE",
+        symbol: str | None = None,
+    ) -> dict[str, Any] | None:
+        rows = self.fetch_decisions_before(ts_at=ts_at, judge_type=judge_type, symbol=symbol, limit=1)
+        return rows[0] if rows else None
+
     def fetch_decision_by_id(self, *, decision_id: str) -> dict[str, Any] | None:
         try:
             did = uuid.UUID(str(decision_id))
@@ -1624,6 +1952,50 @@ class PostgresRepo:
             "payload": payload,
         }
 
+    def fetch_latest_event_before(
+        self,
+        *,
+        event_type: str,
+        ts_at: datetime,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        ts_utc = _ensure_utc(ts_at)
+        where = ["event_type=%s", "ts<=%s"]
+        params: list[Any] = [event_type, ts_utc]
+        if entity_type:
+            where.append("entity_type=%s")
+            params.append(str(entity_type))
+        if entity_id:
+            where.append("entity_id=%s")
+            params.append(str(entity_id))
+        where_sql = " and ".join(where)
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                select event_id, ts, event_type, entity_type, entity_id, run_id, rule_version_id, payload
+                from events
+                where {where_sql}
+                order by ts desc
+                limit 1
+                """,
+                tuple(params),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        event_id, ts, event_type2, entity_type2, entity_id2, run_id, rule_version_id, payload = row
+        return {
+            "event_id": str(event_id),
+            "ts": ts,
+            "event_type": event_type2,
+            "entity_type": entity_type2,
+            "entity_id": entity_id2,
+            "run_id": str(run_id) if run_id else None,
+            "rule_version_id": str(rule_version_id) if rule_version_id else None,
+            "payload": payload,
+        }
+
     def fetch_latest_trade_plan_event(self, *, prefer_active: bool = True, lookback_limit: int = 300) -> dict[str, Any] | None:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -1663,6 +2035,69 @@ class PostgresRepo:
 
     def fetch_latest_trade_plan(self, *, prefer_active: bool = True, lookback_limit: int = 300) -> dict[str, Any] | None:
         ev = self.fetch_latest_trade_plan_event(prefer_active=prefer_active, lookback_limit=lookback_limit)
+        if not ev:
+            return None
+        payload = ev.get("payload")
+        if not isinstance(payload, Mapping):
+            return None
+        return {"event_id": ev.get("event_id"), "ts": ev.get("ts"), **dict(payload)}
+
+    def fetch_latest_trade_plan_event_before(
+        self,
+        *,
+        ts_at: datetime,
+        prefer_active: bool = True,
+        lookback_limit: int = 300,
+    ) -> dict[str, Any] | None:
+        ts_utc = _ensure_utc(ts_at)
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select event_id, ts, event_type, entity_type, entity_id, run_id, rule_version_id, payload
+                from events
+                where event_type='TRADE_PLAN_SET'
+                  and ts <= %s
+                order by ts desc
+                limit %s
+                """,
+                (ts_utc, int(max(1, lookback_limit))),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return None
+
+        latest_any: dict[str, Any] | None = None
+        for event_id, ts, event_type, entity_type, entity_id, run_id, rule_version_id, payload in rows:
+            if not isinstance(payload, Mapping):
+                continue
+            ev = {
+                "event_id": str(event_id),
+                "ts": ts,
+                "event_type": event_type,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "run_id": str(run_id) if run_id else None,
+                "rule_version_id": str(rule_version_id) if rule_version_id else None,
+                "payload": payload,
+            }
+            if latest_any is None:
+                latest_any = ev
+            if bool(prefer_active) and _is_trade_plan_payload_active(payload, now_utc=ts_utc):
+                return ev
+        return latest_any
+
+    def fetch_latest_trade_plan_before(
+        self,
+        *,
+        ts_at: datetime,
+        prefer_active: bool = True,
+        lookback_limit: int = 300,
+    ) -> dict[str, Any] | None:
+        ev = self.fetch_latest_trade_plan_event_before(
+            ts_at=ts_at,
+            prefer_active=prefer_active,
+            lookback_limit=lookback_limit,
+        )
         if not ev:
             return None
         payload = ev.get("payload")
@@ -1798,6 +2233,48 @@ class PostgresRepo:
             "run_id": str(run_id) if run_id else None,
         }
 
+    def fetch_latest_reconciliation_before(self, *, ts_at: datetime, symbol: str | None = None) -> dict[str, Any] | None:
+        ts_utc = _ensure_utc(ts_at)
+        with self.connect() as conn, conn.cursor() as cur:
+            if symbol:
+                cur.execute(
+                    """
+                    select check_id, ts, scope, symbol, status, diff_summary, diff_payload, action_taken, run_id
+                    from reconciliation_checks
+                    where symbol=%s
+                      and ts <= %s
+                    order by ts desc
+                    limit 1
+                    """,
+                    (symbol, ts_utc),
+                )
+            else:
+                cur.execute(
+                    """
+                    select check_id, ts, scope, symbol, status, diff_summary, diff_payload, action_taken, run_id
+                    from reconciliation_checks
+                    where ts <= %s
+                    order by ts desc
+                    limit 1
+                    """,
+                    (ts_utc,),
+                )
+            row = cur.fetchone()
+        if not row:
+            return None
+        check_id, ts, scope, sym, status, diff_summary, diff_payload, action_taken, run_id = row
+        return {
+            "check_id": str(check_id),
+            "ts": ts,
+            "scope": scope,
+            "symbol": sym,
+            "status": status,
+            "diff_summary": diff_summary,
+            "diff_payload": diff_payload,
+            "action_taken": action_taken,
+            "run_id": str(run_id) if run_id else None,
+        }
+
     def fetch_pause_state(self) -> dict[str, Any]:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -1823,6 +2300,36 @@ class PostgresRepo:
             "run_id": str(run_id) if run_id else None,
         }
         paused = ts_resume is None
+        return {"paused": paused, "latest": latest}
+
+    def fetch_pause_state_at(self, *, ts_at: datetime) -> dict[str, Any]:
+        ts_utc = _ensure_utc(ts_at)
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select pause_id, ts_pause, ts_resume, reason_type, severity, auto_resumable, notes, run_id
+                from pause_log
+                where ts_pause <= %s
+                order by ts_pause desc
+                limit 1
+                """,
+                (ts_utc,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return {"paused": False, "latest": None}
+        pause_id, ts_pause, ts_resume, reason_type, severity, auto_resumable, notes, run_id = row
+        latest = {
+            "pause_id": str(pause_id),
+            "ts_pause": ts_pause,
+            "ts_resume": ts_resume,
+            "reason_type": reason_type,
+            "severity": severity,
+            "auto_resumable": auto_resumable,
+            "notes": notes,
+            "run_id": str(run_id) if run_id else None,
+        }
+        paused = ts_resume is None or _ensure_utc(ts_resume) > ts_utc
         return {"paused": paused, "latest": latest}
 
     def meeting_slot_exists(self, *, slot_key: str) -> bool:
@@ -2184,6 +2691,71 @@ class PostgresRepo:
                 {
                     "trade_id": str(trade_id),
                     "symbol": symbol,
+                    "ts_open": ts_open,
+                    "ts_close": ts_close,
+                    "side": side,
+                    "qty": qty,
+                    "avg_entry_price": avg_entry_price,
+                    "avg_exit_price": avg_exit_price,
+                    "realized_pnl": realized_pnl,
+                    "fees_total": fees_total,
+                    "pnl_bps": pnl_bps,
+                }
+            )
+        return out
+
+    def fetch_realized_trades_before(
+        self,
+        *,
+        ts_at: datetime,
+        symbol: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        ts_utc = _ensure_utc(ts_at)
+        lim = max(1, int(limit))
+        with self.connect() as conn, conn.cursor() as cur:
+            if symbol:
+                cur.execute(
+                    """
+                    select trade_id, symbol, ts_open, ts_close, side, qty, avg_entry_price, avg_exit_price, realized_pnl, fees_total, pnl_bps
+                    from realized_trades
+                    where ts_close <= %s
+                      and symbol=%s
+                    order by ts_close desc
+                    limit %s
+                    """,
+                    (ts_utc, symbol, lim),
+                )
+            else:
+                cur.execute(
+                    """
+                    select trade_id, symbol, ts_open, ts_close, side, qty, avg_entry_price, avg_exit_price, realized_pnl, fees_total, pnl_bps
+                    from realized_trades
+                    where ts_close <= %s
+                    order by ts_close desc
+                    limit %s
+                    """,
+                    (ts_utc, lim),
+                )
+            rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for (
+            trade_id,
+            sym,
+            ts_open,
+            ts_close,
+            side,
+            qty,
+            avg_entry_price,
+            avg_exit_price,
+            realized_pnl,
+            fees_total,
+            pnl_bps,
+        ) in rows:
+            out.append(
+                {
+                    "trade_id": str(trade_id),
+                    "symbol": sym,
                     "ts_open": ts_open,
                     "ts_close": ts_close,
                     "side": side,
