@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from ai_invest.runtime.paper_loop import _latest_quant_candidate_symbol, _plan_is_hold_activation
+from zoneinfo import ZoneInfo
+
+from ai_invest.runtime.paper_loop import (
+    _latest_quant_candidate_symbol,
+    _plan_is_hold_activation,
+    _resolve_runtime_trade_plan,
+)
+
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 class _RepoStub:
@@ -12,6 +21,21 @@ class _RepoStub:
     def fetch_latest_agent_daily_report(self, *, agent_name: str):  # type: ignore[no-untyped-def]
         _ = agent_name
         return self._row
+
+
+class _PlanRepoStub:
+    def __init__(self, plan: dict | None, sessions: list[dict] | None = None) -> None:
+        self._plan = plan
+        self._sessions = list(sessions or [])
+
+    def fetch_latest_trade_plan(self, *, prefer_active: bool = True, lookback_limit: int = 300):  # type: ignore[no-untyped-def]
+        _ = prefer_active
+        _ = lookback_limit
+        return self._plan
+
+    def fetch_meeting_sessions(self, *, limit: int = 10):  # type: ignore[no-untyped-def]
+        _ = limit
+        return list(self._sessions)
 
 
 def test_plan_is_hold_activation_detects_hold_variants() -> None:
@@ -66,3 +90,79 @@ def test_latest_quant_candidate_symbol_falls_back_to_suggested_plan() -> None:
     out = _latest_quant_candidate_symbol(repo=repo, max_age_minutes=180)
     assert out == "KRW-XRP"
 
+
+def test_resolve_runtime_trade_plan_returns_active_plan_without_bridge(monkeypatch) -> None:
+    fixed_now = datetime(2026, 3, 13, 1, 10, 0, tzinfo=timezone.utc)
+    repo = _PlanRepoStub(
+        {
+            "slot_key": "2026-03-13 10:05",
+            "symbol": "KRW-BTC",
+            "valid_from_kst": "2026-03-13T10:05:00+09:00",
+            "valid_to_kst": "2026-03-13T12:05:00+09:00",
+            "activation_gate": {"decision_effective": "HOLD", "hold_mode": "HOLD_CONDITIONAL"},
+        }
+    )
+    monkeypatch.setattr("ai_invest.runtime.paper_loop._utcnow", lambda: fixed_now)
+    plan = _resolve_runtime_trade_plan(repo=repo, rules_raw={"governance": {"plan_continuity": {"handoff_grace_minutes": 20}}})
+    assert plan is not None
+    assert plan.get("slot_key") == "2026-03-13 10:05"
+    assert bool((plan.get("activation_gate") or {}).get("handoff_pending")) is False
+
+
+def test_resolve_runtime_trade_plan_bridges_recent_expired_plan_while_meeting_open(monkeypatch) -> None:
+    fixed_now = datetime(2026, 3, 13, 1, 11, 0, tzinfo=timezone.utc)  # 10:11 KST
+    repo = _PlanRepoStub(
+        {
+            "slot_key": "2026-03-13 08:05",
+            "symbol": "KRW-BTC",
+            "valid_from_kst": "2026-03-13T08:05:00+09:00",
+            "valid_to_kst": "2026-03-13T10:05:00+09:00",
+            "activation_gate": {"decision_effective": "HOLD", "hold_mode": "HOLD_CONDITIONAL"},
+        },
+        sessions=[
+            {
+                "meeting_id": "mid-1",
+                "meeting_type": "DAILY_STRATEGY",
+                "status": "OPEN",
+                "started_at": datetime(2026, 3, 13, 10, 5, 10, tzinfo=KST),
+                "agenda": {"slot_key": "2026-03-13 10:05"},
+            }
+        ],
+    )
+    monkeypatch.setattr("ai_invest.runtime.paper_loop._utcnow", lambda: fixed_now)
+    plan = _resolve_runtime_trade_plan(
+        repo=repo,
+        rules_raw={"governance": {"meeting_window_min": 5, "plan_continuity": {"handoff_grace_minutes": 20}}},
+    )
+    assert plan is not None
+    assert bool(plan.get("handoff_bridge")) is True
+    assert bool((plan.get("activation_gate") or {}).get("handoff_pending")) is True
+    assert (plan.get("activation_gate") or {}).get("handoff_open_slot_key") == "2026-03-13 10:05"
+
+
+def test_resolve_runtime_trade_plan_drops_expired_plan_after_bridge_window(monkeypatch) -> None:
+    fixed_now = datetime(2026, 3, 13, 1, 40, 0, tzinfo=timezone.utc)  # 10:40 KST
+    repo = _PlanRepoStub(
+        {
+            "slot_key": "2026-03-13 08:05",
+            "symbol": "KRW-BTC",
+            "valid_from_kst": "2026-03-13T08:05:00+09:00",
+            "valid_to_kst": "2026-03-13T10:05:00+09:00",
+            "activation_gate": {"decision_effective": "HOLD", "hold_mode": "HOLD_CONDITIONAL"},
+        },
+        sessions=[
+            {
+                "meeting_id": "mid-1",
+                "meeting_type": "DAILY_STRATEGY",
+                "status": "OPEN",
+                "started_at": datetime(2026, 3, 13, 10, 5, 10, tzinfo=KST),
+                "agenda": {"slot_key": "2026-03-13 10:05"},
+            }
+        ],
+    )
+    monkeypatch.setattr("ai_invest.runtime.paper_loop._utcnow", lambda: fixed_now)
+    plan = _resolve_runtime_trade_plan(
+        repo=repo,
+        rules_raw={"governance": {"meeting_window_min": 5, "plan_continuity": {"handoff_grace_minutes": 20}}},
+    )
+    assert plan is None

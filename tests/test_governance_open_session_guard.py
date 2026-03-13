@@ -87,3 +87,34 @@ def test_close_or_skip_open_meeting_blocks_same_slot_recent_session(monkeypatch)
     assert blocked is True
     assert repo.updated == []
     assert repo.events == []
+
+
+def test_close_or_skip_open_meeting_closes_stale_same_slot_without_incoming_slot(monkeypatch):
+    fixed_now_kst = datetime(2026, 2, 24, 11, 45, 0, tzinfo=KST)
+    fixed_now_utc = fixed_now_kst.astimezone(timezone.utc)
+    repo = _RepoStub(
+        sessions=[
+            {
+                "meeting_id": "33333333-3333-3333-3333-333333333333",
+                "meeting_type": "DAILY_STRATEGY",
+                "status": "OPEN",
+                "started_at": datetime(2026, 2, 24, 11, 5, 0, tzinfo=KST),
+                "agenda": {"slot_key": "2026-02-24 11:00"},
+            }
+        ]
+    )
+
+    monkeypatch.setattr(gm, "_now_kst", lambda: fixed_now_kst)
+    monkeypatch.setattr(gm, "_utcnow", lambda: fixed_now_utc)
+
+    blocked = gm._close_or_skip_open_meeting(
+        repo=repo,  # type: ignore[arg-type]
+        rules_raw={"governance": {"meeting_window_min": 5, "max_open_meeting_minutes": 20}},
+        emit=None,
+        incoming_slot_key=None,
+    )
+    assert blocked is False
+    assert len(repo.updated) == 1
+    assert repo.updated[0]["status"] == "CLOSED"
+    assert len(repo.events) == 1
+    assert repo.events[0].payload.get("reason_code") == "MEETING_TIMEOUT"

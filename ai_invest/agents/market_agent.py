@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 from ai_invest.config.rules_loader import RulesConfig
 from ai_invest.domain.reason_codes import ReasonCode
+from ai_invest.runtime.edge_calibration import EdgeCalibrationDataset, evaluate_edge_calibration
 from ai_invest.runtime.position_state import parse_position_state
 from ai_invest.strategy.alpha_score import compute_alpha_score, load_alpha_score_config
 from ai_invest.strategy.spread_guard import evaluate_spread_guard
@@ -117,6 +118,8 @@ def market_agent_opine(
     learning_feedback = context.get("learning_feedback") if isinstance(context.get("learning_feedback"), Mapping) else {}
     research_signal = context.get("research_signal") if isinstance(context.get("research_signal"), Mapping) else {}
     runtime_controls = context.get("runtime_controls") if isinstance(context.get("runtime_controls"), Mapping) else {}
+    edge_calibration = context.get("edge_calibration") if isinstance(context.get("edge_calibration"), Mapping) else {}
+    edge_calibration_dataset = context.get("_edge_calibration_dataset")
     learning_enabled = bool(learning_feedback.get("enabled", False))
     learning_profile = (
         learning_feedback.get("symbol_profile") if isinstance(learning_feedback.get("symbol_profile"), Mapping) else {}
@@ -233,6 +236,31 @@ def market_agent_opine(
     min_edge_required_bps = float(base_min_edge_bps) + (
         float(dynamic_edge_penalty) if bool(min_edge_dynamic_enabled) else 0.0
     ) + float(runtime_min_edge_bps_adj)
+    edge_calibration_eval: dict[str, Any] = {}
+    if isinstance(edge_calibration_dataset, EdgeCalibrationDataset) and bool(edge_calibration.get("enabled", False)):
+        edge_calibration_eval = evaluate_edge_calibration(
+            dataset=edge_calibration_dataset,
+            alpha_raw=float(alpha_raw),
+            spread_bps=float(spread_bps),
+            atr_pct=float(atr_pct),
+            dv_zscore=float(dv_z),
+            regime=str(alpha_regime),
+            strategy_tag=str(alpha_strategy_tag),
+            current_expected_cost_bps=float(expected_cost_bps),
+        )
+        if bool(edge_calibration_eval.get("enabled", False)):
+            expected_net_edge_bps = float(
+                _as_float(edge_calibration_eval.get("predicted_after_cost_bps"), default=expected_net_edge_bps)
+            )
+            min_edge_required_bps = float(
+                _as_float(edge_calibration_eval.get("required_after_cost_bps"), default=min_edge_required_bps)
+            )
+            expected_edge_bps = float(
+                max(
+                    0.0,
+                    _as_float(edge_calibration_eval.get("gross_edge_bps"), default=expected_net_edge_bps + expected_cost_bps),
+                )
+            )
 
     current_qty = _as_float(pos_ctx.get("current_qty"), default=0.0)
     has_position = current_qty > 0.0
@@ -521,6 +549,16 @@ def market_agent_opine(
         + float(runtime_entry_alpha_adj)
     )
     entry_alpha_effective = min(0.95, max(float(entry_alpha_floor), float(entry_alpha_effective)))
+    if bool(edge_calibration_eval.get("enabled", False)):
+        calibrated_entry_alpha = max(
+            0.05,
+            _as_float(edge_calibration_eval.get("entry_alpha_threshold"), default=0.05),
+        )
+        # Once after-cost expectation is calibrated from realized outcomes,
+        # raw alpha becomes an explanatory feature rather than the hard gate itself.
+        entry_alpha_floor = min(float(entry_alpha_floor), 0.05)
+        entry_alpha_effective = min(float(entry_alpha_effective), 0.05, float(calibrated_entry_alpha))
+        entry_alpha_effective = min(0.95, max(float(entry_alpha_floor), float(entry_alpha_effective)))
 
     if (
         (not has_position)
@@ -580,6 +618,7 @@ def market_agent_opine(
                 "predicted_slippage_bps": float(predicted_slippage_bps),
                 "spread_bps": float(spread_bps),
                 "fee_total_bps": float(fee_total_bps),
+                "edge_calibration": dict(edge_calibration_eval) if edge_calibration_eval else dict(edge_calibration),
             },
             alpha_raw=alpha_raw,
             regime=alpha_regime,
@@ -622,6 +661,7 @@ def market_agent_opine(
                 "dv_zscore": float(dv_z),
                 "atr_pct": float(atr_pct),
                 "entry_alpha_effective": float(entry_alpha_effective),
+                "edge_calibration": dict(edge_calibration_eval) if edge_calibration_eval else dict(edge_calibration),
             },
             alpha_raw=alpha_raw,
             regime=alpha_regime,
@@ -724,6 +764,7 @@ def market_agent_opine(
                 "learning_feedback_avg_pnl_bps": float(feedback_avg_pnl_bps),
                 "daily_trades_count": int(daily_trades_count),
                 "daily_trades_soft_cap": int(daily_trades_soft_cap),
+                "edge_calibration": dict(edge_calibration_eval) if edge_calibration_eval else dict(edge_calibration),
             },
             alpha_raw=alpha_raw,
             regime=alpha_regime,
@@ -781,6 +822,7 @@ def market_agent_opine(
             "learning_feedback_avg_pnl_bps": float(feedback_avg_pnl_bps),
             "daily_trades_count": int(daily_trades_count),
             "daily_trades_soft_cap": int(daily_trades_soft_cap),
+            "edge_calibration": dict(edge_calibration_eval) if edge_calibration_eval else dict(edge_calibration),
         },
         alpha_raw=alpha_raw,
         regime=alpha_regime,

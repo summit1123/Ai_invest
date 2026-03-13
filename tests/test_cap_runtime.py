@@ -24,6 +24,8 @@ def test_cap_default_config_and_runtime_seed():
     assert cfg["conditions"]["min_alpha"] == 0.75
     assert cfg["conditions"]["sustain_seconds"] == 180
     assert cfg["promotion"]["target_position_pct_cap"] == 3.0
+    assert cfg["promotion"]["scoring_mode"] == "decay_score"
+    assert cfg["promotion"]["miss_decay"] == 0.5
 
     hold_mode = _activation_hold_mode(
         activation_decision_effective="HOLD",
@@ -34,6 +36,8 @@ def test_cap_default_config_and_runtime_seed():
     runtime_seed = _initial_cap_runtime(conditional_activation=cfg, decision_interval_sec=15)
     assert runtime_seed["required_passes"] == 12
     assert runtime_seed["consecutive_passes"] == 0
+    assert runtime_seed["promotion_score"] == 0.0
+    assert runtime_seed["promotion_score_threshold"] == 12.0
 
 
 def test_inter_slot_realtime_mode_only_enabled_for_live_conditional_hold():

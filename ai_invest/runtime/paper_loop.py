@@ -34,6 +34,11 @@ from ai_invest.market_data.upbit_ws import UpbitPublicStreamError, UpbitPublicWs
 from ai_invest.notifications.service import NotificationService
 from ai_invest.ops.reconciliation import record_reconciliation_check
 from ai_invest.research.news_signal import build_news_signal
+from ai_invest.runtime.edge_calibration import (
+    build_edge_calibration_dataset,
+    load_edge_calibration_config,
+    resolve_effective_cap_min_alpha,
+)
 from ai_invest.runtime.position_state import parse_position_state, with_hwm_update
 from ai_invest.runtime.runtime_controls import build_runtime_controls
 from ai_invest.storage.postgres import (
@@ -231,6 +236,76 @@ def _plan_is_hold_activation(plan: Mapping[str, Any] | None) -> bool:
     decision = str((gate or {}).get("decision") or "").strip().upper()
     hold_mode = str((gate or {}).get("hold_mode") or "").strip().upper()
     return bool(decision_effective == "HOLD" or decision == "HOLD" or hold_mode.startswith("HOLD"))
+
+
+def _slot_dt_from_key(slot_key: str | None) -> datetime | None:
+    value = str(slot_key or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value[:16], "%Y-%m-%d %H:%M").replace(tzinfo=KST).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _resolve_runtime_trade_plan(*, repo: PostgresRepo, rules_raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    latest_plan = repo.fetch_latest_trade_plan(prefer_active=True)
+    if not isinstance(latest_plan, Mapping):
+        return None
+    plan = dict(latest_plan)
+    if _trade_plan_is_active(plan):
+        return plan
+
+    gov_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    continuity_cfg = (gov_cfg.get("plan_continuity") or {}) if isinstance(gov_cfg, Mapping) else {}
+    window_min = max(3, _as_int(gov_cfg.get("meeting_window_min"), default=5))
+    handoff_grace_minutes = max(
+        int(window_min),
+        _as_int(continuity_cfg.get("handoff_grace_minutes"), default=max(20, window_min * 2)),
+    )
+    now_utc = _utcnow()
+    plan_valid_to = _parse_dt(str(plan.get("valid_to_kst") or plan.get("valid_to") or ""))
+    if plan_valid_to is None:
+        return None
+    if (now_utc - plan_valid_to).total_seconds() > float(handoff_grace_minutes) * 60.0:
+        return None
+
+    latest_slot_dt = _slot_dt_from_key(str(plan.get("slot_key") or ""))
+    sessions = repo.fetch_meeting_sessions(limit=10)
+    for row in sessions:
+        if str(row.get("meeting_type") or "").upper() != "DAILY_STRATEGY":
+            continue
+        if str(row.get("status") or "").upper() != "OPEN":
+            continue
+        agenda = row.get("agenda") if isinstance(row.get("agenda"), Mapping) else {}
+        open_slot_key = str(agenda.get("slot_key") or "").strip()
+        open_slot_dt = _slot_dt_from_key(open_slot_key)
+        if latest_slot_dt is not None and open_slot_dt is not None and open_slot_dt <= latest_slot_dt:
+            continue
+        started_at = row.get("started_at")
+        if isinstance(started_at, datetime):
+            started_utc = started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
+            bridge_expire_at = min(
+                now_utc + timedelta(minutes=handoff_grace_minutes),
+                started_utc.astimezone(timezone.utc) + timedelta(minutes=handoff_grace_minutes),
+            )
+        else:
+            bridge_expire_at = now_utc + timedelta(minutes=handoff_grace_minutes)
+        if bridge_expire_at <= now_utc:
+            continue
+        bridge = dict(plan)
+        activation_gate = dict(bridge.get("activation_gate") or {})
+        activation_gate["handoff_pending"] = True
+        activation_gate["handoff_reason"] = "AWAITING_NEXT_MEETING_CLOSE"
+        activation_gate["handoff_from_slot_key"] = str(plan.get("slot_key") or "")
+        activation_gate["handoff_open_slot_key"] = open_slot_key or None
+        activation_gate["handoff_open_meeting_id"] = str(row.get("meeting_id") or "") or None
+        activation_gate["handoff_expire_at_kst"] = bridge_expire_at.astimezone(KST).isoformat()
+        bridge["activation_gate"] = activation_gate
+        bridge["valid_to_kst"] = bridge_expire_at.astimezone(KST).isoformat()
+        bridge["handoff_bridge"] = True
+        return bridge
+    return None
 
 
 def _latest_quant_candidate_symbol(
@@ -456,6 +531,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
     hot_reload_enabled = bool(scheduling_cfg.get("rules_hot_reload_enabled", True))
     cap_runtime_state: dict[str, dict[str, Any]] = {}
     entry_confirm_state: dict[str, int] = {}
+    edge_calibration_state: dict[str, dict[str, Any]] = {}
     symbol_rr_cursor = 0
 
     for _i in range(cycles):
@@ -601,7 +677,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         plan_is_hold = False
         manage_open_position_only = False
         inter_slot_realtime_mode = False
-        plan = repo.fetch_latest_trade_plan()
+        plan = _resolve_runtime_trade_plan(repo=repo, rules_raw=raw_rules)
         if plan and _trade_plan_is_active(plan):
             p_sym = str(plan.get("symbol") or "").strip().upper()
             if p_sym:
@@ -799,6 +875,9 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 plan_activation_decision_effective = (
                     str(plan_activation_gate.get("decision_effective") or "").strip().upper() or None
                 )
+                plan_inter_slot_realtime = bool(plan_activation_gate.get("inter_slot_realtime_mode")) or bool(
+                    inter_slot_realtime_mode
+                )
                 if isinstance(plan.get("execution_plan"), dict):
                     plan_execution_plan = dict(plan.get("execution_plan") or {})
                 if isinstance(plan.get("allowed_actions"), dict):
@@ -813,11 +892,20 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 )
                 plan_target_pct = float(raw_plan_target_pct)
                 if str(plan_activation_decision_effective or plan_activation_decision or "").upper() == "HOLD":
+                    conditional_hold_target_pct = _as_float(
+                        plan_activation_gate.get("conditional_hold_target_pct"),
+                        default=float(raw_plan_target_pct or 0.0),
+                    )
                     plan_target_pct = 0.0
                     raw_plan_target_pct = 0.0
-                    if inter_slot_realtime_mode and universe_mode == "paper" and realtime_between_meetings:
-                        # HOLD plan between meetings: keep plan target at 0, but allow market-led micro entry.
-                        plan_allowed_actions["buy"] = True
+                    if plan_inter_slot_realtime:
+                        # Conditional HOLD keeps the policy cap alive between meetings.
+                        # Live keeps buy=False and lets runtime promotion / exploration decide.
+                        # Paper may open buy=True for data collection.
+                        plan_target_pct = float(max(0.0, conditional_hold_target_pct))
+                        raw_plan_target_pct = float(max(0.0, conditional_hold_target_pct))
+                        if universe_mode == "paper" and realtime_between_meetings:
+                            plan_allowed_actions["buy"] = True
                         if "sell" not in plan_allowed_actions:
                             plan_allowed_actions["sell"] = True
                         plan_activation_gate["inter_slot_realtime_mode"] = True
@@ -891,6 +979,56 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         )
         feat_map = asdict(feat)
         feat_map.update(alpha_features)
+        edge_calibration_cfg = load_edge_calibration_config(rules_raw=raw_rules)
+        edge_calibration_summary: dict[str, Any] = {"enabled": False, "symbol": symbol, "sample_count": 0}
+        edge_calibration_dataset = None
+        if bool(edge_calibration_cfg.get("enabled", False)):
+            cache_key = str(symbol).strip().upper()
+            cache_row = edge_calibration_state.get(cache_key) or {}
+            refresh_minutes = max(1, int(_as_int(edge_calibration_cfg.get("refresh_minutes"), default=10)))
+            cache_built_at = cache_row.get("built_at")
+            cache_rules_hash = str(cache_row.get("rules_hash") or "")
+            cache_valid = isinstance(cache_built_at, datetime) and (_utcnow() - cache_built_at) < timedelta(minutes=refresh_minutes)
+            if not cache_valid or cache_rules_hash != str(rules_hash):
+                calibration_outcomes = repo.fetch_decision_outcomes(
+                    symbol=symbol,
+                    limit=max(200, int(_as_int(edge_calibration_cfg.get("outcome_limit"), default=5000))),
+                )
+                calibration_trades = repo.fetch_realized_trades(
+                    symbol=symbol,
+                    limit=max(200, int(_as_int(edge_calibration_cfg.get("trade_limit"), default=5000))),
+                )
+                calibration_decision_ids = [
+                    str(row.get("decision_id") or "").strip()
+                    for row in list(calibration_outcomes or [])
+                    if str(row.get("decision_id") or "").strip()
+                ]
+                edge_calibration_dataset = build_edge_calibration_dataset(
+                    events=repo.fetch_events(
+                        event_type="SAFE_DECISION",
+                        entity_type="decisions",
+                        symbol=symbol,
+                        entity_ids=calibration_decision_ids,
+                        limit=max(
+                            max(200, len(calibration_decision_ids) + 20),
+                            int(_as_int(edge_calibration_cfg.get("safe_decision_limit"), default=5000)),
+                        ),
+                    ),
+                    outcomes=calibration_outcomes,
+                    trades=calibration_trades,
+                    symbol=symbol,
+                    now_utc=_utcnow(),
+                    rules_raw=raw_rules,
+                )
+                edge_calibration_state[cache_key] = {
+                    "built_at": _utcnow(),
+                    "rules_hash": str(rules_hash),
+                    "dataset": edge_calibration_dataset,
+                }
+            else:
+                edge_calibration_dataset = cache_row.get("dataset")
+            if edge_calibration_dataset is not None and hasattr(edge_calibration_dataset, "as_runtime_summary"):
+                edge_calibration_summary = dict(edge_calibration_dataset.as_runtime_summary())
         repo.insert_event(
             DbEvent(
                 event_id=uuid.uuid4(),
@@ -986,6 +1124,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "learning_feedback": dict(learning_feedback),
                 "research_signal": dict(research_signal),
                 "runtime_controls": dict(runtime_controls),
+                "edge_calibration": dict(edge_calibration_summary),
+                "_edge_calibration_dataset": edge_calibration_dataset,
                 "entry_confirmation": {
                     "required_bars": int(entry_confirm_bars),
                     "current_streak": int(_as_int(entry_confirm_state.get(symbol), default=0)),
@@ -1137,9 +1277,27 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             sustain_seconds=int((cap_cfg.get("conditions") or {}).get("sustain_seconds") or 180),
             loop_interval_seconds=int(decision_interval_sec),
         )
-        if int(_as_int(cap_state.get("required_passes"), default=0)) != int(required_passes):
+        promotion_cfg = (cap_cfg.get("promotion") or {}) if isinstance(cap_cfg.get("promotion"), Mapping) else {}
+        configured_score_threshold = _as_float(promotion_cfg.get("promotion_score_threshold"), default=0.0)
+        score_threshold = float(
+            max(
+                1.0,
+                float(configured_score_threshold if configured_score_threshold > 0.0 else float(required_passes)),
+            )
+        )
+        pass_score_weight = float(max(0.1, _as_float(promotion_cfg.get("pass_score_weight"), default=1.0)))
+        extra_pass_bonus = float(max(0.0, _as_float(promotion_cfg.get("extra_pass_bonus"), default=0.15)))
+        miss_decay = float(max(0.1, _as_float(promotion_cfg.get("miss_decay"), default=0.5)))
+        hard_block_reset = bool(promotion_cfg.get("hard_block_reset", True))
+        scoring_mode = str(promotion_cfg.get("scoring_mode") or "decay_score").strip().lower() or "decay_score"
+        if (
+            int(_as_int(cap_state.get("required_passes"), default=0)) != int(required_passes)
+            or abs(_as_float(cap_state.get("promotion_score_threshold"), default=score_threshold) - float(score_threshold)) > 1e-9
+        ):
             cap_state = {
                 "consecutive_passes": 0,
+                "promotion_score": 0.0,
+                "promotion_score_threshold": float(score_threshold),
                 "promoted_at": None,
                 "promote_expires_at": None,
                 "required_passes": int(required_passes),
@@ -1152,6 +1310,9 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             "last_eval_at": _utcnow().astimezone(KST).isoformat(),
             "consecutive_passes": int(_as_int(cap_state.get("consecutive_passes"), default=0)),
             "required_passes": int(required_passes),
+            "promotion_score": float(_as_float(cap_state.get("promotion_score"), default=0.0)),
+            "promotion_score_threshold": float(score_threshold),
+            "scoring_mode": str(scoring_mode),
             "promoted_at": cap_state.get("promoted_at"),
             "promote_expires_at": cap_state.get("promote_expires_at"),
         }
@@ -1172,10 +1333,15 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 cap_state["promoted_at"] = None
                 cap_state["promote_expires_at"] = None
                 cap_state["consecutive_passes"] = 0
+                cap_state["promotion_score"] = 0.0 if hard_block_reset else max(
+                    0.0,
+                    float(_as_float(cap_state.get("promotion_score"), default=0.0)) - float(miss_decay),
+                )
             if promote_expires_at is not None and now_utc >= promote_expires_at:
                 cap_state["promoted_at"] = None
                 cap_state["promote_expires_at"] = None
                 cap_state["consecutive_passes"] = 0
+                cap_state["promotion_score"] = 0.0
                 promotion_active = False
                 emit_cap_event(
                     "CAP_PROMOTION_EXPIRED",
@@ -1186,8 +1352,17 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     },
                 )
 
+            effective_min_alpha = resolve_effective_cap_min_alpha(
+                configured_min_alpha=_as_float(cond.get("min_alpha"), default=0.75),
+                edge_calibration=edge_calibration_summary,
+            )
+            alpha_condition_passed = (
+                float(market.expected_net_edge_bps) >= float(market.min_edge_required_bps)
+                if bool(edge_calibration_summary.get("enabled", False))
+                else float(market.alpha) >= float(effective_min_alpha)
+            )
             cond_results = {
-                "alpha": float(market.alpha) >= _as_float(cond.get("min_alpha"), default=0.75),
+                "alpha": bool(alpha_condition_passed),
                 "spread": float(snapshot.spread_bps) <= _as_float(cond.get("max_spread_bps"), default=1.5),
                 "vol_z": _as_float(feat_map.get("vol_zscore"), default=0.0) >= _as_float(cond.get("min_vol_z"), default=0.0),
                 "atr": _as_float(feat_map.get("atr_pct"), default=0.0) >= _as_float(cond.get("min_atr_pct"), default=0.08),
@@ -1197,6 +1372,10 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
 
             if hard_gate_blocked:
                 cap_state["consecutive_passes"] = 0
+                cap_state["promotion_score"] = 0.0 if hard_block_reset else max(
+                    0.0,
+                    float(_as_float(cap_state.get("promotion_score"), default=0.0)) - float(miss_decay),
+                )
                 emit_cap_event(
                     "CAP_BLOCKED_BY_HARD_GATE",
                     {
@@ -1213,12 +1392,17 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     },
                 )
             else:
+                current_score = float(_as_float(cap_state.get("promotion_score"), default=0.0))
                 if pass_count >= min_pass:
                     cap_state["consecutive_passes"] = int(_as_int(cap_state.get("consecutive_passes"), default=0)) + 1
+                    score_gain = float(pass_score_weight) + float(extra_pass_bonus) * float(max(0, pass_count - min_pass))
+                    cap_state["promotion_score"] = min(float(score_threshold), float(current_score + score_gain))
                 else:
                     cap_state["consecutive_passes"] = 0
+                    shortfall = max(1, int(min_pass - pass_count))
+                    cap_state["promotion_score"] = max(0.0, float(current_score) - float(miss_decay) * float(shortfall))
 
-                if (not promotion_active) and int(_as_int(cap_state.get("consecutive_passes"), default=0)) >= int(required_passes):
+                if (not promotion_active) and float(_as_float(cap_state.get("promotion_score"), default=0.0)) >= float(score_threshold):
                     promotion_ttl_minutes = max(1, _as_int(promotion.get("promotion_ttl_minutes"), default=120))
                     promote_expires = now_utc + timedelta(minutes=promotion_ttl_minutes)
                     cap_state["promoted_at"] = now_utc.astimezone(KST).isoformat()
@@ -1235,6 +1419,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                                 promotion.get("target_position_pct_cap"),
                                 default=3.0,
                             ),
+                            "promotion_score": float(_as_float(cap_state.get("promotion_score"), default=0.0)),
+                            "promotion_score_threshold": float(score_threshold),
                             "conditions": cond_results,
                         },
                     )
@@ -1249,10 +1435,19 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     "reason_code": "RG_CAP_PENDING",
                     "hard_gate_blocked": bool(hard_gate_blocked),
                     "conditions": cond_results,
+                    "effective_min_alpha": float(effective_min_alpha),
+                    "alpha_gate_mode": (
+                        "after_cost_calibrated"
+                        if bool(edge_calibration_summary.get("enabled", False))
+                        else "raw_alpha_threshold"
+                    ),
                     "pass_count": int(pass_count),
                     "min_pass_conditions": int(min_pass),
                     "consecutive_passes": int(_as_int(cap_state.get("consecutive_passes"), default=0)),
                     "required_passes": int(required_passes),
+                    "promotion_score": float(_as_float(cap_state.get("promotion_score"), default=0.0)),
+                    "promotion_score_threshold": float(score_threshold),
+                    "scoring_mode": str(scoring_mode),
                     "promotion_active": bool(promotion_active),
                 },
             )
@@ -1282,6 +1477,9 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 "last_eval_at": _utcnow().astimezone(KST).isoformat(),
                 "consecutive_passes": int(_as_int(cap_state.get("consecutive_passes"), default=0)),
                 "required_passes": int(required_passes),
+                "promotion_score": float(_as_float(cap_state.get("promotion_score"), default=0.0)),
+                "promotion_score_threshold": float(score_threshold),
+                "scoring_mode": str(scoring_mode),
                 "promoted_at": cap_state.get("promoted_at"),
                 "promote_expires_at": cap_state.get("promote_expires_at"),
             }

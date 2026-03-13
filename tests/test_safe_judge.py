@@ -461,6 +461,112 @@ class SafeJudgeTests(unittest.TestCase):
         self.assertEqual(decision.action, "HOLD")
         self.assertEqual(decision.selected_reasons, [ReasonCode.RG_MICRO_BLOCKED_POLICY.value])
 
+    def test_live_micro_runtime_hold_entry_can_buy_with_calibrated_after_cost(self) -> None:
+        payload = base_payload()
+        self.rules.raw.setdefault("universe", {})["mode"] = "live"
+        micro_cfg = self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})
+        micro_cfg["enabled_live"] = True
+        micro_cfg["allow_runtime_hold_entry"] = True
+        micro_cfg["require_calibration_live"] = True
+        micro_cfg["require_market_long"] = False
+        micro_cfg["max_spread_bps"] = 3.0
+        micro_cfg["max_position_pct"] = 12.0
+        micro_cfg["live_min_predicted_after_cost_bps"] = 0.0
+        payload["context"]["runtime_controls"] = {
+            "buy_enabled": True,
+            "max_position_pct": 20.0,
+            "actionable_target_floor_pct": 10.2,
+        }
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": False, "sell": True},
+            "target_position_pct": 12.0,
+            "activation_gate": {
+                "decision": "HOLD",
+                "decision_effective": "HOLD",
+                "hold_mode": "HOLD_CONDITIONAL",
+                "hard_plan_block": False,
+                "soft_plan_block": False,
+                "plan_execution_blocked": False,
+                "inter_slot_realtime_mode": True,
+                "final_plan_no_trade_declared": False,
+            },
+        }
+        payload["context"]["position"] = {"current_position_pct": 0.0}
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={
+                "signal": "HOLD",
+                "alpha": 0.91,
+                "signal_target_pct": 0.0,
+                "expected_net_edge_bps": -0.5,
+                "min_edge_required_bps": 4.0,
+                "reason_codes": [ReasonCode.RG_EDGE_TOO_LOW.value],
+                "reason": {
+                    "edge_calibration": {
+                        "predicted_after_cost_bps": 0.35,
+                        "required_after_cost_bps": 4.0,
+                        "uncertainty_bps": 2.5,
+                    }
+                },
+            },
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "BUY")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_CAP_PROMOTED.value])
+        self.assertEqual(bool(decision.gates.get("micro_mode_runtime_hold_entry_allowed")), True)
+        self.assertEqual(bool(decision.gates.get("micro_mode_live_exploration_edge_ok")), True)
+        self.assertGreaterEqual(float(decision.effective_target_pct or 0.0), 10.2)
+
+    def test_live_micro_runtime_hold_entry_requires_calibration_when_configured(self) -> None:
+        payload = base_payload()
+        self.rules.raw.setdefault("universe", {})["mode"] = "live"
+        micro_cfg = self.rules.raw.setdefault("governance", {}).setdefault("micro_mode", {})
+        micro_cfg["enabled_live"] = True
+        micro_cfg["allow_runtime_hold_entry"] = True
+        micro_cfg["require_calibration_live"] = True
+        micro_cfg["require_market_long"] = False
+        payload["context"]["runtime_controls"] = {
+            "buy_enabled": True,
+            "max_position_pct": 20.0,
+            "actionable_target_floor_pct": 10.2,
+        }
+        payload["context"]["trade_plan"] = {
+            "allowed_actions": {"buy": False, "sell": True},
+            "target_position_pct": 12.0,
+            "activation_gate": {
+                "decision": "HOLD",
+                "decision_effective": "HOLD",
+                "hold_mode": "HOLD_CONDITIONAL",
+                "hard_plan_block": False,
+                "soft_plan_block": False,
+                "plan_execution_blocked": False,
+                "inter_slot_realtime_mode": True,
+                "final_plan_no_trade_declared": False,
+            },
+        }
+
+        decision = safe_judge_decide(
+            payload,
+            rules=self.rules,
+            market={
+                "signal": "HOLD",
+                "alpha": 0.91,
+                "signal_target_pct": 0.0,
+                "expected_net_edge_bps": -0.5,
+                "min_edge_required_bps": 4.0,
+                "reason_codes": [ReasonCode.RG_EDGE_TOO_LOW.value],
+            },
+            regime={"trade_allowed": True},
+            risk={"veto": False},
+            ops={"veto": False},
+        )
+        self.assertEqual(decision.action, "HOLD")
+        self.assertEqual(decision.selected_reasons, [ReasonCode.RG_MICRO_BLOCKED_POLICY.value])
+
     def test_cap_promoted_paper_override_allows_buy_with_effective_target(self) -> None:
         payload = base_payload()
         payload["context"]["trade_plan"] = {

@@ -823,6 +823,12 @@ def _normalized_conditional_activation_config(
                 default=60,
             ),
             "promotion_ttl_minutes": _as_int(promotion.get("promotion_ttl_minutes"), default=120),
+            "promotion_score_threshold": _as_float(promotion.get("promotion_score_threshold"), default=0.0),
+            "scoring_mode": str(promotion.get("scoring_mode") or "decay_score"),
+            "pass_score_weight": _as_float(promotion.get("pass_score_weight"), default=1.0),
+            "extra_pass_bonus": _as_float(promotion.get("extra_pass_bonus"), default=0.15),
+            "miss_decay": _as_float(promotion.get("miss_decay"), default=0.5),
+            "hard_block_reset": bool(promotion.get("hard_block_reset", True)),
         },
     }
 
@@ -860,12 +866,20 @@ def _initial_cap_runtime(
     decision_interval_sec: int,
 ) -> dict[str, Any]:
     cond = conditional_activation.get("conditions") if isinstance(conditional_activation, Mapping) else {}
+    promotion = conditional_activation.get("promotion") if isinstance(conditional_activation, Mapping) else {}
     sustain_seconds = max(15, _as_int((cond or {}).get("sustain_seconds"), default=180))
     required_passes = max(1, int(math.ceil(float(sustain_seconds) / float(max(1, int(decision_interval_sec))))))
+    configured_threshold = _as_float((promotion or {}).get("promotion_score_threshold"), default=0.0)
+    promotion_score_threshold = max(
+        1.0,
+        float(configured_threshold if configured_threshold > 0.0 else float(required_passes)),
+    )
     return {
         "last_eval_at": None,
         "consecutive_passes": 0,
         "required_passes": int(required_passes),
+        "promotion_score": 0.0,
+        "promotion_score_threshold": float(promotion_score_threshold),
         "promoted_at": None,
         "promote_expires_at": None,
     }
@@ -1057,6 +1071,62 @@ def _should_recover_final_plan_no_trade(
     if not reasons:
         return False
     return reasons.issubset({"target_position_pct<=0", "allowed_actions.buy=false"})
+
+
+def _build_runtime_entry_policy(
+    *,
+    inter_slot_realtime_mode: bool,
+    plan_execution_blocked: bool,
+    resolved_allowed_actions: Mapping[str, Any],
+    resolved_target_position_pct: float,
+    activation_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    cap_cfg = (
+        activation_gate.get("conditional_activation")
+        if isinstance(activation_gate.get("conditional_activation"), Mapping)
+        else {}
+    )
+    cond = (cap_cfg.get("conditions") or {}) if isinstance(cap_cfg.get("conditions"), Mapping) else {}
+    cap_runtime = (
+        activation_gate.get("cap_runtime")
+        if isinstance(activation_gate.get("cap_runtime"), Mapping)
+        else {}
+    )
+    runtime_entry_allowed = bool(inter_slot_realtime_mode and not plan_execution_blocked)
+    mode = "CONDITIONAL_RUNTIME" if runtime_entry_allowed else "MEETING_LOCKED"
+    return {
+        "mode": mode,
+        "runtime_entry_allowed": bool(runtime_entry_allowed),
+        "entry_timing_owner": "realtime_loop" if runtime_entry_allowed else "meeting_plan",
+        "meeting_buy_flag": bool((resolved_allowed_actions or {}).get("buy")),
+        "meeting_sell_flag": bool((resolved_allowed_actions or {}).get("sell")),
+        "policy_cap_target_pct": float(_as_float(resolved_target_position_pct, default=0.0)),
+        "required_passes": int(_as_int(cap_runtime.get("required_passes"), default=0)),
+        "consecutive_passes": int(_as_int(cap_runtime.get("consecutive_passes"), default=0)),
+        "min_pass_conditions": int(_as_int(cond.get("min_pass_conditions"), default=0)),
+        "sustain_seconds": int(_as_int(cond.get("sustain_seconds"), default=0)),
+    }
+
+
+def _render_runtime_entry_policy_notes(policy: Mapping[str, Any]) -> str:
+    if not isinstance(policy, Mapping) or not bool(policy.get("runtime_entry_allowed")):
+        return ""
+    return "\n".join(
+        [
+            "[runtime_entry_policy]",
+            f"- runtime_entry_allowed={bool(policy.get('runtime_entry_allowed'))}",
+            f"- entry_timing_owner={str(policy.get('entry_timing_owner') or 'realtime_loop')}",
+            f"- meeting_buy_flag={bool(policy.get('meeting_buy_flag'))}",
+            f"- policy_cap_target_pct={float(_as_float(policy.get('policy_cap_target_pct'), default=0.0)):.1f}",
+            "- interpretation=meeting sets policy cap only; realtime loop may promote entry before next meeting",
+            (
+                "- promotion_rule="
+                f"min_pass_conditions={int(_as_int(policy.get('min_pass_conditions'), default=0))},"
+                f"sustain_seconds={int(_as_int(policy.get('sustain_seconds'), default=0))},"
+                f"required_passes={int(_as_int(policy.get('required_passes'), default=0))}"
+            ),
+        ]
+    )
 
 
 def _build_plan_consistency_checks(
@@ -4636,8 +4706,22 @@ def run_governance_meeting_now(
             blocked_reasons = [str(x).strip() for x in list(hard_plan_block_reasons) + list(soft_plan_block_reasons) if str(x).strip()]
             if blocked_reasons:
                 resolved_execution_lines.append(f"- blocked_reasons={','.join(blocked_reasons[:6])}")
+        runtime_entry_policy = _build_runtime_entry_policy(
+            inter_slot_realtime_mode=bool(inter_slot_realtime_mode),
+            plan_execution_blocked=bool(plan_execution_blocked),
+            resolved_allowed_actions=resolved_allowed_actions,
+            resolved_target_position_pct=float(resolved_target_position_pct),
+            activation_gate=activation_gate,
+        )
+        runtime_entry_notes = _render_runtime_entry_policy_notes(runtime_entry_policy)
         plan_notes = _clip(
-            "\n".join([x for x in [str(plan_notes or "").strip(), *resolved_execution_lines] if str(x).strip()]),
+            "\n".join(
+                [
+                    x
+                    for x in [str(runtime_entry_notes).strip(), str(plan_notes or "").strip(), *resolved_execution_lines]
+                    if str(x).strip()
+                ]
+            ),
             1200,
         )
         consistency_checks = _build_plan_consistency_checks(
@@ -4779,6 +4863,7 @@ def run_governance_meeting_now(
             "allocator_result": allocator_result,
             "cost_model": cost_model,
             "paper_live_policy": paper_live_policy,
+            "runtime_entry_policy": dict(runtime_entry_policy),
             "execution_playbook": execution_playbook,
             "improvement_roadmap": list(improvement_roadmap),
             "consistency_checks": consistency_checks,
@@ -5086,6 +5171,10 @@ def maybe_run_scheduled_governance_meeting(
     window_min = int((governance_cfg.get("meeting_window_min") or 5))
     catchup_enabled = bool(governance_cfg.get("catchup_enabled", True))
     catchup_lookback_hours = int(governance_cfg.get("catchup_lookback_hours") or 36)
+
+    # Sweep stale OPEN meetings every scheduler cycle so runtime handoff does not wait
+    # for the next slot to discover orphan sessions.
+    _close_or_skip_open_meeting(repo=repo, rules_raw=rules_raw, emit=None, incoming_slot_key=None)
 
     if force:
         slot_key = f"{now_kst.date().isoformat()} {now_kst.strftime('%H:%M')}"

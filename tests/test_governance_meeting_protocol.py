@@ -12,11 +12,13 @@ from ai_invest.meetings.governance_meeting import (
     OpsDraft,
     QuantPlanDraft,
     RiskDraft,
+    _build_runtime_entry_policy,
     _build_execution_plan,
     _build_plan_consistency_checks,
     enforce_final_trade_plan,
     _final_plan_declares_no_trade,
     _governance_llm_call_timeout_sec,
+    _render_runtime_entry_policy_notes,
     _run_with_timeout,
     _to_final_trade_plan_v2,
 )
@@ -400,3 +402,46 @@ def test_enforce_final_trade_plan_recovers_policy_cap_when_soft_veto_zeroes_meet
     assert out.allowed_actions.sell is True
     assert float(out.target_position_pct) == 8.0
     assert any("policy cap 8.0%" in str(x) for x in list(out.conflict_resolution or []))
+
+
+def test_runtime_entry_policy_marks_conditional_runtime_mode() -> None:
+    policy = _build_runtime_entry_policy(
+        inter_slot_realtime_mode=True,
+        plan_execution_blocked=False,
+        resolved_allowed_actions={"buy": False, "sell": True},
+        resolved_target_position_pct=10.0,
+        activation_gate={
+            "conditional_activation": {
+                "conditions": {
+                    "min_pass_conditions": 3,
+                    "sustain_seconds": 180,
+                }
+            },
+            "cap_runtime": {
+                "required_passes": 6,
+                "consecutive_passes": 0,
+            },
+        },
+    )
+    assert policy["mode"] == "CONDITIONAL_RUNTIME"
+    assert bool(policy["runtime_entry_allowed"]) is True
+    assert bool(policy["meeting_buy_flag"]) is False
+    assert float(policy["policy_cap_target_pct"]) == 10.0
+
+
+def test_runtime_entry_policy_notes_explain_realtime_ownership() -> None:
+    notes = _render_runtime_entry_policy_notes(
+        {
+            "runtime_entry_allowed": True,
+            "entry_timing_owner": "realtime_loop",
+            "meeting_buy_flag": False,
+            "policy_cap_target_pct": 10.0,
+            "min_pass_conditions": 3,
+            "sustain_seconds": 180,
+            "required_passes": 6,
+        }
+    )
+    assert "[runtime_entry_policy]" in notes
+    assert "runtime_entry_allowed=True" in notes
+    assert "entry_timing_owner=realtime_loop" in notes
+    assert "promotion_rule=min_pass_conditions=3,sustain_seconds=180,required_passes=6" in notes

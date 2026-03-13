@@ -213,12 +213,16 @@ governance:
     entry_mode: adaptive
     max_spread_bps: 8.0
     plan_hold_only: true
-    max_position_pct: 20.0
+    max_position_pct: 12.0
     max_daily_loss_pct: 0.5
     max_trades_per_day: 3
     require_market_long: false
     allow_plan_led_entry: true
-    enabled_live: false
+    allow_runtime_hold_entry: true
+    require_calibration_live: true
+    enabled_live: true
+    live_min_predicted_after_cost_bps: 0.0
+    live_max_uncertainty_bps: 8.0
     alpha_margin: 0.1
     edge_margin_bps: 10.0
     realtime_max_spread_mult: 1.15
@@ -259,6 +263,11 @@ governance:
         promotion_ttl_minutes: 120
         target_position_pct_cap: 20.0
         cooldown_after_promotion_minutes: 60
+        scoring_mode: decay_score
+        pass_score_weight: 1.0
+        extra_pass_bonus: 0.15
+        miss_decay: 0.5
+        hard_block_reset: true
       conditions:
         min_alpha: 0.75
         min_vol_z: 0.0
@@ -272,6 +281,7 @@ governance:
   plan_continuity:
     enabled: true
     min_hold_minutes: 152
+    handoff_grace_minutes: 20
     sticky_if_position_open: true
     switch_min_backtest_score_delta: 2.0
     switch_min_candidate_score_delta: 0.15
@@ -322,6 +332,23 @@ runtime_controller:
   allow_reversal_on_elevated_news: false
   performance_credit_bps: 25.0
   performance_penalty_bps: 25.0
+runtime_calibration:
+  enabled: true
+  refresh_minutes: 10
+  max_age_days: 365
+  safe_decision_limit: 5000
+  trade_limit: 5000
+  outcome_limit: 5000
+  min_samples: 24
+  alpha_entry_percentile: 0.6
+  alpha_promotion_percentile: 0.7
+  alpha_floor_min: 0.16
+  neighbor_k: 96
+  shrinkage_samples: 18.0
+  uncertainty_floor_bps: 4.0
+  uncertainty_mult: 1.1
+  min_required_after_cost_bps: 0.0
+  min_effective_samples: 6.0
 paper_mode:
   data_collection:
     enabled: true

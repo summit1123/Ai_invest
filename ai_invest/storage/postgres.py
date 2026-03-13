@@ -2528,15 +2528,44 @@ class PostgresRepo:
         return out
 
     def fetch_recent_events(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        return self.fetch_events(limit=limit)
+
+    def fetch_events(
+        self,
+        *,
+        event_type: str | None = None,
+        entity_type: str | None = None,
+        symbol: str | None = None,
+        entity_ids: list[str] | tuple[str, ...] | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if event_type:
+            clauses.append("event_type=%s")
+            params.append(str(event_type))
+        if entity_type:
+            clauses.append("entity_type=%s")
+            params.append(str(entity_type))
+        if symbol:
+            clauses.append("upper(coalesce(payload->>'symbol',''))=%s")
+            params.append(str(symbol).strip().upper())
+        if entity_ids:
+            normalized_ids = [str(x).strip() for x in list(entity_ids) if str(x).strip()]
+            if normalized_ids:
+                clauses.append("entity_id = any(%s)")
+                params.append(normalized_ids)
+        where_sql = f"where {' and '.join(clauses)}" if clauses else ""
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 select event_id, ts, event_type, entity_type, entity_id, run_id, rule_version_id, payload
                 from events
+                {where_sql}
                 order by ts desc
                 limit %s
                 """,
-                (limit,),
+                (*params, max(1, int(limit))),
             )
             rows = cur.fetchall()
         out: list[dict[str, Any]] = []
@@ -2717,17 +2746,29 @@ class PostgresRepo:
             )
         return out
 
-    def fetch_realized_trades(self, *, limit: int = 200) -> list[dict[str, Any]]:
+    def fetch_realized_trades(self, *, limit: int = 200, symbol: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                select trade_id, symbol, ts_open, ts_close, side, qty, avg_entry_price, avg_exit_price, realized_pnl, fees_total, pnl_bps
-                from realized_trades
-                order by ts_close desc
-                limit %s
-                """,
-                (limit,),
-            )
+            if symbol:
+                cur.execute(
+                    """
+                    select trade_id, symbol, ts_open, ts_close, side, qty, avg_entry_price, avg_exit_price, realized_pnl, fees_total, pnl_bps
+                    from realized_trades
+                    where symbol=%s
+                    order by ts_close desc
+                    limit %s
+                    """,
+                    (str(symbol), max(1, int(limit))),
+                )
+            else:
+                cur.execute(
+                    """
+                    select trade_id, symbol, ts_open, ts_close, side, qty, avg_entry_price, avg_exit_price, realized_pnl, fees_total, pnl_bps
+                    from realized_trades
+                    order by ts_close desc
+                    limit %s
+                    """,
+                    (max(1, int(limit)),),
+                )
             rows = cur.fetchall()
         out: list[dict[str, Any]] = []
         for (
@@ -2856,17 +2897,29 @@ class PostgresRepo:
             )
         return out
 
-    def fetch_decision_outcomes(self, *, limit: int = 200) -> list[dict[str, Any]]:
+    def fetch_decision_outcomes(self, *, limit: int = 200, symbol: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                select outcome_id, reviewed_at, decision_id, trade_id, symbol, ts_open, ts_close, outcome_label, error_type, root_cause
-                from decision_outcomes
-                order by reviewed_at desc
-                limit %s
-                """,
-                (limit,),
-            )
+            if symbol:
+                cur.execute(
+                    """
+                    select outcome_id, reviewed_at, decision_id, trade_id, symbol, ts_open, ts_close, outcome_label, error_type, root_cause
+                    from decision_outcomes
+                    where symbol=%s
+                    order by reviewed_at desc
+                    limit %s
+                    """,
+                    (str(symbol), max(1, int(limit))),
+                )
+            else:
+                cur.execute(
+                    """
+                    select outcome_id, reviewed_at, decision_id, trade_id, symbol, ts_open, ts_close, outcome_label, error_type, root_cause
+                    from decision_outcomes
+                    order by reviewed_at desc
+                    limit %s
+                    """,
+                    (max(1, int(limit)),),
+                )
             rows = cur.fetchall()
         out: list[dict[str, Any]] = []
         for outcome_id, reviewed_at, decision_id, trade_id, symbol, ts_open, ts_close, outcome_label, error_type, root_cause in rows:

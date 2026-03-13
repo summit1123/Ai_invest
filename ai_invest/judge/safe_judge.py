@@ -169,6 +169,8 @@ def safe_judge_decide(
     trade_plan_activation_decision_effective = _opt_str(payload, "context.trade_plan.activation_gate.decision_effective")
     trade_plan_hold_mode = _opt_str(payload, "context.trade_plan.activation_gate.hold_mode")
     trade_plan_cap_promoted = _opt_bool(payload, "context.trade_plan.activation_gate.cap_promoted")
+    trade_plan_inter_slot_realtime_mode = _opt_bool(payload, "context.trade_plan.activation_gate.inter_slot_realtime_mode")
+    trade_plan_final_no_trade = _opt_bool(payload, "context.trade_plan.activation_gate.final_plan_no_trade_declared")
     try:
         trade_plan_cap_runtime = _dot_get(payload, "context.trade_plan.activation_gate.cap_runtime")
     except Exception:
@@ -179,6 +181,7 @@ def safe_judge_decide(
     cash_krw = _opt_float(payload, "context.account.cash_krw")
     runtime_buy_enabled = bool((runtime_controls or {}).get("buy_enabled", True))
     runtime_max_position_pct = _opt_float(payload, "context.runtime_controls.max_position_pct")
+    runtime_actionable_floor_pct = _opt_float(payload, "context.runtime_controls.actionable_target_floor_pct")
     runtime_reason_codes = _extract_reason_codes(runtime_controls if isinstance(runtime_controls, Mapping) else None)
     market_signal_target_pct = None
     market_expected_edge_bps = None
@@ -186,6 +189,13 @@ def safe_judge_decide(
     market_expected_net_edge_bps = None
     market_min_edge_required_bps = None
     market_regime = None
+    market_reason_map = (market or {}).get("reason") if isinstance((market or {}).get("reason"), Mapping) else {}
+    market_edge_calibration = (
+        market_reason_map.get("edge_calibration") if isinstance(market_reason_map.get("edge_calibration"), Mapping) else {}
+    )
+    market_predicted_after_cost_bps = None
+    market_after_cost_required_bps = None
+    market_after_cost_uncertainty_bps = None
     if market is not None:
         try:
             market_signal_target_pct = float((market or {}).get("signal_target_pct"))
@@ -211,6 +221,18 @@ def safe_judge_decide(
             market_regime = str((market or {}).get("regime") or "").strip().upper() or None
         except Exception:
             market_regime = None
+        try:
+            market_predicted_after_cost_bps = float((market_edge_calibration or {}).get("predicted_after_cost_bps"))
+        except Exception:
+            market_predicted_after_cost_bps = None
+        try:
+            market_after_cost_required_bps = float((market_edge_calibration or {}).get("required_after_cost_bps"))
+        except Exception:
+            market_after_cost_required_bps = None
+        try:
+            market_after_cost_uncertainty_bps = float((market_edge_calibration or {}).get("uncertainty_bps"))
+        except Exception:
+            market_after_cost_uncertainty_bps = None
     market_reason_codes = _extract_reason_codes(market)
     regime_reason_codes = _extract_reason_codes(regime)
     risk_reason_codes = _extract_reason_codes(risk)
@@ -284,18 +306,24 @@ def safe_judge_decide(
         "trade_plan_activation_decision_effective": trade_plan_activation_decision_effective,
         "trade_plan_hold_mode": trade_plan_hold_mode,
         "trade_plan_cap_promoted": trade_plan_cap_promoted,
+        "trade_plan_inter_slot_realtime_mode": bool(trade_plan_inter_slot_realtime_mode),
+        "trade_plan_final_no_trade": bool(trade_plan_final_no_trade),
         "trade_plan_cap_runtime": trade_plan_cap_runtime if isinstance(trade_plan_cap_runtime, Mapping) else None,
         "signal_target_pct": market_signal_target_pct,
         "market_expected_edge_bps": market_expected_edge_bps,
         "market_expected_cost_bps": market_expected_cost_bps,
         "market_expected_net_edge_bps": market_expected_net_edge_bps,
         "market_min_edge_required_bps": market_min_edge_required_bps,
+        "market_predicted_after_cost_bps": market_predicted_after_cost_bps,
+        "market_after_cost_required_bps": market_after_cost_required_bps,
+        "market_after_cost_uncertainty_bps": market_after_cost_uncertainty_bps,
         "market_regime": market_regime,
         "effective_target_pct": effective_target_pct,
         "current_position_pct": current_position_pct,
         "cash_krw": cash_krw,
         "runtime_buy_enabled": bool(runtime_buy_enabled),
         "runtime_max_position_pct": runtime_max_position_pct,
+        "runtime_actionable_floor_pct": runtime_actionable_floor_pct,
         "runtime_reason_codes": [c.value for c in runtime_reason_codes],
         "market_reason_codes": [c.value for c in market_reason_codes],
         "regime_reason_codes": [c.value for c in regime_reason_codes],
@@ -441,9 +469,21 @@ def safe_judge_decide(
         micro_max_trades_per_day = int(micro_cfg.get("max_trades_per_day") or 5)
         micro_plan_hold_only = bool(micro_cfg.get("plan_hold_only", True))
         micro_allow_plan_led_entry = bool(micro_cfg.get("allow_plan_led_entry", False))
+        micro_allow_runtime_hold_entry = bool(micro_cfg.get("allow_runtime_hold_entry", True))
+        micro_require_calibration_live = bool(micro_cfg.get("require_calibration_live", True))
         micro_require_market_long = bool(micro_cfg.get("require_market_long", True))
         micro_ignore_cooldown_in_plan_led = bool(micro_cfg.get("ignore_market_cooldown_in_plan_led", False))
         micro_ignore_edge_in_plan_led = bool(micro_cfg.get("ignore_market_edge_in_plan_led", True))
+        micro_live_min_predicted_after_cost_bps = float(
+            micro_cfg.get("live_min_predicted_after_cost_bps")
+            if micro_cfg.get("live_min_predicted_after_cost_bps") is not None
+            else 0.0
+        )
+        micro_live_max_uncertainty_bps = float(
+            micro_cfg.get("live_max_uncertainty_bps")
+            if micro_cfg.get("live_max_uncertainty_bps") is not None
+            else 8.0
+        )
         micro_alpha_margin = float(
             micro_cfg.get("alpha_margin")
             or (0.10 if is_live_mode else 0.0)
@@ -470,9 +510,13 @@ def safe_judge_decide(
             "max_trades_per_day": int(micro_max_trades_per_day),
             "plan_hold_only": bool(micro_plan_hold_only),
             "allow_plan_led_entry": bool(micro_allow_plan_led_entry),
+            "allow_runtime_hold_entry": bool(micro_allow_runtime_hold_entry),
+            "require_calibration_live": bool(micro_require_calibration_live),
             "require_market_long": bool(micro_require_market_long),
             "ignore_market_cooldown_in_plan_led": bool(micro_ignore_cooldown_in_plan_led),
             "ignore_market_edge_in_plan_led": bool(micro_ignore_edge_in_plan_led),
+            "live_min_predicted_after_cost_bps": float(micro_live_min_predicted_after_cost_bps),
+            "live_max_uncertainty_bps": float(micro_live_max_uncertainty_bps),
             "alpha_margin": float(micro_alpha_margin),
             "edge_margin_bps": float(micro_edge_margin_bps),
             "realtime_min_alpha_delta": float(micro_realtime_min_alpha_delta),
@@ -490,6 +534,15 @@ def safe_judge_decide(
             or plan_hold_mode_value.startswith("HOLD")
         )
         plan_allows_buy = bool(trade_plan_buy_allowed is not False)
+        runtime_hold_entry_allowed = bool(
+            is_live_mode
+            and bool(micro_allow_runtime_hold_entry)
+            and bool(inter_slot_realtime_mode)
+            and bool(plan_is_hold)
+            and not bool(trade_plan_final_no_trade)
+            and bool(plan_gate_passed)
+        )
+        plan_allows_micro_entry = bool(plan_allows_buy or runtime_hold_entry_allowed)
         market_long_ok = bool(market_signal in {"BUY", "LONG"})
         signal_target_ok = bool(market_signal_target_pct is not None and float(market_signal_target_pct) > 0.0)
         market_led_ok = bool(market_long_ok and signal_target_ok)
@@ -512,6 +565,34 @@ def safe_judge_decide(
         if micro_require_market_long:
             trigger_ok = bool(market_led_ok)
             micro_entry_path = "market-led" if market_led_ok else "blocked"
+        live_calibration_ready = bool(market_predicted_after_cost_bps is not None)
+        live_calibration_uncertainty_ok = bool(
+            market_after_cost_uncertainty_bps is None
+            or float(market_after_cost_uncertainty_bps) <= float(micro_live_max_uncertainty_bps)
+        )
+        live_exploration_edge_ok = bool(
+            runtime_hold_entry_allowed
+            and micro_entry_path == "plan-led"
+            and (
+                (
+                    bool(live_calibration_ready)
+                    and float(market_predicted_after_cost_bps or 0.0) >= float(micro_live_min_predicted_after_cost_bps)
+                    and bool(live_calibration_uncertainty_ok)
+                )
+                if bool(micro_require_calibration_live)
+                else (
+                    (
+                        market_predicted_after_cost_bps is not None
+                        and float(market_predicted_after_cost_bps) >= float(micro_live_min_predicted_after_cost_bps)
+                        and bool(live_calibration_uncertainty_ok)
+                    )
+                    or (
+                        market_expected_net_edge_bps is not None
+                        and float(market_expected_net_edge_bps) >= float(net_edge_required + micro_edge_margin_bps)
+                    )
+                )
+            )
+        )
         market_has_cooldown_block = any(c == ReasonCode.RG_COOLDOWN_ACTIVE for c in market_reason_codes)
         market_has_edge_block = any(c == ReasonCode.RG_EDGE_TOO_LOW for c in market_reason_codes)
         # In plan-led micro entry, optionally ignore market cooldown/edge blocks and rely on
@@ -527,7 +608,7 @@ def safe_judge_decide(
         market_reason_blocked = bool(
             cooldown_block_applied
             or edge_block_applied
-            or market_edge_gate_blocked
+            or (market_edge_gate_blocked and not bool(live_exploration_edge_ok))
             or market_cost_gate_blocked
         )
 
@@ -535,7 +616,7 @@ def safe_judge_decide(
             bool(micro_enabled)
             and action == "HOLD"
             and market_signal not in {"SELL", "SHORT"}
-            and bool(plan_allows_buy)
+            and bool(plan_allows_micro_entry)
             and (plan_is_hold if micro_plan_hold_only else True)
         )
         micro_allowed_context = bool(micro_candidate_context and bool(trigger_ok))
@@ -583,8 +664,11 @@ def safe_judge_decide(
             and (
                 (not bool(is_live_mode))
                 or (
-                    market_expected_net_edge_bps is not None
-                    and float(market_expected_net_edge_bps) >= float(net_edge_required + micro_edge_margin_bps)
+                    bool(live_exploration_edge_ok)
+                    or (
+                        market_expected_net_edge_bps is not None
+                        and float(market_expected_net_edge_bps) >= float(net_edge_required + micro_edge_margin_bps)
+                    )
                 )
             )
             and (
@@ -603,6 +687,9 @@ def safe_judge_decide(
         gates["micro_mode_plan_gate_passed"] = bool(plan_gate_passed)
         gates["micro_mode_dynamic_min_alpha"] = float(dynamic_min_alpha)
         gates["micro_mode_dynamic_max_spread_bps"] = float(dynamic_max_spread_bps)
+        gates["micro_mode_runtime_hold_entry_allowed"] = bool(runtime_hold_entry_allowed)
+        gates["micro_mode_live_exploration_edge_ok"] = bool(live_exploration_edge_ok)
+        gates["micro_mode_live_calibration_ready"] = bool(live_calibration_ready)
 
         if micro_pass:
             action = "BUY"
@@ -610,6 +697,8 @@ def safe_judge_decide(
             if plan_led_ok and plan_target_for_execution is not None:
                 base_target = max(float(base_target), float(plan_target_for_execution))
             micro_target = min(float(micro_max_position_pct), float(base_target))
+            if bool(is_live_mode) and runtime_actionable_floor_pct is not None and float(runtime_actionable_floor_pct) > 0.0:
+                micro_target = max(float(micro_target), float(runtime_actionable_floor_pct))
             if runtime_max_position_pct is not None:
                 micro_target = min(float(micro_target), float(runtime_max_position_pct))
             effective_target_pct = float(max(0.0, micro_target))
