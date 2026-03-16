@@ -8,7 +8,7 @@ from ai_invest.meetings.governance_meeting import (
     _should_enable_inter_slot_realtime_mode,
     _stable_hash,
 )
-from ai_invest.runtime.paper_loop import _cap_required_passes
+from ai_invest.runtime.paper_loop import _cap_progress_pass_count, _cap_required_passes
 
 
 def test_cap_required_passes_rounds_up_by_loop_interval():
@@ -23,6 +23,7 @@ def test_cap_default_config_and_runtime_seed():
     assert cfg["auto_promote_to"] == "PAPER"
     assert cfg["conditions"]["min_alpha"] == 0.75
     assert cfg["conditions"]["sustain_seconds"] == 180
+    assert cfg["conditions"]["require_alpha_confirm"] is True
     assert cfg["promotion"]["target_position_pct_cap"] == 3.0
     assert cfg["promotion"]["scoring_mode"] == "decay_score"
     assert cfg["promotion"]["miss_decay"] == 0.5
@@ -130,3 +131,23 @@ def test_inputs_hash_is_deterministic_with_ordering_noise():
         )
     )
     assert changed_hash != hash_a
+
+
+def test_cap_progress_requires_alpha_when_configured() -> None:
+    progress_pass_count, mandatory_conditions_passed = _cap_progress_pass_count(
+        cond_results={"alpha": False, "spread": True, "vol_z": True, "atr": True},
+        min_pass=3,
+        require_alpha_confirm=True,
+    )
+    assert mandatory_conditions_passed is False
+    assert progress_pass_count == 2
+
+
+def test_cap_progress_allows_other_conditions_when_alpha_not_required() -> None:
+    progress_pass_count, mandatory_conditions_passed = _cap_progress_pass_count(
+        cond_results={"alpha": False, "spread": True, "vol_z": True, "atr": True},
+        min_pass=3,
+        require_alpha_confirm=False,
+    )
+    assert mandatory_conditions_passed is True
+    assert progress_pass_count == 3

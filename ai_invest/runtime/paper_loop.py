@@ -199,6 +199,7 @@ def _resolve_cap_config(activation_gate: Mapping[str, Any]) -> dict[str, Any]:
             "min_atr_pct": _as_float(conditions.get("min_atr_pct"), default=0.08),
             "sustain_seconds": max(15, _as_int(conditions.get("sustain_seconds"), default=180)),
             "min_pass_conditions": max(1, min(4, _as_int(conditions.get("min_pass_conditions"), default=3))),
+            "require_alpha_confirm": bool(conditions.get("require_alpha_confirm", True)),
         },
         "promotion": {
             "target_position_pct_cap": max(0.0, _as_float(promotion.get("target_position_pct_cap"), default=3.0)),
@@ -215,6 +216,19 @@ def _cap_required_passes(*, sustain_seconds: int, loop_interval_seconds: int) ->
     sec = max(1, int(loop_interval_seconds))
     sustain = max(1, int(sustain_seconds))
     return max(1, int(ceil(float(sustain) / float(sec))))
+
+
+def _cap_progress_pass_count(
+    *,
+    cond_results: Mapping[str, Any],
+    min_pass: int,
+    require_alpha_confirm: bool = True,
+) -> tuple[int, bool]:
+    raw_pass_count = sum(1 for value in dict(cond_results or {}).values() if bool(value))
+    mandatory_conditions_passed = bool((not require_alpha_confirm) or bool(cond_results.get("alpha")))
+    if mandatory_conditions_passed:
+        return int(raw_pass_count), True
+    return int(min(int(raw_pass_count), max(0, int(min_pass) - 1))), False
 
 
 def _trade_plan_is_active(plan: dict[str, Any]) -> bool:
@@ -306,6 +320,24 @@ def _resolve_runtime_trade_plan(*, repo: PostgresRepo, rules_raw: Mapping[str, A
         bridge["handoff_bridge"] = True
         return bridge
     return None
+
+
+def _market_input_for_safe_judge(market: MarketOpinion) -> dict[str, Any]:
+    payload = asdict(market)
+    reason = payload.get("reason")
+    if not isinstance(reason, Mapping):
+        reason = {}
+        payload["reason"] = reason
+    edge_calibration = reason.get("edge_calibration") if isinstance(reason.get("edge_calibration"), Mapping) else {}
+    if edge_calibration:
+        payload["edge_calibration"] = dict(edge_calibration)
+        if payload.get("predicted_after_cost_bps") is None:
+            payload["predicted_after_cost_bps"] = edge_calibration.get("predicted_after_cost_bps")
+        if payload.get("required_after_cost_bps") is None:
+            payload["required_after_cost_bps"] = edge_calibration.get("required_after_cost_bps")
+        if payload.get("after_cost_uncertainty_bps") is None:
+            payload["after_cost_uncertainty_bps"] = edge_calibration.get("uncertainty_bps")
+    return payload
 
 
 def _latest_quant_candidate_symbol(
@@ -1369,6 +1401,12 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             }
             pass_count = sum(1 for v in cond_results.values() if bool(v))
             min_pass = max(1, _as_int(cond.get("min_pass_conditions"), default=3))
+            require_alpha_confirm = bool(cond.get("require_alpha_confirm", True))
+            progress_pass_count, mandatory_conditions_passed = _cap_progress_pass_count(
+                cond_results=cond_results,
+                min_pass=min_pass,
+                require_alpha_confirm=require_alpha_confirm,
+            )
 
             if hard_gate_blocked:
                 cap_state["consecutive_passes"] = 0
@@ -1393,13 +1431,15 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 )
             else:
                 current_score = float(_as_float(cap_state.get("promotion_score"), default=0.0))
-                if pass_count >= min_pass:
+                if progress_pass_count >= min_pass:
                     cap_state["consecutive_passes"] = int(_as_int(cap_state.get("consecutive_passes"), default=0)) + 1
-                    score_gain = float(pass_score_weight) + float(extra_pass_bonus) * float(max(0, pass_count - min_pass))
+                    score_gain = float(pass_score_weight) + float(extra_pass_bonus) * float(
+                        max(0, progress_pass_count - min_pass)
+                    )
                     cap_state["promotion_score"] = min(float(score_threshold), float(current_score + score_gain))
                 else:
                     cap_state["consecutive_passes"] = 0
-                    shortfall = max(1, int(min_pass - pass_count))
+                    shortfall = max(1, int(min_pass - progress_pass_count))
                     cap_state["promotion_score"] = max(0.0, float(current_score) - float(miss_decay) * float(shortfall))
 
                 if (not promotion_active) and float(_as_float(cap_state.get("promotion_score"), default=0.0)) >= float(score_threshold):
@@ -1422,6 +1462,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                             "promotion_score": float(_as_float(cap_state.get("promotion_score"), default=0.0)),
                             "promotion_score_threshold": float(score_threshold),
                             "conditions": cond_results,
+                            "progress_pass_count": int(progress_pass_count),
+                            "mandatory_conditions_passed": bool(mandatory_conditions_passed),
                         },
                     )
 
@@ -1442,7 +1484,10 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                         else "raw_alpha_threshold"
                     ),
                     "pass_count": int(pass_count),
+                    "progress_pass_count": int(progress_pass_count),
                     "min_pass_conditions": int(min_pass),
+                    "mandatory_conditions": ["alpha"] if bool(require_alpha_confirm) else [],
+                    "mandatory_conditions_passed": bool(mandatory_conditions_passed),
                     "consecutive_passes": int(_as_int(cap_state.get("consecutive_passes"), default=0)),
                     "required_passes": int(required_passes),
                     "promotion_score": float(_as_float(cap_state.get("promotion_score"), default=0.0)),
@@ -1499,23 +1544,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         safe = safe_judge_decide(
             payload,
             rules=rules,
-            market={
-                "signal": market.signal,
-                "confidence": market.confidence,
-                "signal_target_pct": market.signal_target_pct,
-                "alpha": market.alpha,
-                "alpha_raw": market.alpha_raw,
-                "mom_s": market.mom_s,
-                "rev_s": market.rev_s,
-                "regime": market.regime,
-                "trend_strength": market.trend_strength,
-                "shock_strength": market.shock_strength,
-                "expected_edge_bps": market.expected_edge_bps,
-                "expected_cost_bps": market.expected_cost_bps,
-                "expected_net_edge_bps": market.expected_net_edge_bps,
-                "min_edge_required_bps": market.min_edge_required_bps,
-                "reason_codes": list(market.reason_codes or []),
-            },
+            market=_market_input_for_safe_judge(market),
             regime={"trade_allowed": regime.trade_allowed, "reason_codes": list(regime.reason_codes or [])},
             risk={"veto": risk.veto, "reason_codes": list(risk.reason_codes or [])},
             ops={"veto": ops_op.veto, "reason_codes": list(ops_op.reason_codes or [])},

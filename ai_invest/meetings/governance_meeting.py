@@ -815,6 +815,7 @@ def _normalized_conditional_activation_config(
             "min_atr_pct": _as_float(cond.get("min_atr_pct"), default=0.08),
             "sustain_seconds": int(sustain_seconds),
             "min_pass_conditions": int(min_pass_conditions),
+            "require_alpha_confirm": bool(cond.get("require_alpha_confirm", True)),
         },
         "promotion": {
             "target_position_pct_cap": _as_float(promotion.get("target_position_pct_cap"), default=3.0),

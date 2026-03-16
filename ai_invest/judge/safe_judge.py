@@ -193,6 +193,8 @@ def safe_judge_decide(
     market_edge_calibration = (
         market_reason_map.get("edge_calibration") if isinstance(market_reason_map.get("edge_calibration"), Mapping) else {}
     )
+    if not market_edge_calibration and isinstance((market or {}).get("edge_calibration"), Mapping):
+        market_edge_calibration = dict((market or {}).get("edge_calibration") or {})
     market_predicted_after_cost_bps = None
     market_after_cost_required_bps = None
     market_after_cost_uncertainty_bps = None
@@ -224,15 +226,28 @@ def safe_judge_decide(
         try:
             market_predicted_after_cost_bps = float((market_edge_calibration or {}).get("predicted_after_cost_bps"))
         except Exception:
-            market_predicted_after_cost_bps = None
+            try:
+                market_predicted_after_cost_bps = float((market or {}).get("predicted_after_cost_bps"))
+            except Exception:
+                market_predicted_after_cost_bps = None
         try:
             market_after_cost_required_bps = float((market_edge_calibration or {}).get("required_after_cost_bps"))
         except Exception:
-            market_after_cost_required_bps = None
+            try:
+                market_after_cost_required_bps = float((market or {}).get("required_after_cost_bps"))
+            except Exception:
+                market_after_cost_required_bps = None
         try:
             market_after_cost_uncertainty_bps = float((market_edge_calibration or {}).get("uncertainty_bps"))
         except Exception:
-            market_after_cost_uncertainty_bps = None
+            try:
+                market_after_cost_uncertainty_bps = float((market or {}).get("after_cost_uncertainty_bps"))
+            except Exception:
+                market_after_cost_uncertainty_bps = None
+    if market_predicted_after_cost_bps is None and market_expected_net_edge_bps is not None:
+        market_predicted_after_cost_bps = float(market_expected_net_edge_bps)
+    if market_after_cost_required_bps is None and market_min_edge_required_bps is not None:
+        market_after_cost_required_bps = float(market_min_edge_required_bps)
     market_reason_codes = _extract_reason_codes(market)
     regime_reason_codes = _extract_reason_codes(regime)
     risk_reason_codes = _extract_reason_codes(risk)
@@ -650,15 +665,26 @@ def safe_judge_decide(
             min(1.0, float(rules.cost_guard.max_spread_bps_entry)),
             float(rules.cost_guard.max_spread_bps_entry),
         )
+        micro_alpha_gate_bypassed_by_calibration = bool(
+            is_live_mode
+            and micro_entry_path == "plan-led"
+            and bool(live_exploration_edge_ok)
+        )
+        micro_base_alpha_pass = bool(
+            micro_alpha_gate_bypassed_by_calibration
+            or (market_alpha is not None and float(market_alpha) >= float(dynamic_min_alpha))
+        )
+        micro_live_alpha_pass = bool(
+            (not bool(is_live_mode))
+            or micro_alpha_gate_bypassed_by_calibration
+            or (market_alpha is not None and float(market_alpha) >= float(dynamic_min_alpha + micro_alpha_margin))
+        )
 
         micro_pass = (
             micro_allowed_context
             and not bool(market_reason_blocked)
-            and (market_alpha is not None and float(market_alpha) >= float(dynamic_min_alpha))
-            and (
-                not bool(is_live_mode)
-                or (market_alpha is not None and float(market_alpha) >= float(dynamic_min_alpha + micro_alpha_margin))
-            )
+            and bool(micro_base_alpha_pass)
+            and bool(micro_live_alpha_pass)
             and float(spread_bps) <= float(dynamic_max_spread_bps)
             and float(daily_loss_pct) <= float(micro_max_daily_loss_pct)
             and (
@@ -687,6 +713,11 @@ def safe_judge_decide(
         gates["micro_mode_plan_gate_passed"] = bool(plan_gate_passed)
         gates["micro_mode_dynamic_min_alpha"] = float(dynamic_min_alpha)
         gates["micro_mode_dynamic_max_spread_bps"] = float(dynamic_max_spread_bps)
+        gates["micro_mode_alpha_gate_passed"] = bool(micro_base_alpha_pass)
+        gates["micro_mode_live_alpha_gate_passed"] = bool(micro_live_alpha_pass)
+        gates["micro_mode_alpha_gate_bypassed_by_calibration"] = bool(
+            micro_alpha_gate_bypassed_by_calibration
+        )
         gates["micro_mode_runtime_hold_entry_allowed"] = bool(runtime_hold_entry_allowed)
         gates["micro_mode_live_exploration_edge_ok"] = bool(live_exploration_edge_ok)
         gates["micro_mode_live_calibration_ready"] = bool(live_calibration_ready)

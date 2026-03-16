@@ -4,8 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 from zoneinfo import ZoneInfo
 
+from ai_invest.agents.market_agent import MarketOpinion
 from ai_invest.runtime.paper_loop import (
     _latest_quant_candidate_symbol,
+    _market_input_for_safe_judge,
     _plan_is_hold_activation,
     _resolve_runtime_trade_plan,
 )
@@ -166,3 +168,42 @@ def test_resolve_runtime_trade_plan_drops_expired_plan_after_bridge_window(monke
         rules_raw={"governance": {"meeting_window_min": 5, "plan_continuity": {"handoff_grace_minutes": 20}}},
     )
     assert plan is None
+
+
+def test_market_input_for_safe_judge_preserves_edge_calibration_reason() -> None:
+    market = MarketOpinion(
+        signal="HOLD",
+        confidence=0.55,
+        target_position_pct=0.0,
+        signal_target_pct=0.0,
+        alpha=0.12,
+        mom_s=0.0,
+        rev_s=0.0,
+        strength=0.0,
+        vol_scale=0.8,
+        strategy_tag=None,
+        entry_allowed=False,
+        exit_reason=None,
+        reason_codes=["RG_EDGE_TOO_LOW"],
+        reason={
+            "edge_calibration": {
+                "enabled": True,
+                "predicted_after_cost_bps": 1.25,
+                "required_after_cost_bps": 4.0,
+                "uncertainty_bps": 2.0,
+            }
+        },
+        alpha_raw=0.12,
+        regime="RANGE",
+        trend_strength=0.0,
+        shock_strength=0.0,
+        expected_edge_bps=12.0,
+        expected_cost_bps=8.0,
+        expected_net_edge_bps=4.0,
+        min_edge_required_bps=4.0,
+    )
+    payload = _market_input_for_safe_judge(market)
+    assert payload["reason"]["edge_calibration"]["predicted_after_cost_bps"] == 1.25
+    assert payload["predicted_after_cost_bps"] == 1.25
+    assert payload["required_after_cost_bps"] == 4.0
+    assert payload["after_cost_uncertainty_bps"] == 2.0
