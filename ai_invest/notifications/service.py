@@ -520,6 +520,57 @@ class NotificationService:
             payload=payload,
         )
 
+    def notify_resume(
+        self,
+        *,
+        event_id: uuid.UUID,
+        symbol: str,
+        resume_reason: str,
+        run_id: uuid.UUID,
+        recon_ok_count: int | None = None,
+    ) -> None:
+        try:
+            chat_id = telegram_client.chat_id_ops()
+        except Exception as exc:  # pragma: no cover
+            self._repo.insert_notification_delivery(
+                delivery_id=uuid.uuid4(),
+                event_id=event_id,
+                channel="TELEGRAM",
+                template_id="tpl_resume_notice",
+                severity="NORMAL",
+                status="FAILED",
+                attempt_count=0,
+                last_error=f"telegram config error: {exc}",
+                dedupe_key=None,
+                payload={"event": {"symbol": symbol, "resume_reason": resume_reason}},
+                sent_at=None,
+            )
+            return
+        payload = {
+            **_ts_payload(),
+            "symbol": symbol,
+            "resume_reason": resume_reason,
+            "run_id": str(run_id),
+            "recon_ok_count": int(recon_ok_count) if recon_ok_count is not None else "-",
+        }
+        dedupe_key = f"OPS:RESUME:{resume_reason}:{symbol}"
+        self._deliver_telegram(
+            event_id=event_id,
+            template_id="tpl_resume_notice",
+            severity="NORMAL",
+            chat_id=chat_id,
+            dedupe_key=dedupe_key,
+            payload=payload,
+        )
+        self._deliver_discord_webhook(
+            event_id=event_id,
+            template_id="tpl_resume_notice",
+            severity="NORMAL",
+            webhook_env="DISCORD_WEBHOOK_FINANCE_ALERTS",
+            dedupe_key=dedupe_key,
+            payload=payload,
+        )
+
     def notify_tax_export_done(self, *, event_id: uuid.UUID, export_id: str, year: int, month: int) -> None:
         try:
             chat_id = telegram_client.chat_id_review()

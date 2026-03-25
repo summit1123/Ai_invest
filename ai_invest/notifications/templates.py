@@ -224,6 +224,17 @@ def tpl_recon_fail(data: Mapping[str, Any]) -> str:
     )
 
 
+def tpl_resume_notice(data: Mapping[str, Any]) -> str:
+    return (
+        "[운영] 거래 재개 (RESUME)\n"
+        f"- 시각(KST): {data.get('ts_kst')}\n"
+        f"- 종목: {data.get('symbol')}\n"
+        f"- 재개 사유: {data.get('resume_reason')}\n"
+        f"- 정합성 확인: {data.get('recon_ok_count')}회\n"
+        f"- 실행 ID: {data.get('run_id')}\n"
+    )
+
+
 def tpl_safe_decision(data: Mapping[str, Any]) -> str:
     reasons = data.get("reasons") if isinstance(data.get("reasons"), list) else []
     ctx = _as_mapping(data.get("context"))
