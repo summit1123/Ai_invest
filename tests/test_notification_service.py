@@ -26,6 +26,7 @@ class NotificationServiceTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=True,
+                send_discord=False,
                 notify_safe_enabled=False,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
@@ -54,6 +55,7 @@ class NotificationServiceTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                send_discord=False,
                 notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
@@ -92,6 +94,7 @@ class NotificationServiceTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                send_discord=False,
                 notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
@@ -146,6 +149,7 @@ class NotificationServiceTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                send_discord=False,
                 notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
@@ -181,6 +185,7 @@ class NotificationServiceTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                send_discord=False,
                 notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
@@ -215,6 +220,7 @@ class NotificationServiceTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                send_discord=False,
                 notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
@@ -244,6 +250,7 @@ class NotificationServiceTests(unittest.TestCase):
             repo,  # type: ignore[arg-type]
             ctx=NotificationContext(
                 send_telegram=False,
+                send_discord=False,
                 notify_safe_enabled=True,
                 notify_safe_hold=True,
                 notify_safe_change_only=True,
@@ -264,6 +271,37 @@ class NotificationServiceTests(unittest.TestCase):
         self.assertEqual(row.get("template_id"), "tpl_engineering_change_announced")
         self.assertEqual(row.get("status"), "PENDING")
         self.assertIn("tpv2-1", str((row.get("payload") or {}).get("event")))
+
+    def test_notify_pause_records_discord_pending_when_send_disabled(self) -> None:
+        repo = _FakeRepo()
+        svc = NotificationService(
+            repo,  # type: ignore[arg-type]
+            ctx=NotificationContext(
+                send_telegram=False,
+                send_discord=False,
+                notify_safe_enabled=True,
+                notify_safe_hold=True,
+                notify_safe_change_only=True,
+                dedupe_within_sec=60,
+            ),
+        )
+        with patch("ai_invest.notifications.service.telegram_client.chat_id_ops", return_value="-100123"):
+            with patch("ai_invest.notifications.service.discord_client.get_webhook_url", return_value="https://discord.test/webhook"):
+                svc.notify_pause(
+                    event_id=uuid.uuid4(),
+                    symbol="KRW-BTC",
+                    reason_type="RECON_FAIL",
+                    run_id=uuid.uuid4(),
+                )
+
+        self.assertEqual(len(repo.rows), 2)
+        telegram_row = repo.rows[0]
+        discord_row = repo.rows[1]
+        self.assertEqual(telegram_row.get("channel"), "TELEGRAM")
+        self.assertEqual(telegram_row.get("status"), "PENDING")
+        self.assertEqual(discord_row.get("channel"), "DISCORD")
+        self.assertEqual(discord_row.get("status"), "PENDING")
+
 
 
 if __name__ == "__main__":

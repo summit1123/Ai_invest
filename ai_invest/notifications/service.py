@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from zoneinfo import ZoneInfo
 
-from ai_invest.notifications import telegram_client
+from ai_invest.notifications import discord_client, telegram_client
 from ai_invest.notifications.templates import render
 from ai_invest.storage.postgres import PostgresRepo
 
@@ -42,6 +42,7 @@ def _stable_hash(obj: Any) -> str:
 @dataclass(frozen=True)
 class NotificationContext:
     send_telegram: bool
+    send_discord: bool
     notify_safe_enabled: bool
     notify_safe_hold: bool
     notify_safe_change_only: bool
@@ -56,6 +57,7 @@ def load_notification_context() -> NotificationContext:
         dedupe_sec = 60
     return NotificationContext(
         send_telegram=parse_bool(os.environ.get("SEND_TELEGRAM", "")),
+        send_discord=parse_bool(os.environ.get("SEND_DISCORD", "1")),
         notify_safe_enabled=parse_bool(os.environ.get("NOTIFY_SAFE_DECISION_ENABLED", "0")),
         notify_safe_hold=parse_bool(os.environ.get("NOTIFY_SAFE_DECISION_HOLD", "")),
         notify_safe_change_only=parse_bool(os.environ.get("NOTIFY_SAFE_DECISION_CHANGE_ONLY", "1")),
@@ -172,6 +174,86 @@ class NotificationService:
             last_error=result.error,
             dedupe_key=dedupe_key,
             payload={"telegram": {"chat_id": chat_id, "message_id": result.message_id}, "event": payload},
+            sent_at=_utcnow() if result.ok else None,
+        )
+
+    def _deliver_discord_webhook(
+        self,
+        *,
+        event_id: uuid.UUID,
+        template_id: str,
+        severity: str,
+        webhook_env: str,
+        payload: Mapping[str, Any],
+        dedupe_key: str | None = None,
+        username: str = "finance-alerts",
+    ) -> None:
+        delivery_id = uuid.uuid4()
+        text = render(template_id, payload)
+        try:
+            webhook_url = discord_client.get_webhook_url(preferred_env=webhook_env)
+        except Exception as exc:
+            self._repo.insert_notification_delivery(
+                delivery_id=delivery_id,
+                event_id=event_id,
+                channel="DISCORD",
+                template_id=template_id,
+                severity=severity,
+                status="SKIPPED",
+                attempt_count=0,
+                last_error=f"discord webhook missing: {exc}",
+                dedupe_key=dedupe_key,
+                payload={"discord": {"webhook_env": webhook_env}, "event": payload},
+                sent_at=None,
+            )
+            return
+
+        if dedupe_key and self._ctx.dedupe_within_sec > 0:
+            if self._repo.was_notification_sent_recently(dedupe_key=dedupe_key, within_sec=self._ctx.dedupe_within_sec):
+                self._repo.insert_notification_delivery(
+                    delivery_id=delivery_id,
+                    event_id=event_id,
+                    channel="DISCORD",
+                    template_id=template_id,
+                    severity=severity,
+                    status="SKIPPED",
+                    attempt_count=0,
+                    last_error=f"dedupe skip within {self._ctx.dedupe_within_sec}s",
+                    dedupe_key=dedupe_key,
+                    payload={"discord": {"webhook_env": webhook_env}, "event": payload},
+                    sent_at=None,
+                )
+                return
+
+        if not self._ctx.send_discord:
+            self._repo.insert_notification_delivery(
+                delivery_id=delivery_id,
+                event_id=event_id,
+                channel="DISCORD",
+                template_id=template_id,
+                severity=severity,
+                status="PENDING",
+                attempt_count=0,
+                last_error="SEND_DISCORD disabled",
+                dedupe_key=dedupe_key,
+                payload={"discord": {"webhook_env": webhook_env}, "event": payload},
+                sent_at=None,
+            )
+            return
+
+        result = discord_client.send_message(webhook_url=webhook_url, text=text, username=username)
+        status = "SENT" if result.ok else "FAILED"
+        self._repo.insert_notification_delivery(
+            delivery_id=delivery_id,
+            event_id=event_id,
+            channel="DISCORD",
+            template_id=template_id,
+            severity=severity,
+            status=status,
+            attempt_count=1,
+            last_error=result.error,
+            dedupe_key=dedupe_key,
+            payload={"discord": {"webhook_env": webhook_env, "status_code": result.status_code}, "event": payload},
             sent_at=_utcnow() if result.ok else None,
         )
 
@@ -365,18 +447,28 @@ class NotificationService:
                 sent_at=None,
             )
             return
+        payload = {
+            **_ts_payload(),
+            "symbol": symbol,
+            "diff_summary": diff_summary,
+            "run_id": str(run_id),
+        }
+        dedupe_key = f"OPS:RECON_FAIL:{symbol}"
         self._deliver_telegram(
             event_id=event_id,
             template_id="tpl_recon_fail",
             severity="CRITICAL",
             chat_id=chat_id,
-            dedupe_key=f"OPS:RECON_FAIL:{symbol}",
-            payload={
-                **_ts_payload(),
-                "symbol": symbol,
-                "diff_summary": diff_summary,
-                "run_id": str(run_id),
-            },
+            dedupe_key=dedupe_key,
+            payload=payload,
+        )
+        self._deliver_discord_webhook(
+            event_id=event_id,
+            template_id="tpl_recon_fail",
+            severity="CRITICAL",
+            webhook_env="DISCORD_WEBHOOK_FINANCE_ALERTS",
+            dedupe_key=dedupe_key,
+            payload=payload,
         )
 
     def notify_pause(
@@ -404,18 +496,28 @@ class NotificationService:
                 sent_at=None,
             )
             return
+        payload = {
+            **_ts_payload(),
+            "symbol": symbol,
+            "reason_type": reason_type,
+            "run_id": str(run_id),
+        }
+        dedupe_key = f"OPS:PAUSE:{reason_type}:{symbol}"
         self._deliver_telegram(
             event_id=event_id,
             template_id="tpl_pause_critical",
             severity="CRITICAL",
             chat_id=chat_id,
-            dedupe_key=f"OPS:PAUSE:{reason_type}:{symbol}",
-            payload={
-                **_ts_payload(),
-                "symbol": symbol,
-                "reason_type": reason_type,
-                "run_id": str(run_id),
-            },
+            dedupe_key=dedupe_key,
+            payload=payload,
+        )
+        self._deliver_discord_webhook(
+            event_id=event_id,
+            template_id="tpl_pause_critical",
+            severity="CRITICAL",
+            webhook_env="DISCORD_WEBHOOK_FINANCE_ALERTS",
+            dedupe_key=dedupe_key,
+            payload=payload,
         )
 
     def notify_tax_export_done(self, *, event_id: uuid.UUID, export_id: str, year: int, month: int) -> None:
