@@ -8,7 +8,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping
-from urllib.parse import urlencode
+from urllib.parse import urlencode, unquote
 
 import requests
 
@@ -45,7 +45,7 @@ def _to_query_text(params: Mapping[str, Any]) -> str:
                 items.append((str(key), str(v)))
         else:
             items.append((str(key), str(raw)))
-    return urlencode(items, doseq=True)
+    return unquote(urlencode(items, doseq=True))
 
 
 class UpbitPrivateApiError(RuntimeError):
@@ -104,7 +104,7 @@ class UpbitPrivateClient:
         )
 
     def _jwt(self, *, params: Mapping[str, Any] | None = None) -> str:
-        header = {"alg": "HS256", "typ": "JWT"}
+        header = {"alg": "HS512", "typ": "JWT"}
         payload: dict[str, Any] = {"access_key": self._access_key, "nonce": str(uuid.uuid4())}
         params_map = dict(params or {})
         if params_map:
@@ -114,7 +114,7 @@ class UpbitPrivateClient:
                 payload["query_hash_alg"] = "SHA512"
         h = _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
         p = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-        sig = hmac.new(self._secret_key.encode("utf-8"), f"{h}.{p}".encode("utf-8"), hashlib.sha256).digest()
+        sig = hmac.new(self._secret_key.encode("utf-8"), f"{h}.{p}".encode("utf-8"), hashlib.sha512).digest()
         return f"{h}.{p}.{_b64url(sig)}"
 
     def _request(self, *, method: str, path: str, params: Mapping[str, Any] | None = None) -> Any:
