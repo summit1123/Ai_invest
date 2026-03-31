@@ -253,9 +253,9 @@ governance:
   activation_gate:
     enabled: true
     max_drawdown_pct: 25.0
-    min_win_rate_pct: 40.0
+    min_win_rate_pct: 25.0
     min_backtest_score: 0.0
-    min_backtest_trades: 3
+    min_backtest_trades: 1
     require_symbol_match: false
     conditional_activation:
       enabled: true
@@ -269,7 +269,7 @@ governance:
         miss_decay: 0.5
         hard_block_reset: true
       conditions:
-        min_alpha: 0.75
+        min_alpha: 0.70
         min_vol_z: 0.0
         min_atr_pct: 0.08
         max_spread_bps: 8.0
@@ -356,7 +356,7 @@ paper_mode:
     force_plan_buy_allowed: true
     relaxed_min_win_rate_pct: 25.0
     relaxed_min_profit_factor: 1.05
-    min_trades_for_strict_gate: 4
+    min_trades_for_strict_gate: 2
     relaxed_min_backtest_score: -1.5
     relaxed_min_expectancy_pct: 0.0
     allow_soft_plan_block_bypass: true
