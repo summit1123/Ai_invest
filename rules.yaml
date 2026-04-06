@@ -117,7 +117,7 @@ strategy:
     ema_slow: 60
     exit_rsi: 45
     atr_ref_pct: 1.3
-    entry_alpha: 0.82
+    entry_alpha: 0.74
     strong_alpha: 0.9
     atr_block_pct: 2.5
     ret_long_mins: 60
@@ -201,32 +201,32 @@ reporting:
   weekly_review_time_kst: '21:00'
 as_of_date: '2026-02-09'
 cost_guard:
-  max_total_cost_bps: 16.0
-  max_spread_bps_entry: 6.0
-  entry_cost_buffer_bps: 8.0
-  min_expected_edge_bps: 34.0
-  max_predicted_slippage_bps: 8.0
+  max_total_cost_bps: 20.0
+  max_spread_bps_entry: 7.0
+  entry_cost_buffer_bps: 5.0
+  min_expected_edge_bps: 24.0
+  max_predicted_slippage_bps: 12.0
 governance:
   micro_mode:
     enabled: true
-    min_alpha: 0.80
+    min_alpha: 0.74
     entry_mode: adaptive
-    max_spread_bps: 5.0
+    max_spread_bps: 6.0
     plan_hold_only: true
-    max_position_pct: 15.0
-    max_daily_loss_pct: 0.4
-    max_trades_per_day: 1
+    max_position_pct: 18.0
+    max_daily_loss_pct: 0.5
+    max_trades_per_day: 2
     require_market_long: true
     allow_plan_led_entry: true
     allow_runtime_hold_entry: false
     require_calibration_live: true
     enabled_live: true
-    live_min_predicted_after_cost_bps: 12.0
-    live_max_uncertainty_bps: 5.0
-    alpha_margin: 0.16
-    edge_margin_bps: 18.0
-    realtime_max_spread_mult: 0.95
-    realtime_min_alpha_delta: 0.02
+    live_min_predicted_after_cost_bps: 6.0
+    live_max_uncertainty_bps: 7.0
+    alpha_margin: 0.10
+    edge_margin_bps: 10.0
+    realtime_max_spread_mult: 1.05
+    realtime_min_alpha_delta: -0.02
     realtime_between_meetings: false
     inter_slot_symbol_policy: plan_only
     realtime_symbol_max_age_min: 60
@@ -269,12 +269,12 @@ governance:
         miss_decay: 0.5
         hard_block_reset: true
       conditions:
-        min_alpha: 0.82
-        min_vol_z: 0.8
-        min_atr_pct: 0.12
-        max_spread_bps: 5.0
-        sustain_seconds: 600
-        min_pass_conditions: 4
+        min_alpha: 0.74
+        min_vol_z: 0.2
+        min_atr_pct: 0.08
+        max_spread_bps: 6.5
+        sustain_seconds: 240
+        min_pass_conditions: 3
       auto_promote_to: PAPER
     live_execution_enabled: true
   catchup_enabled: true
