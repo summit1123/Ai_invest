@@ -798,6 +798,7 @@ class NotificationService:
         rationale_summary: str | None = None,
         activation_status: str | None = None,
         activation_gate: Mapping[str, Any] | None = None,
+        runtime_entry_policy: Mapping[str, Any] | None = None,
     ) -> None:
         try:
             chat_id = telegram_client.chat_id_meeting()
@@ -812,7 +813,13 @@ class NotificationService:
                 attempt_count=0,
                 last_error=f"telegram config error: {exc}",
                 dedupe_key=None,
-                payload={"event": {"slot_key": slot_key, "symbol": symbol}},
+                payload={
+                    "event": {
+                        "slot_key": slot_key,
+                        "symbol": symbol,
+                        "runtime_entry_policy": dict(runtime_entry_policy or {}),
+                    }
+                },
                 sent_at=None,
             )
             return
@@ -824,6 +831,7 @@ class NotificationService:
                 "target": target_position_pct,
                 "valid_to": valid_to_kst,
                 "allowed": dict(allowed_actions or {}),
+                "runtime_entry_policy": dict(runtime_entry_policy or {}),
             }
         )
         self._deliver_telegram(
@@ -847,6 +855,7 @@ class NotificationService:
                 "rationale_summary": rationale_summary or "",
                 "activation_status": activation_status,
                 "activation_gate": dict(activation_gate or {}),
+                "runtime_entry_policy": dict(runtime_entry_policy or {}),
             },
         )
 

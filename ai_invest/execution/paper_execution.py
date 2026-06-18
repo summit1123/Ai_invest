@@ -64,6 +64,17 @@ def _fee_rate_bps(rules: RulesConfig, *, side: str) -> float:
     return float(fees.get("fallback_ask_fee_bps", 5.0))
 
 
+def _min_order_target_krw(rules: RulesConfig) -> float:
+    min_order_krw = float(rules.execution.min_order_krw)
+    cfg = rules.raw.get("runtime_controller", {}) if isinstance(rules.raw, dict) else {}
+    try:
+        buffer_mult = float(cfg.get("min_order_buffer_mult") or 1.0)
+    except Exception:
+        buffer_mult = 1.0
+    buffer_mult = max(1.0, min(buffer_mult, 1.20))
+    return max(float(min_order_krw), float(min_order_krw) * float(buffer_mult))
+
+
 def _slippage_bps(fill_price: float, ref_price: float, *, side: str) -> float:
     if ref_price <= 0:
         return 0.0
@@ -101,6 +112,7 @@ class PaperExecutor:
         strategy_tag: str | None = None,
         exit_reason: str | None = None,
         cooldown_minutes: int | None = None,
+        allow_min_order_round_up: bool = False,
     ) -> PaperExecutionResult | None:
         action = action.upper()
         if action not in {"BUY", "SELL"}:
@@ -150,6 +162,7 @@ class PaperExecutor:
                     if open_positions >= int(max_open_positions):
                         return None
             min_order_krw = int(rules.execution.min_order_krw)
+            min_order_target_krw = _min_order_target_krw(rules)
             price = snapshot.best_bid  # post-only maker bias
             if cash_balance <= 0:
                 return None
@@ -184,7 +197,15 @@ class PaperExecutor:
                 buy_qty = min(buy_qty, max_affordable_qty)
 
                 if buy_qty * float(price) < float(min_order_krw):
-                    return None
+                    if (
+                        not bool(allow_min_order_round_up)
+                        or current_qty > 0
+                        or float(cash_balance) < float(min_order_target_krw)
+                    ):
+                        return None
+                    buy_qty = min(float(min_order_target_krw) / float(price), float(max_affordable_qty))
+                    if buy_qty * float(price) < float(min_order_target_krw):
+                        return None
                 qty = float(buy_qty)
             side = "BUY"
         else:

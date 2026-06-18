@@ -157,6 +157,14 @@ def _activation_mode_line(activation_status: str, activation_gate: Mapping[str, 
     decision = str(activation_gate.get("decision") or "").strip().upper()
     effective = str(activation_gate.get("decision_effective") or "").strip().upper()
     if status:
+        if status == "ACTIVE_LIVE_DATA_COLLECTION":
+            return "실행 모드: 실거래 데이터 수집 모드입니다. 회의는 정책 상한만 정하고, 실시간 루프가 진입 시점을 판단합니다."
+        if status == "ACTIVE_HOLD":
+            return "실행 모드: 회의 플랜은 HOLD지만, 실시간 루프가 슬롯 중간 승격 조건을 계속 감시합니다."
+        if status == "ACTIVE_DATA_COLLECTION":
+            return "실행 모드: 페이퍼 데이터 수집 모드입니다. 관측과 학습을 우선하고 실거래는 하지 않습니다."
+        if status == "ACTIVE_PAPER":
+            return "실행 모드: 페이퍼 운영 상태입니다. 실거래는 하지 않습니다."
         if status == "ACTIVE":
             return "실행 모드: 현재 플랜이 활성 상태입니다."
         if status == "PAPER_ONLY":
@@ -170,6 +178,45 @@ def _activation_mode_line(activation_status: str, activation_gate: Mapping[str, 
     if effective == "HOLD" or decision == "HOLD":
         return "실행 모드: HOLD(관망) 상태입니다."
     return "실행 모드: 정책 게이트 기준으로 실시간 평가 중입니다."
+
+
+def _runtime_entry_policy_line(runtime_entry_policy: Mapping[str, Any], *, activation_status: str | None = None) -> str:
+    policy = _as_mapping(runtime_entry_policy)
+    if not policy:
+        return ""
+
+    runtime_allowed = _to_bool(policy.get("runtime_entry_allowed"))
+    promotion_enabled = _to_bool(policy.get("runtime_promotion_enabled"))
+    learning_mode = _to_bool(policy.get("learning_mode"))
+    exploration_enabled = _to_bool(policy.get("exploration_enabled"))
+    mode = str(policy.get("mode") or activation_status or "").strip().upper()
+    floor_bps = _as_bps(policy.get("min_predicted_after_cost_bps"), digits=2)
+    min_pass_conditions = _as_int(policy.get("min_pass_conditions"))
+    sustain_seconds = _as_int(policy.get("sustain_seconds"))
+    required_passes = _as_int(policy.get("required_passes"))
+
+    if runtime_allowed is True and (learning_mode is True or mode == "LIVE_DATA_COLLECTION"):
+        headline = "런타임 운영: 회의는 정책 상한만 정하고, 실시간 루프가 학습용 진입 여부를 최종 판단합니다."
+    elif runtime_allowed is True and promotion_enabled is True:
+        headline = "런타임 운영: 회의 플랜이 HOLD여도 실시간 루프가 조건 충족 시 BUY로 승격할 수 있습니다."
+    elif runtime_allowed is False:
+        headline = "런타임 운영: 회의 플랜대로만 집행하며 슬롯 중간 진입 승격은 사용하지 않습니다."
+    else:
+        headline = "런타임 운영: 회의 플랜과 별도로 실시간 루프가 슬롯 중간 평가를 수행합니다."
+
+    details: list[str] = []
+    if mode:
+        details.append(f"mode {mode}")
+    if floor_bps != "-":
+        details.append(f"after-cost floor {floor_bps}")
+    if min_pass_conditions != "-" or sustain_seconds != "-" or required_passes != "-":
+        details.append(f"승격 규칙 {min_pass_conditions}조건/{sustain_seconds}초/{required_passes}회")
+    if exploration_enabled is True:
+        details.append("탐색 진입 사용")
+    elif exploration_enabled is False and runtime_allowed is True:
+        details.append("탐색 진입 비활성")
+
+    return headline if not details else f"{headline} ({', '.join(details)})"
 
 
 def _plain_exec_state(activation_gate: Mapping[str, Any]) -> tuple[str, str]:
@@ -442,6 +489,13 @@ def tpl_meeting_summary(data: Mapping[str, Any]) -> str:
     used_llm = bool(assistant_meta.get("used_llm") or False)
     model = assistant_meta.get("model")
     trade_plan = _as_mapping(data.get("trade_plan"))
+    activation_status = str(trade_plan.get("activation_status") or "")
+    activation_gate = _as_mapping(trade_plan.get("activation_gate"))
+    mode_line = _activation_mode_line(activation_status, activation_gate) if trade_plan else ""
+    runtime_line = _runtime_entry_policy_line(
+        _as_mapping(trade_plan.get("runtime_entry_policy")),
+        activation_status=activation_status,
+    )
 
     source_line = "- 생성: deterministic"
     if used_llm:
@@ -471,6 +525,8 @@ def tpl_meeting_summary(data: Mapping[str, Any]) -> str:
         + plan_line
         + f"- 실행 이해: {action_hint}\n"
         + f"- 이번 슬롯 허용: 매수 {_as_bool_ko(buy_flag)}, 매도 {_as_bool_ko(sell_flag)}\n"
+        + (f"- {mode_line}\n" if mode_line else "")
+        + (f"- {runtime_line}\n" if runtime_line else "")
         + "\n"
         + f"{_clip(body, 1800)}\n"
     )
@@ -511,9 +567,11 @@ def tpl_trade_plan_set(data: Mapping[str, Any]) -> str:
     allowed = _as_mapping(data.get("allowed_actions"))
     constraints = _as_mapping(data.get("constraints"))
     activation_gate = _as_mapping(data.get("activation_gate"))
+    runtime_entry_policy = _as_mapping(data.get("runtime_entry_policy"))
     activation_status = str(data.get("activation_status") or "-")
     exec_state_title, exec_state_detail = _plain_exec_state(activation_gate)
     mode_line = _activation_mode_line(activation_status, activation_gate)
+    runtime_line = _runtime_entry_policy_line(runtime_entry_policy, activation_status=activation_status)
     action_hint = _human_trade_action_hint(
         action=str(data.get("action") or ""),
         buy=allowed.get("buy"),
@@ -528,11 +586,12 @@ def tpl_trade_plan_set(data: Mapping[str, Any]) -> str:
         f"- 유효시간(KST): {data.get('valid_from_kst')} ~ {data.get('valid_to_kst')}\n"
         f"- 허용 동작: 매수 {_as_bool_ko(allowed.get('buy'))}, 매도 {_as_bool_ko(allowed.get('sell'))}\n"
         f"- {mode_line}\n"
-        f"- 현재 실행 판정: {exec_state_title} / {exec_state_detail}\n"
-        f"- 과매매 방지: 재진입 대기 {_as_int(data.get('cooldown_minutes'))}분, 리밸런싱 밴드 {_as_pct(data.get('rebalance_band_pct'), digits=2)}\n"
-        f"- 실행 제약: 스프레드 {_as_bps(constraints.get('max_spread_bps'), digits=2)} 이하, 슬리피지 {_as_bps(constraints.get('max_slippage_bps'), digits=2)} 이하, 종목 비중 {_as_pct(constraints.get('max_position_pct'), digits=2)} 이하\n"
-        f"- 근거 요약: {_clip(data.get('rationale_summary'), 240)}\n"
-        "- 운영 안내: 유효시간이 끝나기 전에 다음 회의 플랜이 나오는지 확인해 주세요.\n"
+        + (f"- {runtime_line}\n" if runtime_line else "")
+        + f"- 현재 실행 판정: {exec_state_title} / {exec_state_detail}\n"
+        + f"- 과매매 방지: 재진입 대기 {_as_int(data.get('cooldown_minutes'))}분, 리밸런싱 밴드 {_as_pct(data.get('rebalance_band_pct'), digits=2)}\n"
+        + f"- 실행 제약: 스프레드 {_as_bps(constraints.get('max_spread_bps'), digits=2)} 이하, 슬리피지 {_as_bps(constraints.get('max_slippage_bps'), digits=2)} 이하, 종목 비중 {_as_pct(constraints.get('max_position_pct'), digits=2)} 이하\n"
+        + f"- 근거 요약: {_clip(data.get('rationale_summary'), 240)}\n"
+        + "- 운영 안내: 유효시간이 끝나기 전에 다음 회의 플랜이 나오는지 확인해 주세요.\n"
     )
 
 

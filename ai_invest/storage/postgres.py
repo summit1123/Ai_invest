@@ -661,6 +661,67 @@ class PostgresRepo:
             )
             conn.commit()
 
+    def fetch_open_orders(
+        self,
+        *,
+        symbol: str | None = None,
+        statuses: Sequence[str] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        wanted = [str(s).strip().upper() for s in list(statuses or ["NEW", "ACK", "PARTIAL"]) if str(s).strip()]
+        if not wanted:
+            wanted = ["NEW", "ACK", "PARTIAL"]
+        sql = """
+            select order_id, ts_created, symbol, side, order_type, price, quantity,
+                   time_in_force, status, client_order_id, meta, run_id, rule_version_id
+            from orders
+            where status = any(%s)
+        """
+        params: list[Any] = [wanted]
+        if symbol:
+            sql += " and upper(symbol)=upper(%s)"
+            params.append(str(symbol))
+        sql += " order by ts_created desc limit %s"
+        params.append(max(1, int(limit)))
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            (
+                order_id,
+                ts_created,
+                sym,
+                side,
+                order_type,
+                price,
+                quantity,
+                time_in_force,
+                status,
+                client_order_id,
+                meta,
+                run_id,
+                rule_version_id,
+            ) = row
+            out.append(
+                {
+                    "order_id": order_id,
+                    "ts_created": ts_created,
+                    "symbol": sym,
+                    "side": side,
+                    "order_type": order_type,
+                    "price": price,
+                    "quantity": quantity,
+                    "time_in_force": time_in_force,
+                    "status": status,
+                    "client_order_id": client_order_id,
+                    "meta": meta or {},
+                    "run_id": run_id,
+                    "rule_version_id": rule_version_id,
+                }
+            )
+        return out
+
     def fetch_position(self, symbol: str) -> DbPosition | None:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(

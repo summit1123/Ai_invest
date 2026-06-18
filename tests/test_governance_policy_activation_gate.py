@@ -88,6 +88,33 @@ def test_policy_activation_gate_returns_insufficient_data_in_paper_mode():
     assert out["decision"] == "PAPER"
 
 
+def test_policy_activation_gate_returns_insufficient_data_in_live_learning_mode():
+    fp = _fact_pack_with_backtest()
+    fp["prework_reports"]["quant_strategist"]["findings"]["backtest"]["ranked"][0]["trades"] = 0
+    out = evaluate_policy_activation_gate(
+        rules_raw={
+            "universe": {"mode": "live"},
+            "governance": {
+                "activation_gate": {
+                    "enabled": True,
+                    "min_backtest_trades": 3,
+                    "live_data_collection": {
+                        "enabled": True,
+                        "bootstrap_min_backtest_trades": 8,
+                    },
+                }
+            },
+        },
+        fact_pack=fp,
+        final_symbol="KRW-BTC",
+    )
+    assert out["enabled"] is True
+    assert out["passed"] is False
+    assert out["reason_code"] == "POLICY_GATE_INSUFFICIENT_DATA"
+    assert out["live_data_collection_mode"] is True
+    assert out["decision"] == "PAPER"
+
+
 def test_policy_activation_gate_relaxed_or_passes_in_paper_mode():
     fp = _fact_pack_with_backtest()
     row = fp["prework_reports"]["quant_strategist"]["findings"]["backtest"]["ranked"][0]

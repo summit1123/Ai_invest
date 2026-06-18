@@ -68,6 +68,22 @@ class MultiOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual([name for name, _ in cmds], ["research_work_loop", "quant_work_loop", "risk_work_loop", "ops_work_loop"])
 
+    def test_stop_request_target_helper_accepts_matching_pid(self) -> None:
+        mod = _load_module()
+        self.assertTrue(
+            mod._stop_request_targets_current_process(
+                {"target_pid": 1234, "source": "autostart"},
+                pid=1234,
+            )
+        )
+        self.assertFalse(
+            mod._stop_request_targets_current_process(
+                {"target_pid": 9999, "source": "autostart"},
+                pid=1234,
+            )
+        )
+        self.assertTrue(mod._stop_request_targets_current_process({"source": "signal"}, pid=1234))
+
 
 if __name__ == "__main__":
     unittest.main()

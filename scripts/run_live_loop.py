@@ -28,7 +28,11 @@ def main() -> int:
 
     if not bool(args.skip_preflight):
         rules_raw = yaml.safe_load((ROOT / "rules.yaml").read_text(encoding="utf-8")) or {}
-        report = build_startup_preflight(rules_raw=rules_raw, require_trading=True)
+        report = build_startup_preflight(
+            rules_raw=rules_raw,
+            require_trading=True,
+            probe_broker=True,
+        )
         for line in format_preflight_report(report):
             print(line, flush=True)
         if not report.ok:

@@ -171,6 +171,41 @@ def safe_judge_decide(
     trade_plan_cap_promoted = _opt_bool(payload, "context.trade_plan.activation_gate.cap_promoted")
     trade_plan_inter_slot_realtime_mode = _opt_bool(payload, "context.trade_plan.activation_gate.inter_slot_realtime_mode")
     trade_plan_final_no_trade = _opt_bool(payload, "context.trade_plan.activation_gate.final_plan_no_trade_declared")
+    trade_plan_runtime_entry_allowed = _opt_bool(payload, "context.trade_plan.runtime_entry_policy.runtime_entry_allowed")
+    trade_plan_runtime_promotion_enabled = _opt_bool(
+        payload,
+        "context.trade_plan.runtime_entry_policy.runtime_promotion_enabled",
+    )
+    trade_plan_runtime_execution_authority = _opt_str(
+        payload,
+        "context.trade_plan.runtime_entry_policy.execution_authority",
+    )
+    trade_plan_runtime_entry_objective = _opt_str(
+        payload,
+        "context.trade_plan.runtime_entry_policy.entry_objective",
+    )
+    trade_plan_runtime_exploration_enabled = _opt_bool(
+        payload,
+        "context.trade_plan.runtime_entry_policy.exploration_enabled",
+    )
+    trade_plan_runtime_profit_floor_bps = _opt_float(
+        payload,
+        "context.trade_plan.runtime_entry_policy.profit_floor_bps",
+    )
+    trade_plan_runtime_profit_required_margin_bps = _opt_float(
+        payload,
+        "context.trade_plan.runtime_entry_policy.profit_required_margin_bps",
+    )
+    trade_plan_runtime_promotion_active = _opt_bool(payload, "context.trade_plan.runtime_entry_policy.promotion_active")
+    trade_plan_runtime_learning_mode = _opt_bool(payload, "context.trade_plan.runtime_entry_policy.learning_mode")
+    trade_plan_runtime_min_predicted_after_cost_bps = _opt_float(
+        payload,
+        "context.trade_plan.runtime_entry_policy.min_predicted_after_cost_bps",
+    )
+    trade_plan_runtime_alpha_bypass_on_exploration = _opt_bool(
+        payload,
+        "context.trade_plan.runtime_entry_policy.alpha_bypass_on_exploration",
+    )
     try:
         trade_plan_cap_runtime = _dot_get(payload, "context.trade_plan.activation_gate.cap_runtime")
     except Exception:
@@ -323,6 +358,17 @@ def safe_judge_decide(
         "trade_plan_cap_promoted": trade_plan_cap_promoted,
         "trade_plan_inter_slot_realtime_mode": bool(trade_plan_inter_slot_realtime_mode),
         "trade_plan_final_no_trade": bool(trade_plan_final_no_trade),
+        "trade_plan_runtime_entry_allowed": trade_plan_runtime_entry_allowed,
+        "trade_plan_runtime_promotion_enabled": trade_plan_runtime_promotion_enabled,
+        "trade_plan_runtime_execution_authority": trade_plan_runtime_execution_authority,
+        "trade_plan_runtime_entry_objective": trade_plan_runtime_entry_objective,
+        "trade_plan_runtime_exploration_enabled": trade_plan_runtime_exploration_enabled,
+        "trade_plan_runtime_profit_floor_bps": trade_plan_runtime_profit_floor_bps,
+        "trade_plan_runtime_profit_required_margin_bps": trade_plan_runtime_profit_required_margin_bps,
+        "trade_plan_runtime_promotion_active": trade_plan_runtime_promotion_active,
+        "trade_plan_runtime_learning_mode": trade_plan_runtime_learning_mode,
+        "trade_plan_runtime_min_predicted_after_cost_bps": trade_plan_runtime_min_predicted_after_cost_bps,
+        "trade_plan_runtime_alpha_bypass_on_exploration": trade_plan_runtime_alpha_bypass_on_exploration,
         "trade_plan_cap_runtime": trade_plan_cap_runtime if isinstance(trade_plan_cap_runtime, Mapping) else None,
         "signal_target_pct": market_signal_target_pct,
         "market_expected_edge_bps": market_expected_edge_bps,
@@ -499,13 +545,26 @@ def safe_judge_decide(
             if micro_cfg.get("live_max_uncertainty_bps") is not None
             else 8.0
         )
+        micro_live_profit_floor_bps = float(
+            micro_cfg.get("live_profit_floor_bps")
+            if micro_cfg.get("live_profit_floor_bps") is not None
+            else 1.0
+        )
+        micro_live_profit_required_margin_bps = float(
+            micro_cfg.get("live_profit_required_margin_bps")
+            if micro_cfg.get("live_profit_required_margin_bps") is not None
+            else 0.5
+        )
+        micro_allow_live_exploration = bool(micro_cfg.get("allow_live_exploration", False))
         micro_alpha_margin = float(
             micro_cfg.get("alpha_margin")
-            or (0.10 if is_live_mode else 0.0)
+            if micro_cfg.get("alpha_margin") is not None
+            else (0.10 if is_live_mode else 0.0)
         )
         micro_edge_margin_bps = float(
             micro_cfg.get("edge_margin_bps")
-            or (10.0 if is_live_mode else 0.0)
+            if micro_cfg.get("edge_margin_bps") is not None
+            else (10.0 if is_live_mode else 0.0)
         )
         plan_gate_hard_block = _opt_bool(payload, "context.trade_plan.activation_gate.hard_plan_block")
         plan_gate_soft_block = _opt_bool(payload, "context.trade_plan.activation_gate.soft_plan_block")
@@ -532,6 +591,9 @@ def safe_judge_decide(
             "ignore_market_edge_in_plan_led": bool(micro_ignore_edge_in_plan_led),
             "live_min_predicted_after_cost_bps": float(micro_live_min_predicted_after_cost_bps),
             "live_max_uncertainty_bps": float(micro_live_max_uncertainty_bps),
+            "live_profit_floor_bps": float(micro_live_profit_floor_bps),
+            "live_profit_required_margin_bps": float(micro_live_profit_required_margin_bps),
+            "allow_live_exploration": bool(micro_allow_live_exploration),
             "alpha_margin": float(micro_alpha_margin),
             "edge_margin_bps": float(micro_edge_margin_bps),
             "realtime_min_alpha_delta": float(micro_realtime_min_alpha_delta),
@@ -549,13 +611,50 @@ def safe_judge_decide(
             or plan_hold_mode_value.startswith("HOLD")
         )
         plan_allows_buy = bool(trade_plan_buy_allowed is not False)
+        runtime_entry_allowed_flag = (
+            bool(trade_plan_runtime_entry_allowed)
+            if trade_plan_runtime_entry_allowed is not None
+            else bool(inter_slot_realtime_mode)
+        )
+        runtime_promotion_enabled = (
+            bool(trade_plan_runtime_promotion_enabled)
+            if trade_plan_runtime_promotion_enabled is not None
+            else bool(runtime_entry_allowed_flag and not plan_allows_buy)
+        )
+        runtime_entry_objective = str(
+            trade_plan_runtime_entry_objective
+            or ("profit-first" if is_live_mode else "feedback-loop")
+        ).strip().lower() or ("profit-first" if is_live_mode else "feedback-loop")
+        runtime_exploration_enabled = (
+            bool(trade_plan_runtime_exploration_enabled)
+            if trade_plan_runtime_exploration_enabled is not None
+            else (bool(micro_allow_live_exploration) if is_live_mode else True)
+        )
+        runtime_profit_floor_bps = float(
+            trade_plan_runtime_profit_floor_bps
+            if trade_plan_runtime_profit_floor_bps is not None
+            else micro_live_profit_floor_bps
+        )
+        runtime_profit_required_margin_bps = float(
+            trade_plan_runtime_profit_required_margin_bps
+            if trade_plan_runtime_profit_required_margin_bps is not None
+            else micro_live_profit_required_margin_bps
+        )
+        runtime_learning_mode = bool(trade_plan_runtime_learning_mode)
+        runtime_min_predicted_after_cost_bps = float(
+            trade_plan_runtime_min_predicted_after_cost_bps
+            if trade_plan_runtime_min_predicted_after_cost_bps is not None
+            else micro_live_min_predicted_after_cost_bps
+        )
+        runtime_alpha_bypass_on_exploration = bool(trade_plan_runtime_alpha_bypass_on_exploration)
         runtime_hold_entry_allowed = bool(
             is_live_mode
             and bool(micro_allow_runtime_hold_entry)
-            and bool(inter_slot_realtime_mode)
+            and bool(runtime_entry_allowed_flag)
             and bool(plan_is_hold)
             and not bool(trade_plan_final_no_trade)
             and bool(plan_gate_passed)
+            and bool(runtime_promotion_enabled)
         )
         plan_allows_micro_entry = bool(plan_allows_buy or runtime_hold_entry_allowed)
         market_long_ok = bool(market_signal in {"BUY", "LONG"})
@@ -585,20 +684,52 @@ def safe_judge_decide(
             market_after_cost_uncertainty_bps is None
             or float(market_after_cost_uncertainty_bps) <= float(micro_live_max_uncertainty_bps)
         )
+        live_runtime_edge_bps = (
+            float(market_predicted_after_cost_bps)
+            if market_predicted_after_cost_bps is not None
+            else (
+                float(market_expected_net_edge_bps)
+                if market_expected_net_edge_bps is not None
+                else None
+            )
+        )
+        live_profit_threshold_source = "runtime_profit_floor"
+        if micro_entry_path == "plan-led":
+            live_profit_threshold_bps = float(runtime_profit_floor_bps) + float(
+                runtime_profit_required_margin_bps
+            )
+        else:
+            live_profit_threshold_source = "market_required_plus_margin"
+            live_profit_threshold_bps = max(
+                float(runtime_profit_floor_bps),
+                float(
+                    (
+                        market_after_cost_required_bps
+                        if market_after_cost_required_bps is not None
+                        else net_edge_required
+                    )
+                ) + float(runtime_profit_required_margin_bps),
+            )
+        live_profit_edge_ok = bool(
+            runtime_hold_entry_allowed
+            and live_runtime_edge_bps is not None
+            and float(live_runtime_edge_bps) >= float(live_profit_threshold_bps)
+            and bool(live_calibration_uncertainty_ok)
+        )
         live_exploration_edge_ok = bool(
             runtime_hold_entry_allowed
             and micro_entry_path == "plan-led"
             and (
                 (
                     bool(live_calibration_ready)
-                    and float(market_predicted_after_cost_bps or 0.0) >= float(micro_live_min_predicted_after_cost_bps)
+                    and float(market_predicted_after_cost_bps or 0.0) >= float(runtime_min_predicted_after_cost_bps)
                     and bool(live_calibration_uncertainty_ok)
                 )
                 if bool(micro_require_calibration_live)
                 else (
                     (
                         market_predicted_after_cost_bps is not None
-                        and float(market_predicted_after_cost_bps) >= float(micro_live_min_predicted_after_cost_bps)
+                        and float(market_predicted_after_cost_bps) >= float(runtime_min_predicted_after_cost_bps)
                         and bool(live_calibration_uncertainty_ok)
                     )
                     or (
@@ -607,6 +738,10 @@ def safe_judge_decide(
                     )
                 )
             )
+        )
+        live_runtime_entry_edge_ok = bool(
+            live_profit_edge_ok
+            or (bool(runtime_exploration_enabled) and bool(live_exploration_edge_ok))
         )
         market_has_cooldown_block = any(c == ReasonCode.RG_COOLDOWN_ACTIVE for c in market_reason_codes)
         market_has_edge_block = any(c == ReasonCode.RG_EDGE_TOO_LOW for c in market_reason_codes)
@@ -623,7 +758,7 @@ def safe_judge_decide(
         market_reason_blocked = bool(
             cooldown_block_applied
             or edge_block_applied
-            or (market_edge_gate_blocked and not bool(live_exploration_edge_ok))
+            or (market_edge_gate_blocked and not bool(live_runtime_entry_edge_ok))
             or market_cost_gate_blocked
         )
 
@@ -638,10 +773,19 @@ def safe_judge_decide(
         micro_block_reason: ReasonCode | None = None
         if micro_candidate_context and (not bool(trigger_ok)):
             micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_POLICY
+        if (
+            micro_allowed_context
+            and bool(is_live_mode)
+            and bool(runtime_hold_entry_allowed)
+            and not bool(live_runtime_entry_edge_ok)
+        ):
+            micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_EDGE
         if micro_allowed_context and market_reason_blocked:
             if cooldown_block_applied:
                 micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_COOLDOWN
             elif edge_block_applied:
+                micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_EDGE
+            elif bool(is_live_mode and runtime_hold_entry_allowed and not live_runtime_entry_edge_ok):
                 micro_block_reason = ReasonCode.RG_MICRO_BLOCKED_EDGE
 
         # Dynamic micro thresholds for real-time responsiveness:
@@ -668,7 +812,14 @@ def safe_judge_decide(
         micro_alpha_gate_bypassed_by_calibration = bool(
             is_live_mode
             and micro_entry_path == "plan-led"
-            and bool(live_exploration_edge_ok)
+            and (
+                bool(live_profit_edge_ok)
+                or (
+                    bool(runtime_learning_mode)
+                    and bool(runtime_alpha_bypass_on_exploration)
+                    and bool(live_exploration_edge_ok)
+                )
+            )
         )
         micro_base_alpha_pass = bool(
             micro_alpha_gate_bypassed_by_calibration
@@ -690,9 +841,10 @@ def safe_judge_decide(
             and (
                 (not bool(is_live_mode))
                 or (
-                    bool(live_exploration_edge_ok)
+                    bool(live_runtime_entry_edge_ok)
                     or (
-                        market_expected_net_edge_bps is not None
+                        micro_entry_path == "market-led"
+                        and market_expected_net_edge_bps is not None
                         and float(market_expected_net_edge_bps) >= float(net_edge_required + micro_edge_margin_bps)
                     )
                 )
@@ -711,6 +863,7 @@ def safe_judge_decide(
         gates["market_edge_gate_blocked"] = bool(market_edge_gate_blocked)
         gates["market_cost_gate_blocked"] = bool(market_cost_gate_blocked)
         gates["micro_mode_plan_gate_passed"] = bool(plan_gate_passed)
+        gates["micro_mode_plan_allows_buy"] = bool(plan_allows_buy)
         gates["micro_mode_dynamic_min_alpha"] = float(dynamic_min_alpha)
         gates["micro_mode_dynamic_max_spread_bps"] = float(dynamic_max_spread_bps)
         gates["micro_mode_alpha_gate_passed"] = bool(micro_base_alpha_pass)
@@ -719,7 +872,23 @@ def safe_judge_decide(
             micro_alpha_gate_bypassed_by_calibration
         )
         gates["micro_mode_runtime_hold_entry_allowed"] = bool(runtime_hold_entry_allowed)
+        gates["micro_mode_runtime_entry_allowed_flag"] = bool(runtime_entry_allowed_flag)
+        gates["micro_mode_runtime_promotion_enabled"] = bool(runtime_promotion_enabled)
+        gates["micro_mode_runtime_execution_authority"] = str(trade_plan_runtime_execution_authority or "")
+        gates["micro_mode_runtime_entry_objective"] = str(runtime_entry_objective)
+        gates["micro_mode_runtime_exploration_enabled"] = bool(runtime_exploration_enabled)
+        gates["micro_mode_runtime_learning_mode"] = bool(runtime_learning_mode)
+        gates["micro_mode_runtime_min_predicted_after_cost_bps"] = float(runtime_min_predicted_after_cost_bps)
+        gates["micro_mode_runtime_alpha_bypass_on_exploration"] = bool(runtime_alpha_bypass_on_exploration)
+        gates["micro_mode_runtime_profit_floor_bps"] = float(runtime_profit_floor_bps)
+        gates["micro_mode_runtime_profit_required_margin_bps"] = float(runtime_profit_required_margin_bps)
+        gates["micro_mode_runtime_promotion_active"] = bool(trade_plan_runtime_promotion_active)
+        gates["micro_mode_live_runtime_edge_bps"] = live_runtime_edge_bps
+        gates["micro_mode_live_profit_threshold_source"] = str(live_profit_threshold_source)
+        gates["micro_mode_live_profit_threshold_bps"] = float(live_profit_threshold_bps)
+        gates["micro_mode_live_profit_edge_ok"] = bool(live_profit_edge_ok)
         gates["micro_mode_live_exploration_edge_ok"] = bool(live_exploration_edge_ok)
+        gates["micro_mode_live_runtime_entry_edge_ok"] = bool(live_runtime_entry_edge_ok)
         gates["micro_mode_live_calibration_ready"] = bool(live_calibration_ready)
 
         if micro_pass:

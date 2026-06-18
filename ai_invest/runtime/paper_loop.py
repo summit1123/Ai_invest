@@ -212,6 +212,112 @@ def _resolve_cap_config(activation_gate: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resolve_live_data_collection_config(raw_rules: Mapping[str, Any]) -> dict[str, Any]:
+    governance_cfg = (raw_rules.get("governance") or {}) if isinstance(raw_rules, Mapping) else {}
+    activation_gate_cfg = (governance_cfg.get("activation_gate") or {}) if isinstance(governance_cfg, Mapping) else {}
+    live_cfg = (activation_gate_cfg.get("live_data_collection") or {}) if isinstance(activation_gate_cfg, Mapping) else {}
+    return {
+        "enabled": bool(live_cfg.get("enabled", False)),
+        "bootstrap_min_backtest_trades": max(
+            1,
+            _as_int(live_cfg.get("bootstrap_min_backtest_trades"), default=8),
+        ),
+        "target_position_pct": max(
+            0.0,
+            min(100.0, _as_float(live_cfg.get("target_position_pct"), default=12.0)),
+        ),
+        "exploration_enabled": bool(live_cfg.get("exploration_enabled", True)),
+        "profit_floor_bps": float(_as_float(live_cfg.get("profit_floor_bps"), default=0.0)),
+        "profit_required_margin_bps": float(
+            _as_float(live_cfg.get("profit_required_margin_bps"), default=0.0)
+        ),
+        "min_predicted_after_cost_bps": float(
+            _as_float(live_cfg.get("min_predicted_after_cost_bps"), default=-0.25)
+        ),
+        "alpha_bypass_on_exploration": bool(live_cfg.get("alpha_bypass_on_exploration", True)),
+    }
+
+
+def _apply_live_learning_runtime_policy_compat(
+    *,
+    raw_rules: Mapping[str, Any],
+    universe_mode: str,
+    runtime_activation_gate: Mapping[str, Any],
+    runtime_entry_policy: Mapping[str, Any],
+    runtime_target_pct: float | None,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    gate = dict(runtime_activation_gate or {})
+    policy = dict(runtime_entry_policy or {})
+    if str(universe_mode or "").strip().lower() != "live":
+        return gate, policy, False
+
+    live_cfg = _resolve_live_data_collection_config(raw_rules)
+    if not bool(live_cfg.get("enabled")):
+        return gate, policy, False
+
+    selected_backtest = gate.get("selected_backtest") if isinstance(gate.get("selected_backtest"), Mapping) else {}
+    trades_actual = max(0, _as_int(selected_backtest.get("trades"), default=0))
+    bootstrap_min = max(1, _as_int(live_cfg.get("bootstrap_min_backtest_trades"), default=8))
+    reason_code = str(gate.get("reason_code") or "").strip().upper()
+    decision = str(gate.get("decision") or "").strip().upper()
+    hold_mode = str(gate.get("hold_mode") or "").strip().upper()
+    decision_effective = str(gate.get("decision_effective") or "").strip().upper()
+    live_candidate = bool(
+        gate.get("live_data_collection_mode")
+        or gate.get("live_data_collection_applied")
+        or (not gate and runtime_target_pct is None)
+        or (
+            bool(gate.get("inter_slot_realtime_mode"))
+            and decision == "PAPER"
+            and trades_actual < bootstrap_min
+            and (decision_effective == "HOLD" or hold_mode.startswith("HOLD"))
+            and reason_code in {"POLICY_GATE_BLOCKED", "POLICY_GATE_INSUFFICIENT_DATA"}
+        )
+    )
+    if not live_candidate:
+        return gate, policy, False
+
+    target_pct = float(_as_float(runtime_target_pct, default=float(live_cfg.get("target_position_pct") or 0.0)))
+    if target_pct <= 0.0:
+        target_pct = float(live_cfg.get("target_position_pct") or 0.0)
+
+    gate["live_data_collection_mode"] = True
+    gate["live_data_collection_applied"] = True
+    gate["live_data_collection_compat_applied"] = True
+    gate["live_data_collection_min_trades_effective"] = int(bootstrap_min)
+    gate["live_data_collection_target_pct"] = float(target_pct)
+    gate.setdefault("decision", "HOLD")
+    gate.setdefault("decision_effective", "HOLD")
+    gate.setdefault("hold_mode", "HOLD_CONDITIONAL")
+    gate.setdefault("inter_slot_realtime_mode", True)
+    gate.setdefault("hard_plan_block", False)
+    gate.setdefault("soft_plan_block", False)
+    gate.setdefault("plan_execution_blocked", False)
+    gate.setdefault("final_plan_no_trade_declared", False)
+    gate["reason_code"] = "POLICY_GATE_INSUFFICIENT_DATA"
+
+    policy.update(
+        {
+            "mode": "LIVE_DATA_COLLECTION",
+            "entry_objective": "learning-loop",
+            "runtime_entry_allowed": True,
+            "runtime_promotion_enabled": True,
+            "execution_authority": "realtime_loop",
+            "entry_timing_owner": "realtime_loop",
+            "exploration_enabled": bool(live_cfg.get("exploration_enabled", True)),
+            "profit_floor_bps": float(live_cfg.get("profit_floor_bps", 0.0)),
+            "profit_required_margin_bps": float(live_cfg.get("profit_required_margin_bps", 0.0)),
+            "learning_mode": True,
+            "min_predicted_after_cost_bps": float(live_cfg.get("min_predicted_after_cost_bps", -0.25)),
+            "alpha_bypass_on_exploration": bool(live_cfg.get("alpha_bypass_on_exploration", True)),
+            "meeting_buy_flag": False,
+            "meeting_sell_flag": True,
+            "policy_cap_target_pct": float(target_pct),
+        }
+    )
+    return gate, policy, True
+
+
 def _cap_required_passes(*, sustain_seconds: int, loop_interval_seconds: int) -> int:
     sec = max(1, int(loop_interval_seconds))
     sustain = max(1, int(sustain_seconds))
@@ -383,6 +489,45 @@ def _latest_quant_candidate_symbol(
     if sym and (allowed_symbols is None or sym in allowed_symbols):
         return sym
     return None
+
+
+def _select_runtime_candidate_symbol(
+    *,
+    repo: PostgresRepo,
+    default_symbol: str,
+    plan_symbol: str | None,
+    plan_is_hold: bool,
+    plan_symbol_allowed: bool,
+    realtime_between_meetings: bool,
+    inter_slot_symbol_policy: str,
+    realtime_symbol_max_age_min: int,
+    allowed_symbols: set[str] | None,
+) -> tuple[str, str, bool]:
+    candidate_symbol = str(default_symbol)
+    candidate_source = "default"
+    inter_slot_realtime_mode = False
+
+    runtime_symbol_rotation = bool(
+        plan_is_hold and realtime_between_meetings and str(inter_slot_symbol_policy or "").strip().lower() == "allow_quant"
+    )
+    if plan_symbol_allowed and not runtime_symbol_rotation:
+        return str(plan_symbol), "plan_symbol", False
+
+    if runtime_symbol_rotation:
+        runtime_symbol = _latest_quant_candidate_symbol(
+            repo=repo,
+            max_age_minutes=int(realtime_symbol_max_age_min),
+            allowed_symbols=allowed_symbols,
+        )
+        if runtime_symbol:
+            return str(runtime_symbol), "quant_inter_slot", True
+        if plan_symbol_allowed:
+            return str(plan_symbol), "plan_symbol_hold_fallback", False
+
+    if plan_symbol_allowed:
+        candidate_symbol = str(plan_symbol)
+        candidate_source = "plan_symbol_hold_policy" if plan_is_hold else "plan_symbol"
+    return candidate_symbol, candidate_source, inter_slot_realtime_mode
 
 
 def _fetch_open_position_symbols(*, repo: PostgresRepo) -> list[str]:
@@ -721,29 +866,17 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             plan_symbol and (allowed_symbols is None or str(plan_symbol) in allowed_symbols)
         )
         max_open_positions = max(1, int(rules.universe.max_open_positions))
-        candidate_symbol = str(default_symbol)
-        candidate_source = "default"
-
-        if plan_symbol_allowed and not (plan_is_hold and universe_mode == "paper" and realtime_between_meetings):
-            candidate_symbol = str(plan_symbol)
-            candidate_source = "plan_symbol"
-        elif plan_is_hold and universe_mode == "paper" and realtime_between_meetings:
-            if inter_slot_symbol_policy == "allow_quant":
-                runtime_symbol = _latest_quant_candidate_symbol(
-                    repo=repo,
-                    max_age_minutes=int(realtime_symbol_max_age_min),
-                    allowed_symbols=allowed_symbols,
-                )
-                if runtime_symbol:
-                    candidate_symbol = str(runtime_symbol)
-                    candidate_source = "quant_inter_slot"
-                    inter_slot_realtime_mode = True
-                elif plan_symbol_allowed:
-                    candidate_symbol = str(plan_symbol)
-                    candidate_source = "plan_symbol_hold_fallback"
-            elif plan_symbol_allowed:
-                candidate_symbol = str(plan_symbol)
-                candidate_source = "plan_symbol_hold_policy"
+        candidate_symbol, candidate_source, inter_slot_realtime_mode = _select_runtime_candidate_symbol(
+            repo=repo,
+            default_symbol=str(default_symbol),
+            plan_symbol=plan_symbol,
+            plan_is_hold=bool(plan_is_hold),
+            plan_symbol_allowed=bool(plan_symbol_allowed),
+            realtime_between_meetings=bool(realtime_between_meetings),
+            inter_slot_symbol_policy=str(inter_slot_symbol_policy),
+            realtime_symbol_max_age_min=int(realtime_symbol_max_age_min),
+            allowed_symbols=allowed_symbols,
+        )
 
         open_symbols = _fetch_open_position_symbols(repo=repo)
         open_set = set(open_symbols)
@@ -896,6 +1029,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         raw_plan_target_pct = None
         plan_activation_gate: dict[str, Any] = {}
         plan_allowed_actions: dict[str, Any] = {}
+        plan_runtime_entry_policy: dict[str, Any] = {}
         plan_activation_decision: str | None = None
         plan_activation_decision_effective: str | None = None
         plan_execution_plan: dict[str, Any] = {}
@@ -914,6 +1048,8 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                     plan_execution_plan = dict(plan.get("execution_plan") or {})
                 if isinstance(plan.get("allowed_actions"), dict):
                     plan_allowed_actions = dict(plan.get("allowed_actions") or {})
+                if isinstance(plan.get("runtime_entry_policy"), dict):
+                    plan_runtime_entry_policy = dict(plan.get("runtime_entry_policy") or {})
                 execution_target = None
                 if isinstance(plan_execution_plan.get("final_numbers"), dict):
                     execution_target = (plan_execution_plan.get("final_numbers") or {}).get("target_position_pct")
@@ -941,10 +1077,16 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                         if "sell" not in plan_allowed_actions:
                             plan_allowed_actions["sell"] = True
                         plan_activation_gate["inter_slot_realtime_mode"] = True
+                        if plan_runtime_entry_policy:
+                            plan_runtime_entry_policy["runtime_entry_allowed"] = True
+                            plan_runtime_entry_policy["runtime_promotion_enabled"] = not bool(
+                                plan_allowed_actions.get("buy")
+                            )
         except Exception:
             plan_target_pct = None
             raw_plan_target_pct = None
             plan_allowed_actions = {}
+            plan_runtime_entry_policy = {}
         if plan_target_pct is not None:
             plan_target_pct = max(0.0, min(float(plan_target_pct), float(effective_target_cap)))
         if manage_open_position_only:
@@ -1267,6 +1409,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
         runtime_activation_gate = dict(plan_activation_gate or {})
         runtime_execution_plan = dict(plan_execution_plan or {})
         runtime_allowed_actions = dict(plan_allowed_actions)
+        runtime_entry_policy = dict(plan_runtime_entry_policy or {})
         runtime_target_pct = plan_target_pct
         runtime_control_cap = _as_float(runtime_controls.get("max_position_pct"), default=runtime_target_pct)
         if runtime_target_pct is not None and runtime_control_cap > 0:
@@ -1279,6 +1422,62 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             str(runtime_activation_gate.get("decision_effective") or plan_activation_decision_effective or "").strip().upper()
             or str(runtime_activation_gate.get("decision") or plan_activation_decision or "").strip().upper()
             or None
+        )
+        runtime_micro_cfg = (
+            (((raw_rules.get("governance") or {}).get("micro_mode") or {}))
+            if isinstance(raw_rules, Mapping)
+            else {}
+        )
+        runtime_entry_policy.setdefault(
+            "runtime_entry_allowed",
+            bool(runtime_activation_gate.get("inter_slot_realtime_mode")),
+        )
+        runtime_entry_policy.setdefault(
+            "runtime_promotion_enabled",
+            bool(runtime_entry_policy.get("runtime_entry_allowed")) and not bool(runtime_allowed_actions.get("buy")),
+        )
+        runtime_activation_gate, runtime_entry_policy, live_learning_policy_applied = _apply_live_learning_runtime_policy_compat(
+            raw_rules=raw_rules,
+            universe_mode=str(universe_mode),
+            runtime_activation_gate=runtime_activation_gate,
+            runtime_entry_policy=runtime_entry_policy,
+            runtime_target_pct=runtime_target_pct,
+        )
+        if live_learning_policy_applied:
+            policy_cap_target_pct = _as_float(runtime_entry_policy.get("policy_cap_target_pct"), default=0.0)
+            if policy_cap_target_pct > 0.0:
+                runtime_target_pct = min(float(policy_cap_target_pct), float(effective_target_cap))
+                runtime_allowed_actions.setdefault("sell", True)
+        runtime_entry_policy.setdefault(
+            "execution_authority",
+            "realtime_loop" if bool(runtime_entry_policy.get("runtime_entry_allowed")) else "meeting_plan",
+        )
+        runtime_entry_policy.setdefault("entry_timing_owner", str(runtime_entry_policy.get("execution_authority") or "meeting_plan"))
+        runtime_entry_policy.setdefault(
+            "entry_objective",
+            "profit-first" if universe_mode == "live" else "feedback-loop",
+        )
+        runtime_entry_policy.setdefault(
+            "exploration_enabled",
+            bool(runtime_micro_cfg.get("allow_live_exploration", False)) if universe_mode == "live" else True,
+        )
+        runtime_entry_policy.setdefault(
+            "profit_floor_bps",
+            float(_as_float(runtime_micro_cfg.get("live_profit_floor_bps"), default=1.0))
+            if universe_mode == "live"
+            else 0.0,
+        )
+        runtime_entry_policy.setdefault(
+            "profit_required_margin_bps",
+            float(_as_float(runtime_micro_cfg.get("live_profit_required_margin_bps"), default=0.5))
+            if universe_mode == "live"
+            else 0.0,
+        )
+        runtime_entry_policy.setdefault("meeting_buy_flag", bool(plan_allowed_actions.get("buy")))
+        runtime_entry_policy.setdefault("meeting_sell_flag", bool(plan_allowed_actions.get("sell")))
+        runtime_entry_policy.setdefault(
+            "policy_cap_target_pct",
+            float(_as_float(runtime_target_pct, default=0.0)),
         )
 
         def emit_cap_event(event_type: str, payload_map: Mapping[str, Any]) -> None:
@@ -1502,6 +1701,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 runtime_activation_gate["decision_effective"] = "PAPER"
                 runtime_activation_gate["cap_promoted"] = True
                 runtime_allowed_actions = {"buy": True, "sell": True}
+                runtime_entry_policy["promotion_active"] = True
                 execution_target = None
                 if isinstance(runtime_execution_plan.get("final_numbers"), Mapping):
                     execution_target = _as_float(
@@ -1517,6 +1717,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                 runtime_execution_plan["final_numbers"]["target_position_pct"] = float(runtime_target_pct)
             else:
                 runtime_activation_gate["cap_promoted"] = False
+                runtime_entry_policy["promotion_active"] = False
 
             cap_runtime_payload = {
                 "last_eval_at": _utcnow().astimezone(KST).isoformat(),
@@ -1540,6 +1741,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             "allowed_actions": dict(runtime_allowed_actions),
             "activation_gate": dict(runtime_activation_gate),
             "execution_plan": dict(runtime_execution_plan),
+            "runtime_entry_policy": dict(runtime_entry_policy),
         }
         safe = safe_judge_decide(
             payload,
@@ -1591,6 +1793,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
                         "allowed_actions": dict(runtime_allowed_actions),
                         "activation_gate": dict(runtime_activation_gate),
                         "execution_plan": dict(runtime_execution_plan),
+                        "runtime_entry_policy": dict(runtime_entry_policy),
                     }
                     if plan
                     else None,
@@ -1675,6 +1878,7 @@ def run_paper_loop(*, cycles: int = 1, sleep_sec: float | None = None) -> None:
             strategy_tag=market.strategy_tag,
             exit_reason=market.exit_reason,
             cooldown_minutes=int(runtime_cooldown_minutes),
+            allow_min_order_round_up=bool(runtime_entry_policy.get("learning_mode")),
         )
         if exec_res is not None:
             notifier.notify_fill(

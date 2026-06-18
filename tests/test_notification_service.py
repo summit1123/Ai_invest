@@ -75,6 +75,12 @@ class NotificationServiceTests(unittest.TestCase):
                 cooldown_minutes=30,
                 constraints={"max_spread_bps": 8.0, "max_slippage_bps": 10.0, "max_position_pct": 20.0},
                 rationale_summary="요약",
+                activation_status="ACTIVE_LIVE_DATA_COLLECTION",
+                runtime_entry_policy={
+                    "mode": "LIVE_DATA_COLLECTION",
+                    "runtime_entry_allowed": True,
+                    "learning_mode": True,
+                },
             )
 
         self.assertEqual(len(repo.rows), 1)
@@ -85,6 +91,8 @@ class NotificationServiceTests(unittest.TestCase):
         event_payload = payload.get("event") or {}
         self.assertEqual(event_payload.get("symbol"), "KRW-BTC")
         self.assertEqual(event_payload.get("slot_key"), "2026-02-11 08:00")
+        self.assertEqual(event_payload.get("activation_status"), "ACTIVE_LIVE_DATA_COLLECTION")
+        self.assertEqual((event_payload.get("runtime_entry_policy") or {}).get("mode"), "LIVE_DATA_COLLECTION")
 
     def test_notify_safe_decision_change_only_skips_unchanged_state(self) -> None:
         repo = _FakeRepo()

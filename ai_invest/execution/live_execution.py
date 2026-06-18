@@ -74,6 +74,50 @@ def _fee_rate_bps(rules: RulesConfig, *, side: str) -> float:
     return float(fees.get("fallback_ask_fee_bps", 5.0))
 
 
+def _min_order_target_krw(rules: RulesConfig) -> float:
+    min_order_krw = float(rules.execution.min_order_krw)
+    cfg = rules.raw.get("runtime_controller", {}) if isinstance(rules.raw, Mapping) else {}
+    buffer_mult = _as_float(cfg.get("min_order_buffer_mult"), default=1.0)
+    buffer_mult = max(1.0, min(float(buffer_mult), 1.20))
+    return max(float(min_order_krw), float(min_order_krw) * float(buffer_mult))
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _settlement_day(rules: RulesConfig, ts: datetime) -> str:
+    tz_name = str(rules.raw.get("settlement", {}).get("timezone", "Asia/Seoul"))
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Seoul")
+    return ts.astimezone(tz).date().isoformat()
+
+
+def _micro_max_trades_per_day(rules: RulesConfig) -> int:
+    governance = rules.raw.get("governance", {}) if isinstance(rules.raw, Mapping) else {}
+    micro = governance.get("micro_mode", {}) if isinstance(governance, Mapping) else {}
+    try:
+        return max(0, int(float(micro.get("max_trades_per_day") or 0)))
+    except Exception:
+        return 0
+
+
 def _safe_uuid(value: str | None) -> uuid.UUID | None:
     try:
         return uuid.UUID(str(value))
@@ -240,6 +284,88 @@ class LiveExecutor:
             emitted.append(target)
         return emitted
 
+    def _skip_order(
+        self,
+        *,
+        run_id: uuid.UUID,
+        rule_version_id: uuid.UUID,
+        decision_id: uuid.UUID,
+        symbol: str,
+        action: str,
+        reason: str,
+        ts: datetime,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "decision_id": str(decision_id),
+            "symbol": symbol,
+            "action": str(action).upper(),
+            "reason": str(reason),
+        }
+        payload.update(dict(extra or {}))
+        self._repo.insert_event(
+            DbEvent(
+                event_id=uuid.uuid4(),
+                ts=ts,
+                event_type="ORDER_SKIPPED",
+                entity_type="orders",
+                entity_id=str(decision_id),
+                run_id=run_id,
+                rule_version_id=rule_version_id,
+                payload=payload,
+            )
+        )
+
+    def _today_trade_count(self, *, rules: RulesConfig, ts: datetime) -> int:
+        fetch_pnl_daily = getattr(self._repo, "fetch_pnl_daily", None)
+        if not callable(fetch_pnl_daily):
+            return 0
+        today = _settlement_day(rules, ts)
+        try:
+            rows = list(fetch_pnl_daily(limit=3) or [])
+        except Exception:
+            return 0
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("day") or "") != today:
+                continue
+            try:
+                return max(0, int(float(row.get("trades_count", row.get("trades_count_delta", 0)) or 0)))
+            except Exception:
+                return 0
+        return 0
+
+    def _active_execution_symbols(self, *, quote_currency: str) -> set[str]:
+        active: set[str] = set()
+        overview_fn = getattr(self._repo, "fetch_portfolio_overview", None)
+        if callable(overview_fn):
+            try:
+                overview = overview_fn(quote_currency=quote_currency) or {}
+            except Exception:
+                overview = {}
+            for row in list(overview.get("positions") or []):
+                if not isinstance(row, Mapping):
+                    continue
+                sym = str(row.get("symbol") or "").strip().upper()
+                qty = _as_float(row.get("qty"), default=0.0)
+                if sym and qty > 0:
+                    active.add(sym)
+
+        fetch_open_orders = getattr(self._repo, "fetch_open_orders", None)
+        if callable(fetch_open_orders):
+            try:
+                rows = list(fetch_open_orders(statuses=["NEW", "ACK", "PARTIAL"], limit=50) or [])
+            except Exception:
+                rows = []
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                sym = str(row.get("symbol") or "").strip().upper()
+                if sym:
+                    active.add(sym)
+        return active
+
     def execute(
         self,
         *,
@@ -253,6 +379,7 @@ class LiveExecutor:
         strategy_tag: str | None = None,
         exit_reason: str | None = None,
         cooldown_minutes: int | None = None,
+        allow_min_order_round_up: bool = False,
     ) -> LiveExecutionResult | None:
         action_u = str(action or "").strip().upper()
         if action_u not in {"BUY", "SELL"}:
@@ -262,6 +389,34 @@ class LiveExecutor:
         quote_ccy = _quote_currency(symbol)
         ts_decision = _utcnow()
         submit_mid = float(snapshot.mid_price)
+
+        fetch_open_orders = getattr(self._repo, "fetch_open_orders", None)
+        if callable(fetch_open_orders):
+            try:
+                open_orders = list(
+                    fetch_open_orders(symbol=symbol, statuses=["NEW", "ACK", "PARTIAL"], limit=10)
+                    or []
+                )
+            except Exception:
+                open_orders = []
+            if open_orders:
+                self._skip_order(
+                    run_id=run_id,
+                    rule_version_id=rule_version_id,
+                    decision_id=decision_id,
+                    symbol=symbol,
+                    action=action_u,
+                    reason="OPEN_ORDER_EXISTS",
+                    ts=ts_decision,
+                    extra={
+                        "open_order_ids": [
+                            str(row.get("order_id") or "")
+                            for row in open_orders[:10]
+                            if isinstance(row, Mapping)
+                        ],
+                    },
+                )
+                return None
 
         pos = self._repo.fetch_position(symbol)
         pos_meta = dict((pos.meta or {}) if pos else {})
@@ -285,7 +440,61 @@ class LiveExecutor:
 
         side = "BUY" if action_u == "BUY" else "SELL"
         if side == "BUY":
+            if current_qty <= 0:
+                cooldown_until = _parse_utc_datetime(pos_meta.get("cooldown_until"))
+                if cooldown_until is not None and cooldown_until > ts_decision:
+                    self._skip_order(
+                        run_id=run_id,
+                        rule_version_id=rule_version_id,
+                        decision_id=decision_id,
+                        symbol=symbol,
+                        action=action_u,
+                        reason="RG_COOLDOWN_ACTIVE",
+                        ts=ts_decision,
+                        extra={
+                            "cooldown_until": cooldown_until.isoformat(),
+                            "last_exit_reason": pos_meta.get("last_exit_reason"),
+                        },
+                    )
+                    return None
+
+                max_trades = _micro_max_trades_per_day(rules)
+                if max_trades > 0:
+                    today_trades = self._today_trade_count(rules=rules, ts=ts_decision)
+                    if int(today_trades) >= int(max_trades):
+                        self._skip_order(
+                            run_id=run_id,
+                            rule_version_id=rule_version_id,
+                            decision_id=decision_id,
+                            symbol=symbol,
+                            action=action_u,
+                            reason="RG_EXPOSURE_LIMIT",
+                            ts=ts_decision,
+                            extra={"daily_trades_count": int(today_trades), "max_trades_per_day": int(max_trades)},
+                        )
+                        return None
+
+                max_open_positions = max(0, int(rules.universe.max_open_positions))
+                if max_open_positions > 0:
+                    active_symbols = self._active_execution_symbols(quote_currency=quote_ccy)
+                    if symbol not in active_symbols and len(active_symbols) >= int(max_open_positions):
+                        self._skip_order(
+                            run_id=run_id,
+                            rule_version_id=rule_version_id,
+                            decision_id=decision_id,
+                            symbol=symbol,
+                            action=action_u,
+                            reason="RG_EXPOSURE_LIMIT",
+                            ts=ts_decision,
+                            extra={
+                                "active_symbols": sorted(active_symbols),
+                                "max_open_positions": int(max_open_positions),
+                            },
+                        )
+                        return None
+
             min_order_krw = int(rules.execution.min_order_krw)
+            min_order_target_krw = _min_order_target_krw(rules)
             tgt_pct = None
             try:
                 tgt_pct = float(target_position_pct) if target_position_pct is not None else None
@@ -303,13 +512,19 @@ class LiveExecutor:
                 desired_krw = max(0.0, float(desired_value) - float(pos_value))
             desired_krw = min(float(desired_krw), float(cash_balance))
             if desired_krw < float(min_order_krw):
-                return None
+                if (
+                    not bool(allow_min_order_round_up)
+                    or current_qty > 0
+                    or float(cash_balance) < float(min_order_target_krw)
+                ):
+                    return None
+                desired_krw = float(min_order_target_krw)
 
             # Fee-aware affordability.
             fee_rate = _fee_rate_bps(rules, side="BUY") / 10000.0
             max_affordable = float(cash_balance) / (1.0 + float(fee_rate))
             desired_krw = min(float(desired_krw), float(max_affordable))
-            if desired_krw < float(min_order_krw):
+            if desired_krw < float(min_order_target_krw if bool(allow_min_order_round_up) else min_order_krw):
                 return None
 
             ord_type_cfg = str(rules.execution.default_ord_type).strip().lower()

@@ -6,10 +6,12 @@ from zoneinfo import ZoneInfo
 
 from ai_invest.agents.market_agent import MarketOpinion
 from ai_invest.runtime.paper_loop import (
+    _apply_live_learning_runtime_policy_compat,
     _latest_quant_candidate_symbol,
     _market_input_for_safe_judge,
     _plan_is_hold_activation,
     _resolve_runtime_trade_plan,
+    _select_runtime_candidate_symbol,
 )
 
 
@@ -170,6 +172,55 @@ def test_resolve_runtime_trade_plan_drops_expired_plan_after_bridge_window(monke
     assert plan is None
 
 
+def test_apply_live_learning_runtime_policy_compat_upgrades_legacy_hold_plan() -> None:
+    gate, policy, applied = _apply_live_learning_runtime_policy_compat(
+        raw_rules={
+            "governance": {
+                "activation_gate": {
+                    "live_data_collection": {
+                        "enabled": True,
+                        "bootstrap_min_backtest_trades": 8,
+                        "target_position_pct": 12.0,
+                        "exploration_enabled": True,
+                        "profit_floor_bps": 0.0,
+                        "profit_required_margin_bps": 0.0,
+                        "min_predicted_after_cost_bps": -0.25,
+                        "alpha_bypass_on_exploration": True,
+                    }
+                }
+            }
+        },
+        universe_mode="live",
+        runtime_activation_gate={
+            "decision": "PAPER",
+            "decision_effective": "HOLD",
+            "hold_mode": "HOLD_CONDITIONAL",
+            "reason_code": "POLICY_GATE_BLOCKED",
+            "inter_slot_realtime_mode": True,
+            "selected_backtest": {"trades": 0},
+        },
+        runtime_entry_policy={
+            "runtime_entry_allowed": True,
+            "runtime_promotion_enabled": True,
+            "exploration_enabled": False,
+            "profit_floor_bps": 1.0,
+            "profit_required_margin_bps": 0.5,
+        },
+        runtime_target_pct=12.0,
+    )
+    assert applied is True
+    assert gate["live_data_collection_applied"] is True
+    assert gate["reason_code"] == "POLICY_GATE_INSUFFICIENT_DATA"
+    assert policy["mode"] == "LIVE_DATA_COLLECTION"
+    assert policy["entry_objective"] == "learning-loop"
+    assert policy["exploration_enabled"] is True
+    assert policy["learning_mode"] is True
+    assert policy["profit_floor_bps"] == 0.0
+    assert policy["profit_required_margin_bps"] == 0.0
+    assert policy["min_predicted_after_cost_bps"] == -0.25
+    assert policy["alpha_bypass_on_exploration"] is True
+
+
 def test_market_input_for_safe_judge_preserves_edge_calibration_reason() -> None:
     market = MarketOpinion(
         signal="HOLD",
@@ -207,3 +258,50 @@ def test_market_input_for_safe_judge_preserves_edge_calibration_reason() -> None
     assert payload["predicted_after_cost_bps"] == 1.25
     assert payload["required_after_cost_bps"] == 4.0
     assert payload["after_cost_uncertainty_bps"] == 2.0
+
+
+def test_select_runtime_candidate_symbol_uses_quant_candidate_for_live_hold_mode() -> None:
+    now = datetime.now(timezone.utc)
+    repo = _RepoStub(
+        {
+            "created_at": now,
+            "findings": {
+                "candidates": [
+                    {"symbol": "KRW-ETH", "score": 0.41},
+                    {"symbol": "KRW-BTC", "score": 0.32},
+                ]
+            },
+        }
+    )
+    symbol, source, inter_slot = _select_runtime_candidate_symbol(
+        repo=repo,
+        default_symbol="KRW-BTC",
+        plan_symbol="KRW-BTC",
+        plan_is_hold=True,
+        plan_symbol_allowed=True,
+        realtime_between_meetings=True,
+        inter_slot_symbol_policy="allow_quant",
+        realtime_symbol_max_age_min=60,
+        allowed_symbols=None,
+    )
+    assert symbol == "KRW-ETH"
+    assert source == "quant_inter_slot"
+    assert inter_slot is True
+
+
+def test_select_runtime_candidate_symbol_falls_back_to_plan_symbol_when_no_quant_candidate() -> None:
+    repo = _RepoStub(None)
+    symbol, source, inter_slot = _select_runtime_candidate_symbol(
+        repo=repo,
+        default_symbol="KRW-BTC",
+        plan_symbol="KRW-BTC",
+        plan_is_hold=True,
+        plan_symbol_allowed=True,
+        realtime_between_meetings=True,
+        inter_slot_symbol_policy="allow_quant",
+        realtime_symbol_max_age_min=60,
+        allowed_symbols=None,
+    )
+    assert symbol == "KRW-BTC"
+    assert source == "plan_symbol_hold_fallback"
+    assert inter_slot is False

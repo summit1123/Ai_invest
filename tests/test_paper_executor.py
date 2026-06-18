@@ -263,6 +263,36 @@ class PaperExecutorTests(unittest.TestCase):
         self.assertGreater(res.fill_qty, 1900.0)
         self.assertLess(res.fill_qty, 2100.0)
 
+    def test_learning_mode_rounds_small_buy_up_to_min_order(self) -> None:
+        repo = _FakeRepo()
+        ex = PaperExecutor(repo=repo)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+        repo.ensure_paper_seed_cash(currency="KRW", amount=50_100.0)
+
+        snap_buy = MarketSnapshot(
+            ts_ms=0,
+            symbol="KRW-BTC",
+            last_price=100.0,
+            best_bid=100.0,
+            best_ask=101.0,
+        )
+        res = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=snap_buy,
+            rules=rules,
+            target_position_pct=9.77,
+            allow_min_order_round_up=True,
+        )
+        self.assertIsNotNone(res)
+        assert res is not None
+        expected_notional = float(rules.execution.min_order_krw) * float(
+            (rules.raw.get("runtime_controller") or {}).get("min_order_buffer_mult") or 1.0
+        )
+        self.assertAlmostEqual(float(res.fill_qty), float(expected_notional) / 100.0, places=6)
+
     def test_position_meta_tracks_strategy_and_cooldown(self) -> None:
         repo = _FakeRepo()
         ex = PaperExecutor(repo=repo)  # type: ignore[arg-type]

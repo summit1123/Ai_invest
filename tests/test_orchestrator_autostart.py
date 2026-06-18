@@ -4,10 +4,16 @@ import json
 import os
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from ai_invest.runtime.orchestrator_autostart import _status_workers_alive, maybe_start_orchestrator
+from ai_invest.runtime.orchestrator_autostart import (
+    OrchestratorAutostartState,
+    _status_workers_alive,
+    maybe_start_orchestrator,
+    stop_orchestrator,
+)
 
 
 class OrchestratorAutostartTests(unittest.TestCase):
@@ -68,6 +74,47 @@ class OrchestratorAutostartTests(unittest.TestCase):
         self.assertTrue(st.enabled)
         self.assertFalse(st.started_here)
         self.assertIn("external orchestrator", st.reason)
+
+    def test_stop_orchestrator_waits_for_polled_stop_request_on_windows(self) -> None:
+        class _FakeProc:
+            def __init__(self) -> None:
+                self.pid = 4321
+                self.wait_calls: list[float | None] = []
+                self.terminate_called = False
+                self.kill_called = False
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                self.wait_calls.append(timeout)
+                return 0
+
+            def terminate(self) -> None:
+                self.terminate_called = True
+
+            def kill(self) -> None:
+                self.kill_called = True
+
+        fake_proc = _FakeProc()
+        state = OrchestratorAutostartState(
+            enabled=True,
+            started_here=True,
+            reason="started",
+            status_path=Path("runtime/status.json"),
+            log_path=Path("logs/autostart.log"),
+            proc=fake_proc,
+            log_fp=StringIO(),
+        )
+
+        with patch("ai_invest.runtime.orchestrator_autostart.sys.platform", "win32"):
+            with patch("ai_invest.runtime.orchestrator_autostart.write_stop_request") as write_stop_request:
+                stop_orchestrator(state)
+
+        write_stop_request.assert_called_once()
+        self.assertEqual(fake_proc.wait_calls, [8.0])
+        self.assertFalse(fake_proc.terminate_called)
+        self.assertFalse(fake_proc.kill_called)
 
 
 if __name__ == "__main__":

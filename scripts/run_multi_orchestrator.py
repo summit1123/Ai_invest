@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -18,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 DEFAULT_STATUS_FILE = ROOT / "runtime" / "orchestrator_status.json"
 
 from ai_invest.config.dotenv import load_dotenv  # noqa: E402
+from ai_invest.runtime.orchestrator_stop_trace import consume_stop_request  # noqa: E402
 from ai_invest.runtime.orchestrator_state import (  # noqa: E402
     orchestrator_status_signature,
     persist_orchestrator_status_event,
@@ -172,6 +174,30 @@ def _write_status_file(status_file: Path, data: dict[str, Any]) -> None:
     tmp.replace(status_file)
 
 
+def _worker_creationflags() -> int:
+    if sys.platform != "win32":
+        return 0
+    create_no_window = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    create_new_process_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    return int(create_no_window | create_new_process_group)
+
+
+def _stop_request_targets_current_process(
+    stop_request: Mapping[str, Any] | None,
+    *,
+    pid: int | None = None,
+) -> bool:
+    if not isinstance(stop_request, Mapping):
+        return False
+    target_pid = stop_request.get("target_pid")
+    if target_pid is None:
+        return True
+    try:
+        return int(target_pid) == int(os.getpid() if pid is None else pid)
+    except Exception:
+        return False
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Run unified multi-agent orchestrator (paper/work/governance loops).")
     p.add_argument("--decision-interval-sec", type=float, default=-1.0, help="paper loop decision interval")
@@ -237,6 +263,7 @@ def main() -> int:
         report = build_startup_preflight(
             rules_raw=rules,
             require_trading=not bool(args.no_paper),
+            probe_broker=True,
         )
         for line in format_preflight_report(report):
             print(line, flush=True)
@@ -255,6 +282,7 @@ def main() -> int:
     worker_state: dict[str, dict[str, Any]] = {}
     stopping = False
     last_status_signature: str | None = None
+    last_stop_request: dict[str, Any] | None = None
     try:
         status_repo: PostgresRepo | None = PostgresRepo()
     except PostgresConfigError as exc:
@@ -266,9 +294,11 @@ def main() -> int:
         procs[name] = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
-            stdout=None,
-            stderr=None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             text=True,
+            creationflags=_worker_creationflags(),
         )
         st = worker_state.get(name) or {"restarts": 0}
         st["pid"] = int(procs[name].pid)
@@ -292,6 +322,7 @@ def main() -> int:
             "ts_utc": _now_utc_iso(),
             "stopping": bool(stopping),
             "workers": worker_state,
+            "last_stop_request": dict(last_stop_request) if isinstance(last_stop_request, dict) else None,
         }
 
     def _persist_status_snapshot(snapshot: dict[str, Any]) -> None:
@@ -311,10 +342,40 @@ def main() -> int:
         except Exception as exc:
             print(f"[warn] failed to persist orchestrator status: {exc}", flush=True)
 
-    def _stop_all(sig: int | None = None, _frame=None) -> None:
-        nonlocal stopping
+    def _stop_all(
+        sig: int | None = None,
+        _frame=None,
+        *,
+        stop_request: Mapping[str, Any] | None = None,
+    ) -> None:
+        nonlocal stopping, last_stop_request
         stopping = True
-        print(f"[stop] signal={sig}", flush=True)
+        resolved_stop_request = stop_request
+        if resolved_stop_request is None:
+            pending_stop_request = consume_stop_request(max_age_seconds=60.0)
+            if _stop_request_targets_current_process(pending_stop_request):
+                resolved_stop_request = pending_stop_request
+            elif pending_stop_request is not None:
+                print(
+                    f"[stop] ignoring stop_request target_pid={pending_stop_request.get('target_pid')}",
+                    flush=True,
+                )
+        if resolved_stop_request is None and isinstance(last_stop_request, dict):
+            resolved_stop_request = dict(last_stop_request)
+        if resolved_stop_request is None:
+            resolved_stop_request = {
+                "ts_utc": _now_utc_iso(),
+                "source": "signal",
+                "reason": "external_signal",
+                "signal": int(sig) if sig is not None else None,
+            }
+        else:
+            resolved_stop_request = {
+                **dict(resolved_stop_request),
+                "signal": int(sig) if sig is not None else resolved_stop_request.get("signal"),
+            }
+        last_stop_request = dict(resolved_stop_request)
+        print(f"[stop] signal={sig} stop_request={json.dumps(last_stop_request, ensure_ascii=True)}", flush=True)
         try:
             snapshot = _snapshot_status()
             _write_status_file(status_file, snapshot)
@@ -353,6 +414,15 @@ def main() -> int:
 
     try:
         while not stopping:
+            pending_stop_request = consume_stop_request(max_age_seconds=60.0)
+            if pending_stop_request is not None:
+                if _stop_request_targets_current_process(pending_stop_request):
+                    _stop_all(stop_request=pending_stop_request)
+                    continue
+                print(
+                    f"[warn] ignored stop_request for target_pid={pending_stop_request.get('target_pid')}",
+                    flush=True,
+                )
             time.sleep(1.0)
             for name, proc in list(procs.items()):
                 code = proc.poll()
@@ -376,7 +446,8 @@ def main() -> int:
             _write_status_file(status_file, snapshot)
             _persist_status_snapshot(snapshot)
     finally:
-        _stop_all()
+        if any(proc.poll() is None for proc in procs.values()):
+            _stop_all()
     return 0
 
 

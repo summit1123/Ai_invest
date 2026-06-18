@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Mapping
 
+from ai_invest.runtime.orchestrator_stop_trace import write_stop_request
+
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATUS_PATH = ROOT / "runtime" / "orchestrator_status.json"
 DEFAULT_LOG_PATH = ROOT / "logs" / "orchestrator.autostart.log"
@@ -29,6 +31,25 @@ def _parse_bool(value: str | None, *, default: bool) -> bool:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            process_query_limited_information = 0x1000
+            still_active = 259
+            handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return int(exit_code.value) == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
     try:
         os.kill(int(pid), 0)
         return True
@@ -78,6 +99,15 @@ def _autostart_enabled() -> bool:
     return _parse_bool(os.environ.get("APP_AUTOSTART_ORCHESTRATOR"), default=default_enabled)
 
 
+def _autostart_creationflags() -> int:
+    if sys.platform != "win32":
+        return 0
+    create_no_window = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    create_new_process_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    detached_process = int(getattr(subprocess, "DETACHED_PROCESS", 0))
+    return int(create_no_window | create_new_process_group | detached_process)
+
+
 def maybe_start_orchestrator() -> OrchestratorAutostartState:
     status_path = Path(os.environ.get("ORCHESTRATOR_STATUS_PATH", str(DEFAULT_STATUS_PATH)))
     log_path = Path(os.environ.get("APP_AUTOSTART_LOG_PATH", str(DEFAULT_LOG_PATH)))
@@ -111,10 +141,12 @@ def maybe_start_orchestrator() -> OrchestratorAutostartState:
     proc = subprocess.Popen(
         cmd,
         cwd=str(ROOT),
+        stdin=subprocess.DEVNULL,
         stdout=fp,
         stderr=fp,
         text=True,
         start_new_session=True,
+        creationflags=_autostart_creationflags(),
     )
 
     return OrchestratorAutostartState(
@@ -135,21 +167,43 @@ def stop_orchestrator(state: OrchestratorAutostartState | None) -> None:
     if proc is not None and state.started_here:
         try:
             if proc.poll() is None:
-                try:
-                    # Because start_new_session=True, signal the whole process group.
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except Exception:
-                    proc.terminate()
-
-                t0 = time.time()
-                while time.time() - t0 < 8.0 and proc.poll() is None:
-                    time.sleep(0.2)
-
-                if proc.poll() is None:
+                write_stop_request(
+                    source="autostart",
+                    reason="parent_shutdown",
+                    target_pid=proc.pid,
+                    extra={
+                        "started_here": bool(state.started_here),
+                        "enabled": bool(state.enabled),
+                        "status_path": str(state.status_path),
+                        "log_path": str(state.log_path),
+                    },
+                )
+                if sys.platform == "win32":
                     try:
-                        os.killpg(proc.pid, signal.SIGKILL)
+                        # The orchestrator polls for stop_request files, so give it time to exit cleanly.
+                        proc.wait(timeout=8.0)
+                    except subprocess.TimeoutExpired:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=8.0)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                else:
+                    try:
+                        # Because start_new_session=True, signal the whole process group.
+                        os.killpg(proc.pid, signal.SIGTERM)
                     except Exception:
-                        proc.kill()
+                        proc.terminate()
+
+                    t0 = time.time()
+                    while time.time() - t0 < 8.0 and proc.poll() is None:
+                        time.sleep(0.2)
+
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
         except Exception:
             pass
 

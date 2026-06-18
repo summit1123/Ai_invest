@@ -180,6 +180,12 @@ def build_pause_explanation(*, repo: PostgresRepo, status_path: Path) -> dict[st
     dead_workers = list(orchestrator.get("dead_workers") or [])
     if dead_workers:
         reasons.append(f"workers down: {', '.join(dead_workers[:5])}")
+    stop_request = orchestrator.get("last_stop_request") if isinstance(orchestrator.get("last_stop_request"), Mapping) else {}
+    if stop_request:
+        reasons.append(
+            "latest stop request: "
+            f"{stop_request.get('source') or 'unknown'} / {stop_request.get('reason') or 'unspecified'}"
+        )
     if not reasons:
         reasons.append("system is not currently paused")
 
@@ -475,6 +481,11 @@ def _compare_scalar_changes(*, from_state: Mapping[str, Any], to_state: Mapping[
         "orchestrator_restart_counts",
         dict((from_state.get("orchestrator") or {}).get("restart_counts") or {}),
         dict((to_state.get("orchestrator") or {}).get("restart_counts") or {}),
+    )
+    add(
+        "orchestrator_last_stop_request",
+        dict((from_state.get("orchestrator") or {}).get("last_stop_request") or {}),
+        dict((to_state.get("orchestrator") or {}).get("last_stop_request") or {}),
     )
     return changes
 

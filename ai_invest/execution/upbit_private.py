@@ -6,9 +6,10 @@ import hmac
 import json
 import os
 import uuid
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from typing import Any, Mapping
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 import requests
 
@@ -31,21 +32,39 @@ def _as_float(value: Any, *, default: float = 0.0) -> float:
         return float(default)
 
 
+def _param_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        try:
+            value = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return str(value)
+    if isinstance(value, Decimal):
+        s = format(value, "f")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s or "0"
+    return str(value)
+
+
 def _to_query_text(params: Mapping[str, Any]) -> str:
     items: list[tuple[str, str]] = []
     for key, raw in params.items():
         if raw is None:
             continue
-        if isinstance(raw, bool):
-            items.append((str(key), "true" if raw else "false"))
-        elif isinstance(raw, (list, tuple)):
+        if isinstance(raw, (list, tuple)):
             for v in raw:
                 if v is None:
                     continue
-                items.append((str(key), str(v)))
+                items.append((str(key), _param_text(v)))
         else:
-            items.append((str(key), str(raw)))
-    return urlencode(items, doseq=True)
+            items.append((str(key), _param_text(raw)))
+    return unquote(urlencode(items, doseq=True))
 
 
 class UpbitPrivateApiError(RuntimeError):
@@ -104,7 +123,7 @@ class UpbitPrivateClient:
         )
 
     def _jwt(self, *, params: Mapping[str, Any] | None = None) -> str:
-        header = {"alg": "HS256", "typ": "JWT"}
+        header = {"alg": "HS512", "typ": "JWT"}
         payload: dict[str, Any] = {"access_key": self._access_key, "nonce": str(uuid.uuid4())}
         params_map = dict(params or {})
         if params_map:
@@ -114,7 +133,7 @@ class UpbitPrivateClient:
                 payload["query_hash_alg"] = "SHA512"
         h = _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
         p = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-        sig = hmac.new(self._secret_key.encode("utf-8"), f"{h}.{p}".encode("utf-8"), hashlib.sha256).digest()
+        sig = hmac.new(self._secret_key.encode("utf-8"), f"{h}.{p}".encode("utf-8"), hashlib.sha512).digest()
         return f"{h}.{p}.{_b64url(sig)}"
 
     def _request(self, *, method: str, path: str, params: Mapping[str, Any] | None = None) -> Any:
@@ -158,6 +177,15 @@ class UpbitPrivateClient:
         if not isinstance(res, list):
             raise UpbitPrivateApiError(message="Unexpected /v1/accounts response shape", payload=res)
         return [row for row in res if isinstance(row, Mapping)]
+
+    def get_order_chance(self, *, market: str) -> dict[str, Any]:
+        params = {"market": str(market).strip().upper()}
+        if not params["market"]:
+            raise UpbitPrivateApiError(message="get_order_chance requires market")
+        res = self._request(method="GET", path="/v1/orders/chance", params=params)
+        if not isinstance(res, Mapping):
+            raise UpbitPrivateApiError(message="Unexpected /v1/orders/chance response shape", payload=res)
+        return dict(res)
 
     def get_order(self, *, order_id: str | None = None, identifier: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {}
@@ -205,9 +233,9 @@ class UpbitPrivateClient:
 
         payload: dict[str, Any] = {"market": str(market).strip().upper(), "side": side_n, "ord_type": ord_type_n}
         if volume is not None:
-            payload["volume"] = str(max(0.0, float(volume)))
+            payload["volume"] = _param_text(max(0.0, float(volume)))
         if price is not None:
-            payload["price"] = str(max(0.0, float(price)))
+            payload["price"] = _param_text(max(0.0, float(price)))
         if time_in_force:
             payload["time_in_force"] = str(time_in_force).strip().lower()
         if identifier:

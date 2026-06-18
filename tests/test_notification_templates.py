@@ -56,6 +56,18 @@ class NotificationTemplateTests(unittest.TestCase):
                     "max_position_pct": 20.0,
                 },
                 "rationale_summary": "리스크 상한 유지 + 스프레드 정상화",
+                "activation_status": "ACTIVE_LIVE_DATA_COLLECTION",
+                "runtime_entry_policy": {
+                    "mode": "LIVE_DATA_COLLECTION",
+                    "runtime_entry_allowed": True,
+                    "runtime_promotion_enabled": True,
+                    "learning_mode": True,
+                    "exploration_enabled": True,
+                    "min_predicted_after_cost_bps": -0.25,
+                    "min_pass_conditions": 3,
+                    "sustain_seconds": 180,
+                    "required_passes": 6,
+                },
             },
         )
 
@@ -63,6 +75,44 @@ class NotificationTemplateTests(unittest.TestCase):
         self.assertIn("KRW-BTC", text)
         self.assertIn("스프레드", text)
         self.assertIn("근거 요약", text)
+        self.assertIn("실거래 데이터 수집 모드", text)
+        self.assertIn("런타임 운영", text)
+        self.assertIn("실시간 루프", text)
+
+    def test_meeting_summary_template_explains_runtime_promotion(self) -> None:
+        text = render(
+            "tpl_meeting_summary",
+            {
+                "ts_kst": "2026-02-11T08:00:00+09:00",
+                "meeting_id": "m-1",
+                "summary": "이번 슬롯은 정책 상한만 유지합니다.",
+                "trade_plan": {
+                    "symbol": "KRW-BTC",
+                    "target_position_pct": 12.0,
+                    "valid_from_kst": "2026-02-11T08:00:00+09:00",
+                    "valid_to_kst": "2026-02-11T16:00:00+09:00",
+                    "allowed_actions": {"buy": False, "sell": True},
+                    "activation_status": "ACTIVE_LIVE_DATA_COLLECTION",
+                    "activation_gate": {"decision_effective": "HOLD"},
+                    "runtime_entry_policy": {
+                        "mode": "LIVE_DATA_COLLECTION",
+                        "runtime_entry_allowed": True,
+                        "runtime_promotion_enabled": True,
+                        "learning_mode": True,
+                        "exploration_enabled": True,
+                        "min_predicted_after_cost_bps": -0.25,
+                        "min_pass_conditions": 3,
+                        "sustain_seconds": 180,
+                        "required_passes": 6,
+                    },
+                },
+            },
+        )
+
+        self.assertIn("회의 결과 보고", text)
+        self.assertIn("실행 모드", text)
+        self.assertIn("런타임 운영", text)
+        self.assertIn("실시간 루프", text)
 
     def test_fill_notice_includes_total_amount_and_total_fee(self) -> None:
         text = render(

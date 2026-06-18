@@ -7,6 +7,7 @@ import os
 import queue
 import threading
 import uuid
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -30,6 +31,7 @@ from ai_invest.market_data.features import build_feature_snapshot_from_candles
 from ai_invest.market_data.upbit_public import fetch_candles_minutes, fetch_market_snapshot
 from ai_invest.notifications.service import NotificationService
 from ai_invest.research.rss import summarize_headlines_text
+from ai_invest.runtime.orchestrator_state import ORCHESTRATOR_EVENT_TYPE
 from ai_invest.storage.postgres import DbEvent, DbMeetingMessage, DbMeetingSession, PostgresRepo
 from ai_invest.work.agent_work_loop import collect_latest_work_reports, run_agent_work_cycle
 
@@ -834,6 +836,31 @@ def _normalized_conditional_activation_config(
     }
 
 
+def _normalized_live_data_collection_config(*, rules_raw: Mapping[str, Any]) -> dict[str, Any]:
+    gov = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    gate_cfg = (gov.get("activation_gate") or {}) if isinstance(gov, Mapping) else {}
+    raw_cfg = (gate_cfg.get("live_data_collection") or {}) if isinstance(gate_cfg, Mapping) else {}
+    bootstrap_min_trades = max(1, _as_int(raw_cfg.get("bootstrap_min_backtest_trades"), default=8))
+    return {
+        "enabled": bool(raw_cfg.get("enabled", False)),
+        "bootstrap_min_backtest_trades": int(bootstrap_min_trades),
+        "target_position_pct": float(
+            _clamp(_as_float(raw_cfg.get("target_position_pct"), default=12.0), 0.0, 20.0)
+        ),
+        "exploration_enabled": bool(raw_cfg.get("exploration_enabled", True)),
+        "profit_floor_bps": float(
+            _clamp(_as_float(raw_cfg.get("profit_floor_bps"), default=0.0), -5.0, 10.0)
+        ),
+        "profit_required_margin_bps": float(
+            _clamp(_as_float(raw_cfg.get("profit_required_margin_bps"), default=0.0), 0.0, 10.0)
+        ),
+        "min_predicted_after_cost_bps": float(
+            _clamp(_as_float(raw_cfg.get("min_predicted_after_cost_bps"), default=-0.25), -5.0, 10.0)
+        ),
+        "alpha_bypass_on_exploration": bool(raw_cfg.get("alpha_bypass_on_exploration", True)),
+    }
+
+
 def _activation_hold_mode(*, activation_decision_effective: str, conditional_activation: Mapping[str, Any]) -> str:
     if str(activation_decision_effective or "").upper() != "HOLD":
         return "HOLD_STATIC"
@@ -1081,6 +1108,8 @@ def _build_runtime_entry_policy(
     resolved_allowed_actions: Mapping[str, Any],
     resolved_target_position_pct: float,
     activation_gate: Mapping[str, Any],
+    rules_raw: Mapping[str, Any] | None = None,
+    universe_mode: str = "paper",
 ) -> dict[str, Any]:
     cap_cfg = (
         activation_gate.get("conditional_activation")
@@ -1094,12 +1123,62 @@ def _build_runtime_entry_policy(
         else {}
     )
     runtime_entry_allowed = bool(inter_slot_realtime_mode and not plan_execution_blocked)
-    mode = "CONDITIONAL_RUNTIME" if runtime_entry_allowed else "MEETING_LOCKED"
+    meeting_buy_flag = bool((resolved_allowed_actions or {}).get("buy"))
+    runtime_promotion_enabled = bool(runtime_entry_allowed and not meeting_buy_flag)
+    gov_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    micro_cfg = (gov_cfg.get("micro_mode") or {}) if isinstance(gov_cfg, Mapping) else {}
+    live_data_collection_cfg = _normalized_live_data_collection_config(rules_raw=rules_raw or {})
+    is_live_mode = str(universe_mode or "").strip().lower() == "live"
+    live_learning_mode = bool(
+        is_live_mode
+        and bool(live_data_collection_cfg.get("enabled"))
+        and bool(
+            activation_gate.get("live_data_collection_applied")
+            or activation_gate.get("live_data_collection_mode")
+        )
+    )
+    mode = "LIVE_DATA_COLLECTION" if (runtime_entry_allowed and live_learning_mode) else (
+        "CONDITIONAL_RUNTIME" if runtime_entry_allowed else "MEETING_LOCKED"
+    )
+    if live_learning_mode:
+        entry_objective = "learning-loop"
+        exploration_enabled = bool(live_data_collection_cfg.get("exploration_enabled", True))
+        profit_floor_bps = float(live_data_collection_cfg.get("profit_floor_bps", 0.0))
+        profit_required_margin_bps = float(live_data_collection_cfg.get("profit_required_margin_bps", 0.0))
+    elif is_live_mode:
+        entry_objective = "profit-first"
+        exploration_enabled = bool(micro_cfg.get("allow_live_exploration", False))
+        profit_floor_bps = float(
+            _as_float(micro_cfg.get("live_profit_floor_bps"), default=1.0)
+        )
+        profit_required_margin_bps = float(
+            _as_float(micro_cfg.get("live_profit_required_margin_bps"), default=0.5)
+        )
+    else:
+        entry_objective = "feedback-loop"
+        exploration_enabled = True
+        profit_floor_bps = 0.0
+        profit_required_margin_bps = 0.0
     return {
         "mode": mode,
         "runtime_entry_allowed": bool(runtime_entry_allowed),
+        "runtime_promotion_enabled": bool(runtime_promotion_enabled),
+        "execution_authority": "realtime_loop" if runtime_entry_allowed else "meeting_plan",
         "entry_timing_owner": "realtime_loop" if runtime_entry_allowed else "meeting_plan",
-        "meeting_buy_flag": bool((resolved_allowed_actions or {}).get("buy")),
+        "entry_objective": str(entry_objective),
+        "exploration_enabled": bool(exploration_enabled),
+        "learning_mode": bool(live_learning_mode),
+        "min_predicted_after_cost_bps": (
+            float(live_data_collection_cfg.get("min_predicted_after_cost_bps", -0.25))
+            if bool(live_learning_mode)
+            else None
+        ),
+        "alpha_bypass_on_exploration": bool(
+            live_learning_mode and bool(live_data_collection_cfg.get("alpha_bypass_on_exploration", True))
+        ),
+        "profit_floor_bps": float(profit_floor_bps),
+        "profit_required_margin_bps": float(profit_required_margin_bps),
+        "meeting_buy_flag": bool(meeting_buy_flag),
         "meeting_sell_flag": bool((resolved_allowed_actions or {}).get("sell")),
         "policy_cap_target_pct": float(_as_float(resolved_target_position_pct, default=0.0)),
         "required_passes": int(_as_int(cap_runtime.get("required_passes"), default=0)),
@@ -1116,7 +1195,22 @@ def _render_runtime_entry_policy_notes(policy: Mapping[str, Any]) -> str:
         [
             "[runtime_entry_policy]",
             f"- runtime_entry_allowed={bool(policy.get('runtime_entry_allowed'))}",
+            f"- runtime_promotion_enabled={bool(policy.get('runtime_promotion_enabled'))}",
+            f"- execution_authority={str(policy.get('execution_authority') or 'realtime_loop')}",
             f"- entry_timing_owner={str(policy.get('entry_timing_owner') or 'realtime_loop')}",
+            f"- entry_objective={str(policy.get('entry_objective') or 'profit-first')}",
+            f"- exploration_enabled={bool(policy.get('exploration_enabled'))}",
+            f"- learning_mode={bool(policy.get('learning_mode'))}",
+            (
+                "- exploration_floor="
+                f"min_predicted_after_cost_bps={float(_as_float(policy.get('min_predicted_after_cost_bps'), default=0.0)):.2f},"
+                f"alpha_bypass_on_exploration={bool(policy.get('alpha_bypass_on_exploration'))}"
+            ),
+            (
+                "- profit_gate="
+                f"floor_bps={float(_as_float(policy.get('profit_floor_bps'), default=0.0)):.2f},"
+                f"required_margin_bps={float(_as_float(policy.get('profit_required_margin_bps'), default=0.0)):.2f}"
+            ),
             f"- meeting_buy_flag={bool(policy.get('meeting_buy_flag'))}",
             f"- policy_cap_target_pct={float(_as_float(policy.get('policy_cap_target_pct'), default=0.0)):.1f}",
             "- interpretation=meeting sets policy cap only; realtime loop may promote entry before next meeting",
@@ -1514,7 +1608,9 @@ def evaluate_policy_activation_gate(
     data_collection_cfg = (
         (paper_mode_cfg.get("data_collection") or {}) if isinstance(paper_mode_cfg, Mapping) else {}
     )
+    live_data_collection_cfg = _normalized_live_data_collection_config(rules_raw=rules_raw)
     is_paper = str(((rules_raw.get("universe") or {}).get("mode") or "paper")).strip().lower() == "paper"
+    is_live = str(((rules_raw.get("universe") or {}).get("mode") or "paper")).strip().lower() == "live"
     data_collection_enabled = bool(data_collection_cfg.get("enabled", False))
     enabled = bool(gate_cfg.get("enabled", True))
     if not enabled:
@@ -1595,6 +1691,42 @@ def evaluate_policy_activation_gate(
             "selected_backtest": dict(bt),
             "reason_code": "POLICY_GATE_INSUFFICIENT_DATA",
             "paper_data_collection_mode": True,
+            "strict_min_trades_effective": int(strict_min_trades_effective),
+            "strict_min_trades_config": int(strict_min_trades),
+            "lookback_bars": int(lookback_bars),
+            "decision": "PAPER",
+        }
+
+    live_bootstrap_min_trades = max(
+        int(min_trades),
+        min(
+            int(live_data_collection_cfg.get("bootstrap_min_backtest_trades") or min_trades),
+            int(dynamic_strict_floor),
+        ),
+    )
+    if is_live and bool(live_data_collection_cfg.get("enabled")) and trades_actual < int(live_bootstrap_min_trades):
+        checks = [
+            {
+                "name": "symbol_match",
+                "passed": (not require_symbol_match) or (bt_symbol == final_symbol_u),
+                "actual": bt_symbol,
+                "required": final_symbol_u if require_symbol_match else "any",
+            },
+            {
+                "name": "trades_for_live_learning",
+                "passed": False,
+                "actual": trades_actual,
+                "required": int(live_bootstrap_min_trades),
+            },
+        ]
+        return {
+            "enabled": True,
+            "passed": False,
+            "checks": checks,
+            "selected_backtest": dict(bt),
+            "reason_code": "POLICY_GATE_INSUFFICIENT_DATA",
+            "live_data_collection_mode": True,
+            "live_data_collection_min_trades_effective": int(live_bootstrap_min_trades),
             "strict_min_trades_effective": int(strict_min_trades_effective),
             "strict_min_trades_config": int(strict_min_trades),
             "lookback_bars": int(lookback_bars),
@@ -1693,18 +1825,397 @@ def _next_prep_slot_dt_kst(*, slot_key: str, times: Sequence[str]) -> datetime:
     return now_kst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
 
+def _maybe_float(value: Any) -> float | None:
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _as_utc_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _dedupe_reason_codes(values: Iterable[Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        code = str(raw or "").strip().upper()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    return out
+
+
+def _extract_reason_codes(payload: Any) -> list[str]:
+    if isinstance(payload, Mapping):
+        raw_items: list[Any] = []
+        for key in ("reason_codes", "selected_reasons"):
+            value = payload.get(key)
+            if isinstance(value, (list, tuple)):
+                raw_items.extend(value)
+        single = payload.get("reason_code")
+        if single is not None:
+            raw_items.append(single)
+        reason_payload = payload.get("reason")
+        if isinstance(reason_payload, Mapping):
+            nested = reason_payload.get("reason_codes")
+            if isinstance(nested, (list, tuple)):
+                raw_items.extend(nested)
+        return _dedupe_reason_codes(raw_items)
+    if isinstance(payload, (list, tuple)):
+        return _dedupe_reason_codes(payload)
+    return _dedupe_reason_codes([payload])
+
+
+def _safe_runtime_hold_entry_candidate(decision: Mapping[str, Any] | None) -> bool:
+    gates = decision.get("gates") if isinstance(decision, Mapping) and isinstance(decision.get("gates"), Mapping) else {}
+    return bool(gates.get("micro_mode_runtime_hold_entry_allowed"))
+
+
+def _extract_market_after_cost_metrics(raw_payload: Mapping[str, Any] | None) -> dict[str, float | None]:
+    src = raw_payload if isinstance(raw_payload, Mapping) else {}
+    edge_calibration = src.get("edge_calibration") if isinstance(src.get("edge_calibration"), Mapping) else {}
+    predicted_after_cost_bps = _maybe_float(edge_calibration.get("predicted_after_cost_bps"))
+    if predicted_after_cost_bps is None:
+        predicted_after_cost_bps = _maybe_float(src.get("predicted_after_cost_bps"))
+    if predicted_after_cost_bps is None:
+        predicted_after_cost_bps = _maybe_float(src.get("expected_net_edge_bps"))
+    if predicted_after_cost_bps is None:
+        edge_bps = _maybe_float(src.get("expected_edge_bps"))
+        cost_bps = _maybe_float(src.get("expected_cost_bps"))
+        if edge_bps is not None and cost_bps is not None:
+            predicted_after_cost_bps = float(edge_bps) - float(cost_bps)
+
+    required_after_cost_bps = _maybe_float(edge_calibration.get("required_after_cost_bps"))
+    if required_after_cost_bps is None:
+        required_after_cost_bps = _maybe_float(src.get("required_after_cost_bps"))
+    if required_after_cost_bps is None:
+        required_after_cost_bps = _maybe_float(src.get("min_edge_required_bps"))
+
+    uncertainty_bps = _maybe_float(edge_calibration.get("uncertainty_bps"))
+    if uncertainty_bps is None:
+        uncertainty_bps = _maybe_float(src.get("after_cost_uncertainty_bps"))
+
+    alpha = _maybe_float(src.get("alpha"))
+    if alpha is None:
+        alpha = _maybe_float(src.get("alpha_raw"))
+
+    return {
+        "predicted_after_cost_bps": predicted_after_cost_bps,
+        "required_after_cost_bps": required_after_cost_bps,
+        "uncertainty_bps": uncertainty_bps,
+        "alpha": alpha,
+    }
+
+
+def _orchestrator_snapshot_is_down(payload: Mapping[str, Any] | None) -> bool:
+    src = payload if isinstance(payload, Mapping) else {}
+    if bool(src.get("stopping")):
+        return True
+    workers = src.get("workers") if isinstance(src.get("workers"), Mapping) else {}
+    if not workers:
+        return False
+    paper_state = workers.get("paper_loop") if isinstance(workers.get("paper_loop"), Mapping) else {}
+    if paper_state:
+        return not bool(paper_state.get("alive"))
+    return not any(bool((state or {}).get("alive")) for state in workers.values() if isinstance(state, Mapping))
+
+
+def _summarize_signal_audit(
+    *,
+    symbol: str,
+    window_start: datetime,
+    window_end: datetime,
+    market_rows: Sequence[Mapping[str, Any]],
+    safe_rows: Sequence[Mapping[str, Any]],
+    orchestrator_rows: Sequence[Mapping[str, Any]],
+    rules_raw: Mapping[str, Any],
+) -> dict[str, Any]:
+    symbol_norm = str(symbol or "").strip().upper() or "KRW-BTC"
+    start_utc = _as_utc_dt(window_start) or _utcnow()
+    end_utc = _as_utc_dt(window_end) or start_utc
+    if end_utc < start_utc:
+        start_utc, end_utc = end_utc, start_utc
+
+    scheduling_cfg = (rules_raw.get("scheduling") or {}) if isinstance(rules_raw, Mapping) else {}
+    gov_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
+    micro_cfg = (gov_cfg.get("micro_mode") or {}) if isinstance(gov_cfg, Mapping) else {}
+    activation_cfg = (gov_cfg.get("activation_gate") or {}) if isinstance(gov_cfg, Mapping) else {}
+    conditional_cfg = (
+        (activation_cfg.get("conditional_activation") or {})
+        if isinstance(activation_cfg.get("conditional_activation"), Mapping)
+        else {}
+    )
+    condition_cfg = (
+        (conditional_cfg.get("conditions") or {})
+        if isinstance(conditional_cfg.get("conditions"), Mapping)
+        else {}
+    )
+
+    decision_interval_sec = max(10, int(_as_int(scheduling_cfg.get("decision_interval_sec"), default=30)))
+    observation_gap_threshold_sec = max(300, decision_interval_sec * 10)
+    alpha_threshold = max(
+        float(_as_float(micro_cfg.get("min_alpha"), default=0.0)),
+        float(_as_float(condition_cfg.get("min_alpha"), default=0.0)),
+    )
+    base_after_cost_floor_bps = max(
+        float(_as_float(micro_cfg.get("live_min_predicted_after_cost_bps"), default=0.0)),
+        float(_as_float(micro_cfg.get("live_profit_floor_bps"), default=0.0)),
+    )
+    profit_required_margin_bps = float(
+        _as_float(micro_cfg.get("live_profit_required_margin_bps"), default=0.0)
+    )
+    max_uncertainty_bps = float(_as_float(micro_cfg.get("live_max_uncertainty_bps"), default=999.0))
+
+    def _in_window(row: Mapping[str, Any]) -> bool:
+        ts = _as_utc_dt(row.get("ts"))
+        if ts is None:
+            return False
+        return bool(start_utc < ts <= end_utc)
+
+    market_window = sorted(
+        [dict(row) for row in list(market_rows or []) if isinstance(row, Mapping) and _in_window(row)],
+        key=lambda row: _as_utc_dt(row.get("ts")) or start_utc,
+    )
+    safe_window = sorted(
+        [dict(row) for row in list(safe_rows or []) if isinstance(row, Mapping) and _in_window(row)],
+        key=lambda row: _as_utc_dt(row.get("ts")) or start_utc,
+    )
+    orchestrator_window = sorted(
+        [dict(row) for row in list(orchestrator_rows or []) if isinstance(row, Mapping) and _in_window(row)],
+        key=lambda row: _as_utc_dt(row.get("ts")) or start_utc,
+    )
+
+    decisions_by_id: dict[str, Mapping[str, Any]] = {}
+    decisions_by_ts: dict[str, Mapping[str, Any]] = {}
+    for row in safe_window:
+        decision_id = str(row.get("decision_id") or "").strip()
+        ts = _as_utc_dt(row.get("ts"))
+        if decision_id:
+            decisions_by_id[decision_id] = row
+        if ts is not None:
+            decisions_by_ts[ts.isoformat()] = row
+
+    market_sample_count = len(market_window)
+    market_buy_signal_count = 0
+    alpha_entry_hits = 0
+    profit_watch_hits = 0
+    profit_watch_promoted = 0
+    profit_watch_blocked = 0
+    blocked_reason_counts: Counter[str] = Counter()
+    last_sample_ts = start_utc
+    max_observed_gap_sec = 0.0
+
+    for row in market_window:
+        ts = _as_utc_dt(row.get("ts")) or last_sample_ts
+        max_observed_gap_sec = max(max_observed_gap_sec, float((ts - last_sample_ts).total_seconds()))
+        last_sample_ts = ts
+
+        raw_payload = row.get("raw_payload") if isinstance(row.get("raw_payload"), Mapping) else {}
+        signal = str(row.get("signal") or raw_payload.get("signal") or "").strip().upper()
+        if signal == "BUY":
+            market_buy_signal_count += 1
+
+        metrics = _extract_market_after_cost_metrics(raw_payload)
+        alpha = metrics.get("alpha")
+        after_cost_bps = metrics.get("predicted_after_cost_bps")
+        required_after_cost_bps = metrics.get("required_after_cost_bps")
+        uncertainty_bps = metrics.get("uncertainty_bps")
+        decision: Mapping[str, Any] | None = None
+        decision_id = str(row.get("decision_id") or "").strip()
+        if decision_id:
+            decision = decisions_by_id.get(decision_id)
+        if decision is None:
+            decision = decisions_by_ts.get(ts.isoformat())
+        runtime_hold_candidate = _safe_runtime_hold_entry_candidate(decision)
+        entry_allowed = raw_payload.get("entry_allowed") if isinstance(raw_payload, Mapping) else None
+        alpha_hit = alpha is not None and float(alpha) >= float(alpha_threshold)
+        entry_candidate = bool(signal in {"BUY", "LONG"} or entry_allowed is True or runtime_hold_candidate)
+        if entry_candidate and alpha_hit:
+            alpha_entry_hits += 1
+
+        effective_after_cost_floor_bps = float(base_after_cost_floor_bps) + float(profit_required_margin_bps)
+        if not runtime_hold_candidate and required_after_cost_bps is not None:
+            effective_after_cost_floor_bps = max(
+                float(base_after_cost_floor_bps),
+                float(required_after_cost_bps),
+            ) + float(profit_required_margin_bps)
+        uncertainty_ok = uncertainty_bps is None or float(uncertainty_bps) <= float(max_uncertainty_bps)
+        profit_watch_hit = bool(
+            entry_candidate
+            and alpha_hit
+            and uncertainty_ok
+            and after_cost_bps is not None
+            and float(after_cost_bps) >= float(effective_after_cost_floor_bps)
+        )
+        if not profit_watch_hit:
+            continue
+
+        profit_watch_hits += 1
+        if isinstance(decision, Mapping) and str(decision.get("action") or "").strip().upper() == "BUY":
+            profit_watch_promoted += 1
+            continue
+
+        profit_watch_blocked += 1
+        reason_codes = _extract_reason_codes(decision)
+        if not reason_codes:
+            reason_codes = ["NO_SAFE_DECISION"]
+        for code in reason_codes:
+            blocked_reason_counts[str(code)] += 1
+
+    max_observed_gap_sec = max(max_observed_gap_sec, float((end_utc - last_sample_ts).total_seconds()))
+    safe_buy_count = sum(1 for row in safe_window if str(row.get("action") or "").strip().upper() == "BUY")
+    runtime_down_snapshots = sum(
+        1
+        for row in orchestrator_window
+        if _orchestrator_snapshot_is_down(row.get("payload") if isinstance(row.get("payload"), Mapping) else {})
+    )
+    observation_gap = bool(market_sample_count == 0 or max_observed_gap_sec > float(observation_gap_threshold_sec))
+
+    return {
+        "symbol": symbol_norm,
+        "window_start_utc": start_utc.isoformat(),
+        "window_end_utc": end_utc.isoformat(),
+        "window_start_kst": start_utc.astimezone(KST).isoformat(),
+        "window_end_kst": end_utc.astimezone(KST).isoformat(),
+        "window_minutes": round(max(0.0, (end_utc - start_utc).total_seconds()) / 60.0, 1),
+        "market_sample_count": int(market_sample_count),
+        "market_buy_signal_count": int(market_buy_signal_count),
+        "alpha_entry_hits": int(alpha_entry_hits),
+        "profit_watch_hits": int(profit_watch_hits),
+        "profit_watch_promoted": int(profit_watch_promoted),
+        "profit_watch_blocked": int(profit_watch_blocked),
+        "safe_buy_count": int(safe_buy_count),
+        "blocked_reason_counts": dict(blocked_reason_counts.most_common(6)),
+        "runtime_down_snapshots": int(runtime_down_snapshots),
+        "observation_gap": bool(observation_gap),
+        "max_observed_gap_min": round(float(max_observed_gap_sec) / 60.0, 1),
+        "observation_gap_threshold_min": round(float(observation_gap_threshold_sec) / 60.0, 1),
+        "alpha_threshold": float(alpha_threshold),
+        "profit_floor_bps": float(base_after_cost_floor_bps),
+        "profit_required_margin_bps": float(profit_required_margin_bps),
+        "max_uncertainty_bps": float(max_uncertainty_bps),
+    }
+
+
+def _collect_symbol_signal_audit(
+    *,
+    repo: PostgresRepo,
+    symbol: str,
+    window_start: datetime,
+    window_end: datetime,
+    rules_raw: Mapping[str, Any],
+) -> dict[str, Any]:
+    start_utc = _as_utc_dt(window_start) or _utcnow()
+    end_utc = _as_utc_dt(window_end) or start_utc
+    if end_utc < start_utc:
+        start_utc, end_utc = end_utc, start_utc
+
+    scheduling_cfg = (rules_raw.get("scheduling") or {}) if isinstance(rules_raw, Mapping) else {}
+    decision_interval_sec = max(10, int(_as_int(scheduling_cfg.get("decision_interval_sec"), default=30)))
+    window_sec = max(0.0, (end_utc - start_utc).total_seconds())
+    sample_limit = min(5000, max(240, int(window_sec / float(decision_interval_sec)) + 160))
+    event_limit = min(1000, max(60, int(window_sec / 300.0) + 40))
+
+    market_rows = repo.fetch_agent_opinions(limit=sample_limit, symbol=symbol, agent_name="market_agent")
+    safe_rows = repo.fetch_decisions_before(
+        ts_at=end_utc,
+        judge_type="SAFE",
+        symbol=symbol,
+        limit=sample_limit,
+    )
+    orchestrator_rows = repo.fetch_events(event_type=ORCHESTRATOR_EVENT_TYPE, limit=event_limit)
+    return _summarize_signal_audit(
+        symbol=symbol,
+        window_start=start_utc,
+        window_end=end_utc,
+        market_rows=market_rows,
+        safe_rows=safe_rows,
+        orchestrator_rows=orchestrator_rows,
+        rules_raw=rules_raw,
+    )
+
+
+def _render_signal_audit_notes(
+    signal_audit: Mapping[str, Any] | None,
+    *,
+    compact: bool = False,
+) -> str:
+    audit = dict(signal_audit or {}) if isinstance(signal_audit, Mapping) else {}
+    if not audit:
+        return ""
+    blocked_reason_counts = (
+        audit.get("blocked_reason_counts")
+        if isinstance(audit.get("blocked_reason_counts"), Mapping)
+        else {}
+    )
+    blocked_reasons = ", ".join(f"{k}:{v}" for k, v in list(blocked_reason_counts.items())[:4])
+    lines = [
+        "[btc_signal_audit]",
+        f"- window_kst={str(audit.get('window_start_kst') or '')} -> {str(audit.get('window_end_kst') or '')}",
+        (
+            "- samples="
+            f"{int(_as_float(audit.get('market_sample_count'), default=0.0))}, "
+            f"market_buy={int(_as_float(audit.get('market_buy_signal_count'), default=0.0))}, "
+            f"alpha_hits={int(_as_float(audit.get('alpha_entry_hits'), default=0.0))}, "
+            f"watch_hits={int(_as_float(audit.get('profit_watch_hits'), default=0.0))}"
+        ),
+        (
+            "- outcomes="
+            f"safe_buys={int(_as_float(audit.get('safe_buy_count'), default=0.0))}, "
+            f"watch_promoted={int(_as_float(audit.get('profit_watch_promoted'), default=0.0))}, "
+            f"watch_blocked={int(_as_float(audit.get('profit_watch_blocked'), default=0.0))}"
+        ),
+        (
+            "- coverage="
+            f"runtime_down_snapshots={int(_as_float(audit.get('runtime_down_snapshots'), default=0.0))}, "
+            f"observation_gap={bool(audit.get('observation_gap'))}, "
+            f"max_gap_min={float(_as_float(audit.get('max_observed_gap_min'), default=0.0)):.1f}"
+        ),
+    ]
+    if not compact:
+        lines.append(
+            (
+                "- watch_rule="
+                f"alpha>={float(_as_float(audit.get('alpha_threshold'), default=0.0)):.2f}, "
+                f"after_cost>={float(_as_float(audit.get('profit_floor_bps'), default=0.0)) + float(_as_float(audit.get('profit_required_margin_bps'), default=0.0)):.2f}, "
+                f"uncertainty<={float(_as_float(audit.get('max_uncertainty_bps'), default=0.0)):.2f}"
+            )
+        )
+        if blocked_reasons:
+            lines.append(f"- blocked_reasons={blocked_reasons}")
+    return "\n".join(lines)
+
+
 def _build_agent_tasks(
     *,
     slot_key: str,
     outputs: GovernanceOutputs,
     rules_raw: Mapping[str, Any],
+    signal_audit: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     times = get_meeting_times_kst(rules_raw)
     next_slot_dt = _next_prep_slot_dt_kst(slot_key=slot_key, times=times)
     prep_slot_key = _slot_key_for_dt(next_slot_dt)
     due_ts = next_slot_dt.isoformat()
     symbol = str(outputs.final_plan.symbol)
-    return [
+    tasks = [
         {
             "task_id": str(uuid.uuid4()),
             "target_agent": "research_agent",
@@ -1766,6 +2277,55 @@ def _build_agent_tasks(
             },
         },
     ]
+    audit = dict(signal_audit or {}) if isinstance(signal_audit, Mapping) else {}
+    if audit:
+        watch_hits = int(_as_float(audit.get("profit_watch_hits"), default=0.0))
+        safe_buys = int(_as_float(audit.get("safe_buy_count"), default=0.0))
+        blocked = int(_as_float(audit.get("profit_watch_blocked"), default=0.0))
+        runtime_down = int(_as_float(audit.get("runtime_down_snapshots"), default=0.0))
+        observation_gap = bool(audit.get("observation_gap"))
+        tasks.append(
+            {
+                "task_id": str(uuid.uuid4()),
+                "target_agent": "quant_strategist",
+                "task_type": "BTC_SIGNAL_AUDIT",
+                "priority": "HIGH" if (watch_hits > 0 or blocked > 0) else "MEDIUM",
+                "status": "READY",
+                "due_ts_kst": due_ts,
+                "description": (
+                    f"{symbol} 직전 회의 이후 신호 감사: watch_hits={watch_hits}, "
+                    f"safe_buys={safe_buys}, blocked={blocked}"
+                ),
+                "slot_key": slot_key,
+                "payload": {
+                    "symbol": symbol,
+                    "audit": audit,
+                    "prep_for_slot_key": prep_slot_key,
+                },
+            }
+        )
+        if runtime_down > 0 or observation_gap:
+            tasks.append(
+                {
+                    "task_id": str(uuid.uuid4()),
+                    "target_agent": "ops_manager",
+                    "task_type": "RUNTIME_COVERAGE_AUDIT",
+                    "priority": "HIGH",
+                    "status": "READY",
+                    "due_ts_kst": due_ts,
+                    "description": (
+                        f"{symbol} 감시 공백 점검: runtime_down_snapshots={runtime_down}, "
+                        f"observation_gap={observation_gap}"
+                    ),
+                    "slot_key": slot_key,
+                    "payload": {
+                        "symbol": symbol,
+                        "audit": audit,
+                        "prep_for_slot_key": prep_slot_key,
+                    },
+                }
+            )
+    return tasks
 
 
 def _build_execution_playbook(
@@ -2086,6 +2646,48 @@ def _render_reader_minutes(
         ]
     )
     return _clip(minutes, 3200)
+
+
+def _render_reader_minutes_with_signal_audit(
+    *,
+    slot_key: str,
+    activation_status: str,
+    plan_symbol: str,
+    target_position_pct: float,
+    allowed_actions: Mapping[str, Any],
+    activation_gate: Mapping[str, Any],
+    rationale: Mapping[str, Any],
+    playbook: Mapping[str, Any],
+    roadmap: Sequence[Mapping[str, Any]],
+    signal_audit: Mapping[str, Any] | None = None,
+    llm_minutes_raw: str,
+) -> str:
+    base = _render_reader_minutes(
+        slot_key=slot_key,
+        activation_status=activation_status,
+        plan_symbol=plan_symbol,
+        target_position_pct=target_position_pct,
+        allowed_actions=allowed_actions,
+        activation_gate=activation_gate,
+        rationale=rationale,
+        playbook=playbook,
+        roadmap=roadmap,
+        llm_minutes_raw=llm_minutes_raw,
+    )
+    audit_notes = _render_signal_audit_notes(signal_audit)
+    if not audit_notes:
+        return base
+    return _clip(
+        "\n".join(
+            [
+                str(base).rstrip(),
+                "",
+                "6) BTC signal audit since previous meeting",
+                audit_notes,
+            ]
+        ),
+        3200,
+    )
 
 
 def enforce_final_trade_plan(
@@ -4444,6 +5046,7 @@ def run_governance_meeting_now(
         gate_reason_code = str(activation_gate.get("reason_code") or "")
         gov_cfg = (rules_raw.get("governance") or {}) if isinstance(rules_raw, Mapping) else {}
         gate_cfg = (gov_cfg.get("activation_gate") or {}) if isinstance(gov_cfg, Mapping) else {}
+        live_data_collection_cfg = _normalized_live_data_collection_config(rules_raw=rules_raw)
         live_execution_enabled = bool(gate_cfg.get("live_execution_enabled", False))
         paper_mode_cfg = (rules_raw.get("paper_mode") or {}) if isinstance(rules_raw, Mapping) else {}
         data_collection_cfg = (
@@ -4458,6 +5061,12 @@ def run_governance_meeting_now(
         paper_data_collection_candidate = bool(
             activation_gate.get("paper_data_collection_mode")
             and gate_reason_code == "POLICY_GATE_INSUFFICIENT_DATA"
+            and (not hard_plan_block)
+        )
+        live_data_collection_candidate = bool(
+            activation_gate.get("live_data_collection_mode")
+            and gate_reason_code == "POLICY_GATE_INSUFFICIENT_DATA"
+            and str(universe_mode).lower() == "live"
             and (not hard_plan_block)
         )
         soft_plan_block_reasons: list[str] = []
@@ -4557,9 +5166,13 @@ def run_governance_meeting_now(
             activation_gate["final_plan_no_trade_declared"] = True
             activation_gate["final_plan_no_trade_reasons"] = list(final_plan_no_trade_reasons)
         paper_data_collection_applied = bool(paper_data_collection_candidate and (not final_plan_no_trade))
+        live_data_collection_applied = bool(live_data_collection_candidate and (not final_plan_no_trade))
         if bool(paper_data_collection_candidate) and final_plan_no_trade:
             activation_gate["paper_data_collection_suppressed"] = True
             activation_gate["paper_data_collection_suppressed_reason"] = "FINAL_PLAN_NO_TRADE"
+        if bool(live_data_collection_candidate) and final_plan_no_trade:
+            activation_gate["live_data_collection_suppressed"] = True
+            activation_gate["live_data_collection_suppressed_reason"] = "FINAL_PLAN_NO_TRADE"
 
         resolved_allowed_actions = outputs.final_plan.allowed_actions.model_dump()
         resolved_target_position_pct = float(outputs.final_plan.target_position_pct)
@@ -4590,6 +5203,22 @@ def run_governance_meeting_now(
             activation_gate["paper_data_collection_applied"] = True
             activation_gate["paper_data_collection_target_pct"] = float(resolved_target_position_pct)
             activation_gate["paper_data_collection_buy_allowed"] = bool(resolved_allowed_actions["buy"])
+        if live_data_collection_applied:
+            resolved_allowed_actions["buy"] = False
+            resolved_allowed_actions["sell"] = True
+            resolved_target_position_pct = max(
+                0.0,
+                min(
+                    float(_as_float(live_data_collection_cfg.get("target_position_pct"), default=12.0)),
+                    float(outputs.risk.max_position_pct),
+                    float(rules.risk.max_position_pct_per_symbol),
+                    float(capital_profile.max_target_position_pct),
+                ),
+            )
+            activation_gate = dict(activation_gate)
+            activation_gate["live_data_collection_applied"] = True
+            activation_gate["live_data_collection_target_pct"] = float(resolved_target_position_pct)
+            activation_gate["live_data_collection_buy_allowed"] = False
 
         if plan_execution_blocked:
             resolved_allowed_actions["buy"] = False
@@ -4615,7 +5244,7 @@ def run_governance_meeting_now(
 
         hold_only_plan = (float(resolved_target_position_pct) <= 0.0) or (not bool(resolved_allowed_actions.get("buy")))
         if str(activation_decision_effective).upper() == "HOLD":
-            activation_status = "ACTIVE_HOLD"
+            activation_status = "ACTIVE_LIVE_DATA_COLLECTION" if live_data_collection_applied else "ACTIVE_HOLD"
         elif str(activation_decision_effective).upper() == "PAPER":
             activation_status = "ACTIVE_DATA_COLLECTION" if paper_data_collection_applied else "ACTIVE_PAPER"
         else:
@@ -4637,6 +5266,11 @@ def run_governance_meeting_now(
         if paper_data_collection_applied:
             gate_msg += (
                 f"\n- paper_data_collection: buy={bool(resolved_allowed_actions.get('buy'))}, "
+                f"target={float(resolved_target_position_pct):.1f}%"
+            )
+        if live_data_collection_applied:
+            gate_msg += (
+                f"\n- live_data_collection: buy={bool(resolved_allowed_actions.get('buy'))}, "
                 f"target={float(resolved_target_position_pct):.1f}%"
             )
         _store_message(
@@ -4713,6 +5347,8 @@ def run_governance_meeting_now(
             resolved_allowed_actions=resolved_allowed_actions,
             resolved_target_position_pct=float(resolved_target_position_pct),
             activation_gate=activation_gate,
+            rules_raw=rules_raw,
+            universe_mode=universe_mode,
         )
         runtime_entry_notes = _render_runtime_entry_policy_notes(runtime_entry_policy)
         plan_notes = _clip(
@@ -4768,6 +5404,43 @@ def run_governance_meeting_now(
             live_execution_enabled=bool(live_execution_enabled),
             conditional_hold_target_allowed=bool(inter_slot_realtime_mode),
         )
+        previous_plan_event = repo.fetch_latest_trade_plan_event_before(
+            ts_at=started_at - timedelta(seconds=1),
+            prefer_active=False,
+            lookback_limit=240,
+        )
+        previous_plan_ts = _as_utc_dt((previous_plan_event or {}).get("ts"))
+        signal_audit_window_start = previous_plan_ts or (started_at - timedelta(hours=8))
+        signal_audit = _collect_symbol_signal_audit(
+            repo=repo,
+            symbol=str(resolved_final_plan.symbol),
+            window_start=signal_audit_window_start,
+            window_end=started_at,
+            rules_raw=rules_raw,
+        )
+        if previous_plan_ts is not None:
+            signal_audit["previous_plan_ts_kst"] = previous_plan_ts.astimezone(KST).isoformat()
+        previous_plan_payload = (
+            (previous_plan_event or {}).get("payload")
+            if isinstance((previous_plan_event or {}).get("payload"), Mapping)
+            else {}
+        )
+        if isinstance(previous_plan_payload, Mapping):
+            previous_slot_key = str(previous_plan_payload.get("slot_key") or "").strip()
+            if previous_slot_key:
+                signal_audit["previous_slot_key"] = previous_slot_key
+        signal_audit_notes = _render_signal_audit_notes(signal_audit, compact=True)
+        if signal_audit_notes:
+            plan_notes = _clip(
+                "\n".join(
+                    [
+                        x
+                        for x in [signal_audit_notes, str(plan_notes or "").strip()]
+                        if str(x).strip()
+                    ]
+                ),
+                1200,
+            )
         fee_total_bps = float(
             _as_float(((rules_raw.get("fees") or {}).get("fallback_bid_fee_bps")), default=5.0)
             + _as_float(((rules_raw.get("fees") or {}).get("fallback_ask_fee_bps")), default=5.0)
@@ -4868,8 +5541,9 @@ def run_governance_meeting_now(
             "execution_playbook": execution_playbook,
             "improvement_roadmap": list(improvement_roadmap),
             "consistency_checks": consistency_checks,
+            "signal_audit": dict(signal_audit),
         }
-        formatted_minutes = _render_reader_minutes(
+        formatted_minutes = _render_reader_minutes_with_signal_audit(
             slot_key=slot_key,
             activation_status=activation_status,
             plan_symbol=str(resolved_final_plan.symbol),
@@ -4879,6 +5553,7 @@ def run_governance_meeting_now(
             rationale=dict(resolved_final_plan.rationale or {}),
             playbook=execution_playbook,
             roadmap=improvement_roadmap,
+            signal_audit=signal_audit,
             llm_minutes_raw=str(outputs.secretary_minutes or ""),
         )
 
@@ -4895,6 +5570,7 @@ def run_governance_meeting_now(
                 "activation_status": activation_status,
                 "activation_gate": activation_gate,
                 "improvement_roadmap": list(improvement_roadmap),
+                "signal_audit": dict(signal_audit),
                 "secretary_minutes_raw": str(outputs.secretary_minutes or ""),
             },
             action_items={"items": action_items},
@@ -4920,7 +5596,25 @@ def run_governance_meeting_now(
                     "activation_gate": activation_gate,
                     "trade_plan": plan_payload,
                     "improvement_roadmap": list(improvement_roadmap),
+                    "signal_audit": dict(signal_audit),
                     "llm_meta": {k: asdict(v) for k, v in outputs.llm_meta.items()},
+                },
+            )
+        )
+        repo.insert_event(
+            DbEvent(
+                event_id=uuid.uuid4(),
+                ts=ended_at,
+                event_type="MEETING_SIGNAL_AUDIT",
+                entity_type="meeting_sessions",
+                entity_id=str(meeting_id),
+                run_id=None,
+                rule_version_id=None,
+                payload={
+                    "meeting_id": str(meeting_id),
+                    "slot_key": slot_key,
+                    "symbol": str(resolved_final_plan.symbol),
+                    "signal_audit": dict(signal_audit),
                 },
             )
         )
@@ -5018,6 +5712,7 @@ def run_governance_meeting_now(
                     rationale_summary=" | ".join(rationale_lines[:3]),
                     activation_status=str(activation_status),
                     activation_gate=dict(activation_gate or {}),
+                    runtime_entry_policy=dict(plan_payload.get("runtime_entry_policy") or {}),
                 )
             except Exception:
                 pass
@@ -5064,7 +5759,12 @@ def run_governance_meeting_now(
                 payload=policy_payload,
             )
         )
-        assigned_tasks = _build_agent_tasks(slot_key=slot_key, outputs=outputs, rules_raw=rules_raw)
+        assigned_tasks = _build_agent_tasks(
+            slot_key=slot_key,
+            outputs=outputs,
+            rules_raw=rules_raw,
+            signal_audit=signal_audit,
+        )
         for task in assigned_tasks:
             repo.insert_event(
                 DbEvent(
@@ -5091,6 +5791,7 @@ def run_governance_meeting_now(
                     "activation_gate": activation_gate,
                     "assigned_tasks": assigned_tasks,
                     "improvement_roadmap": list(improvement_roadmap),
+                    "signal_audit": dict(signal_audit),
                     "secretary_minutes_raw": str(outputs.secretary_minutes or ""),
                 },
                 action_items={
@@ -5124,6 +5825,7 @@ def run_governance_meeting_now(
                     "activation_gate": activation_gate,
                     "assigned_tasks": assigned_tasks,
                     "improvement_roadmap": list(improvement_roadmap),
+                    "signal_audit": dict(signal_audit),
                 },
             )
             emit("done", {"ok": True})

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import time
 
 from ai_invest.config.rules_loader import load_rules
@@ -12,14 +13,17 @@ from ai_invest.meetings.governance_meeting import (
     OpsDraft,
     QuantPlanDraft,
     RiskDraft,
+    _build_agent_tasks,
     _build_runtime_entry_policy,
     _build_execution_plan,
     _build_plan_consistency_checks,
     enforce_final_trade_plan,
     _final_plan_declares_no_trade,
     _governance_llm_call_timeout_sec,
+    _render_signal_audit_notes,
     _render_runtime_entry_policy_notes,
     _run_with_timeout,
+    _summarize_signal_audit,
     _to_final_trade_plan_v2,
 )
 
@@ -422,18 +426,83 @@ def test_runtime_entry_policy_marks_conditional_runtime_mode() -> None:
                 "consecutive_passes": 0,
             },
         },
+        rules_raw={"governance": {"micro_mode": {"allow_live_exploration": False}}},
+        universe_mode="live",
     )
     assert policy["mode"] == "CONDITIONAL_RUNTIME"
     assert bool(policy["runtime_entry_allowed"]) is True
+    assert bool(policy["runtime_promotion_enabled"]) is True
+    assert policy["execution_authority"] == "realtime_loop"
+    assert policy["entry_objective"] == "profit-first"
+    assert bool(policy["exploration_enabled"]) is False
+    assert float(policy["profit_floor_bps"]) == 1.0
+    assert float(policy["profit_required_margin_bps"]) == 0.5
     assert bool(policy["meeting_buy_flag"]) is False
     assert float(policy["policy_cap_target_pct"]) == 10.0
+
+
+def test_runtime_entry_policy_marks_live_learning_mode() -> None:
+    policy = _build_runtime_entry_policy(
+        inter_slot_realtime_mode=True,
+        plan_execution_blocked=False,
+        resolved_allowed_actions={"buy": False, "sell": True},
+        resolved_target_position_pct=10.0,
+        activation_gate={
+            "live_data_collection_applied": True,
+            "conditional_activation": {
+                "conditions": {
+                    "min_pass_conditions": 3,
+                    "sustain_seconds": 180,
+                }
+            },
+            "cap_runtime": {
+                "required_passes": 6,
+                "consecutive_passes": 0,
+            },
+        },
+        rules_raw={
+            "governance": {
+                "micro_mode": {"allow_live_exploration": False},
+                "activation_gate": {
+                    "live_data_collection": {
+                        "enabled": True,
+                        "target_position_pct": 12.0,
+                        "exploration_enabled": True,
+                        "profit_floor_bps": 0.0,
+                        "profit_required_margin_bps": 0.0,
+                        "min_predicted_after_cost_bps": -0.25,
+                        "alpha_bypass_on_exploration": True,
+                    }
+                },
+            }
+        },
+        universe_mode="live",
+    )
+    assert policy["mode"] == "LIVE_DATA_COLLECTION"
+    assert bool(policy["runtime_entry_allowed"]) is True
+    assert policy["entry_objective"] == "learning-loop"
+    assert bool(policy["exploration_enabled"]) is True
+    assert bool(policy["learning_mode"]) is True
+    assert float(policy["profit_floor_bps"]) == 0.0
+    assert float(policy["profit_required_margin_bps"]) == 0.0
+    assert float(policy["min_predicted_after_cost_bps"]) == -0.25
+    assert bool(policy["alpha_bypass_on_exploration"]) is True
 
 
 def test_runtime_entry_policy_notes_explain_realtime_ownership() -> None:
     notes = _render_runtime_entry_policy_notes(
         {
             "runtime_entry_allowed": True,
+            "runtime_promotion_enabled": True,
+            "execution_authority": "realtime_loop",
             "entry_timing_owner": "realtime_loop",
+            "entry_objective": "profit-first",
+            "exploration_enabled": False,
+            "learning_mode": False,
+            "min_predicted_after_cost_bps": 0.0,
+            "alpha_bypass_on_exploration": False,
+            "profit_floor_bps": 1.0,
+            "profit_required_margin_bps": 0.5,
             "meeting_buy_flag": False,
             "policy_cap_target_pct": 10.0,
             "min_pass_conditions": 3,
@@ -443,5 +512,175 @@ def test_runtime_entry_policy_notes_explain_realtime_ownership() -> None:
     )
     assert "[runtime_entry_policy]" in notes
     assert "runtime_entry_allowed=True" in notes
+    assert "runtime_promotion_enabled=True" in notes
+    assert "execution_authority=realtime_loop" in notes
     assert "entry_timing_owner=realtime_loop" in notes
+    assert "entry_objective=profit-first" in notes
+    assert "exploration_enabled=False" in notes
+    assert "learning_mode=False" in notes
+    assert "exploration_floor=min_predicted_after_cost_bps=0.00,alpha_bypass_on_exploration=False" in notes
+    assert "profit_gate=floor_bps=1.00,required_margin_bps=0.50" in notes
     assert "promotion_rule=min_pass_conditions=3,sustain_seconds=180,required_passes=6" in notes
+
+
+def test_summarize_signal_audit_flags_blocked_watch_hits_and_runtime_gaps() -> None:
+    window_start = datetime(2026, 3, 18, 23, 5, tzinfo=timezone.utc)
+    window_end = window_start + timedelta(hours=2)
+    market_ts = window_start + timedelta(minutes=5)
+    audit = _summarize_signal_audit(
+        symbol="KRW-BTC",
+        window_start=window_start,
+        window_end=window_end,
+        market_rows=[
+            {
+                "ts": market_ts,
+                "signal": "BUY",
+                "decision_id": "d-1",
+                "raw_payload": {
+                    "signal": "BUY",
+                    "entry_allowed": True,
+                    "alpha": 0.82,
+                    "expected_net_edge_bps": 2.4,
+                    "reason_codes": ["RG_PASS"],
+                },
+            }
+        ],
+        safe_rows=[
+            {
+                "ts": market_ts,
+                "decision_id": "d-1",
+                "action": "HOLD",
+                "selected_reasons": ["RG_MICRO_BLOCKED_POLICY"],
+            }
+        ],
+        orchestrator_rows=[
+            {
+                "ts": window_start + timedelta(minutes=45),
+                "payload": {
+                    "stopping": False,
+                    "workers": {
+                        "paper_loop": {"alive": False},
+                        "ops_work_loop": {"alive": True},
+                    },
+                },
+            }
+        ],
+        rules_raw={
+            "scheduling": {"decision_interval_sec": 30},
+            "governance": {
+                "micro_mode": {
+                    "min_alpha": 0.65,
+                    "live_min_predicted_after_cost_bps": 0.0,
+                    "live_profit_floor_bps": 1.0,
+                    "live_profit_required_margin_bps": 0.5,
+                    "live_max_uncertainty_bps": 8.0,
+                },
+                "activation_gate": {"conditional_activation": {"conditions": {"min_alpha": 0.75}}},
+            },
+        },
+    )
+
+    assert audit["market_sample_count"] == 1
+    assert audit["market_buy_signal_count"] == 1
+    assert audit["alpha_entry_hits"] == 1
+    assert audit["profit_watch_hits"] == 1
+    assert audit["profit_watch_blocked"] == 1
+    assert audit["profit_watch_promoted"] == 0
+    assert audit["safe_buy_count"] == 0
+    assert audit["blocked_reason_counts"] == {"RG_MICRO_BLOCKED_POLICY": 1}
+    assert audit["runtime_down_snapshots"] == 1
+    assert audit["observation_gap"] is True
+
+
+def test_summarize_signal_audit_counts_runtime_hold_promotions() -> None:
+    window_start = datetime(2026, 3, 18, 23, 5, tzinfo=timezone.utc)
+    market_ts = window_start + timedelta(minutes=5)
+    audit = _summarize_signal_audit(
+        symbol="KRW-BTC",
+        window_start=window_start,
+        window_end=window_start + timedelta(hours=1),
+        market_rows=[
+            {
+                "ts": market_ts,
+                "signal": "HOLD",
+                "decision_id": "d-2",
+                "raw_payload": {
+                    "signal": "HOLD",
+                    "entry_allowed": False,
+                    "alpha": 0.82,
+                    "predicted_after_cost_bps": 1.75,
+                    "required_after_cost_bps": 4.0,
+                    "after_cost_uncertainty_bps": 2.0,
+                    "reason_codes": ["RG_EDGE_TOO_LOW"],
+                },
+            }
+        ],
+        safe_rows=[
+            {
+                "ts": market_ts,
+                "decision_id": "d-2",
+                "action": "BUY",
+                "selected_reasons": ["RG_CAP_PROMOTED"],
+                "gates": {
+                    "micro_mode_runtime_hold_entry_allowed": True,
+                },
+            }
+        ],
+        orchestrator_rows=[],
+        rules_raw={
+            "scheduling": {"decision_interval_sec": 30},
+            "governance": {
+                "micro_mode": {
+                    "min_alpha": 0.65,
+                    "live_profit_floor_bps": 1.0,
+                    "live_profit_required_margin_bps": 0.5,
+                    "live_max_uncertainty_bps": 8.0,
+                }
+            },
+        },
+    )
+
+    assert audit["market_buy_signal_count"] == 0
+    assert audit["alpha_entry_hits"] == 1
+    assert audit["profit_watch_hits"] == 1
+    assert audit["profit_watch_promoted"] == 1
+    assert audit["profit_watch_blocked"] == 0
+    assert audit["safe_buy_count"] == 1
+
+
+def test_render_signal_audit_notes_and_followup_tasks() -> None:
+    out = run_governance_protocol(fact_pack=_base_fact_pack(), rules_raw={})
+    signal_audit = {
+        "window_start_kst": "2026-03-19T08:05:00+09:00",
+        "window_end_kst": "2026-03-19T10:05:00+09:00",
+        "market_sample_count": 180,
+        "market_buy_signal_count": 3,
+        "alpha_entry_hits": 2,
+        "profit_watch_hits": 2,
+        "profit_watch_promoted": 1,
+        "profit_watch_blocked": 1,
+        "safe_buy_count": 1,
+        "runtime_down_snapshots": 2,
+        "observation_gap": True,
+        "max_observed_gap_min": 17.5,
+        "alpha_threshold": 0.75,
+        "profit_floor_bps": 1.0,
+        "profit_required_margin_bps": 0.5,
+        "max_uncertainty_bps": 8.0,
+        "blocked_reason_counts": {"RG_MICRO_BLOCKED_POLICY": 1},
+    }
+
+    notes = _render_signal_audit_notes(signal_audit)
+    tasks = _build_agent_tasks(
+        slot_key="2026-03-19 10:05",
+        outputs=out,
+        rules_raw={},
+        signal_audit=signal_audit,
+    )
+    task_types = [str(task.get("task_type")) for task in tasks]
+
+    assert "[btc_signal_audit]" in notes
+    assert "watch_rule=alpha>=0.75" in notes
+    assert "blocked_reasons=RG_MICRO_BLOCKED_POLICY:1" in notes
+    assert "BTC_SIGNAL_AUDIT" in task_types
+    assert "RUNTIME_COVERAGE_AUDIT" in task_types

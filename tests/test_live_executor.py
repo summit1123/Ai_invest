@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ai_invest.config.rules_loader import load_rules
 from ai_invest.execution.live_execution import LiveExecutor
@@ -16,6 +17,7 @@ class _FakeLiveClient:
         self.krw_balance = 1_000_000.0
         self.btc_balance = 0.0
         self.btc_avg = 0.0
+        self.place_calls = 0
         self.orders: dict[str, dict[str, Any]] = {}
 
     def get_accounts(self) -> list[dict[str, Any]]:
@@ -45,6 +47,7 @@ class _FakeLiveClient:
         time_in_force: str | None = None,  # noqa: ARG002
         identifier: str | None = None,  # noqa: ARG002
     ) -> dict[str, Any]:
+        self.place_calls += 1
         order_id = str(uuid.uuid4())
         if market != "KRW-BTC":
             raise RuntimeError("unsupported market")
@@ -117,6 +120,31 @@ class _FakeRepo:
         self.realized_trades: list[dict[str, Any]] = []
         self.pnl_daily: list[dict[str, Any]] = []
 
+    def fetch_open_orders(
+        self,
+        *,
+        symbol: str | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        wanted_statuses = {str(s).upper() for s in list(statuses or ["NEW", "ACK", "PARTIAL"])}
+        rows: list[dict[str, Any]] = []
+        for order in self.orders.values():
+            if symbol is not None and str(order.symbol).upper() != str(symbol).upper():
+                continue
+            if str(order.status).upper() not in wanted_statuses:
+                continue
+            rows.append(
+                {
+                    "order_id": order.order_id,
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "status": order.status,
+                    "meta": dict(order.meta or {}),
+                }
+            )
+        return rows[: max(1, int(limit))]
+
     def fetch_cash_balance(self, *, currency: str) -> float:
         ccy = str(currency).upper()
         total = 0.0
@@ -134,6 +162,14 @@ class _FakeRepo:
 
     def upsert_position(self, pos: DbPosition) -> None:
         self.positions[pos.symbol] = pos
+
+    def fetch_portfolio_overview(self, *, quote_currency: str = "KRW") -> dict[str, Any]:  # noqa: ARG002
+        positions: list[dict[str, Any]] = []
+        for pos in self.positions.values():
+            if float(pos.qty or 0.0) <= 0.0:
+                continue
+            positions.append({"symbol": pos.symbol, "qty": float(pos.qty or 0.0)})
+        return {"positions_count": len(positions), "positions": positions}
 
     def insert_event(self, event: DbEvent) -> None:
         self.events.append(event)
@@ -183,6 +219,9 @@ class _FakeRepo:
                 "trades_count_delta": trades_count_delta,
             }
         )
+
+    def fetch_pnl_daily(self, *, limit: int = 30) -> list[dict[str, Any]]:
+        return list(self.pnl_daily[: max(1, int(limit))])
 
 
 class LiveExecutorTests(unittest.TestCase):
@@ -245,6 +284,227 @@ class LiveExecutorTests(unittest.TestCase):
         self.assertAlmostEqual(float(pos2.qty), 0.0, places=9)
         self.assertEqual(len(repo.realized_trades), 1)
         self.assertGreater(len(repo.exec_metrics), 1)
+
+    def test_live_learning_mode_rounds_small_buy_up_to_min_order(self) -> None:
+        repo = _FakeRepo()
+        client = _FakeLiveClient()
+        client.krw_balance = 50_100.0
+        ex = LiveExecutor(repo=repo, client=client)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+
+        buy_snap = MarketSnapshot(
+            ts_ms=0,
+            symbol="KRW-BTC",
+            last_price=100.0,
+            best_bid=100.0,
+            best_ask=101.0,
+        )
+        buy = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=buy_snap,
+            rules=rules,
+            target_position_pct=9.77,
+            allow_min_order_round_up=True,
+        )
+        self.assertIsNotNone(buy)
+        assert buy is not None
+        self.assertGreater(float(buy.fill_qty), 0.0)
+        order = next(iter(repo.orders.values()))
+        expected_notional = float(rules.execution.min_order_krw) * float(
+            (rules.raw.get("runtime_controller") or {}).get("min_order_buffer_mult") or 1.0
+        )
+        self.assertAlmostEqual(float(order.price or 0.0) * float(order.quantity or 0.0), float(expected_notional), delta=1.0)
+
+    def test_live_executor_blocks_new_order_when_symbol_has_open_order(self) -> None:
+        repo = _FakeRepo()
+        client = _FakeLiveClient()
+        ex = LiveExecutor(repo=repo, client=client)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+        run_id = uuid.uuid4()
+        rule_version_id = uuid.uuid4()
+        repo.insert_order(
+            DbOrder(
+                order_id="existing-open-order",
+                ts_created=datetime.now(timezone.utc),
+                symbol="KRW-BTC",
+                side="BUY",
+                order_type="limit",
+                price=100.0,
+                quantity=1.0,
+                time_in_force="post_only",
+                status="ACK",
+                client_order_id="existing",
+                meta={"live": True},
+                run_id=run_id,
+                rule_version_id=rule_version_id,
+            )
+        )
+
+        result = ex.execute(
+            run_id=run_id,
+            rule_version_id=rule_version_id,
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=MarketSnapshot(
+                ts_ms=0,
+                symbol="KRW-BTC",
+                last_price=100.0,
+                best_bid=100.0,
+                best_ask=101.0,
+            ),
+            rules=rules,
+            target_position_pct=20.0,
+            allow_min_order_round_up=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(client.place_calls, 0)
+        self.assertEqual(len(repo.orders), 1)
+        self.assertTrue(any(e.event_type == "ORDER_SKIPPED" for e in repo.events))
+
+    def test_live_executor_blocks_buy_during_position_cooldown(self) -> None:
+        repo = _FakeRepo()
+        client = _FakeLiveClient()
+        ex = LiveExecutor(repo=repo, client=client)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+        cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+        repo.upsert_position(
+            DbPosition(
+                symbol="KRW-BTC",
+                ts_updated=datetime.now(timezone.utc),
+                qty=0.0,
+                avg_entry_price=None,
+                unrealized_pnl=None,
+                stop_price=None,
+                take_profit=None,
+                meta={"cooldown_until": cooldown_until.isoformat(), "last_exit_reason": "STOP"},
+            )
+        )
+
+        result = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=MarketSnapshot(ts_ms=0, symbol="KRW-BTC", last_price=100.0, best_bid=100.0, best_ask=101.0),
+            rules=rules,
+            target_position_pct=20.0,
+            allow_min_order_round_up=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(client.place_calls, 0)
+        self.assertTrue(
+            any((e.payload or {}).get("reason") == "RG_COOLDOWN_ACTIVE" for e in repo.events),
+            "cooldown skip event should be observable",
+        )
+
+    def test_live_executor_blocks_new_symbol_when_position_cap_reached(self) -> None:
+        repo = _FakeRepo()
+        client = _FakeLiveClient()
+        ex = LiveExecutor(repo=repo, client=client)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+        repo.upsert_position(
+            DbPosition(
+                symbol="KRW-ETH",
+                ts_updated=datetime.now(timezone.utc),
+                qty=1.0,
+                avg_entry_price=100.0,
+                unrealized_pnl=None,
+                stop_price=None,
+                take_profit=None,
+                meta={"trade_id": str(uuid.uuid4())},
+            )
+        )
+
+        result = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=MarketSnapshot(ts_ms=0, symbol="KRW-BTC", last_price=100.0, best_bid=100.0, best_ask=101.0),
+            rules=rules,
+            target_position_pct=20.0,
+            allow_min_order_round_up=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(client.place_calls, 0)
+        self.assertTrue(
+            any((e.payload or {}).get("reason") == "RG_EXPOSURE_LIMIT" for e in repo.events),
+            "position-cap skip event should be observable",
+        )
+
+    def test_live_executor_blocks_new_symbol_when_other_symbol_has_open_order(self) -> None:
+        repo = _FakeRepo()
+        client = _FakeLiveClient()
+        ex = LiveExecutor(repo=repo, client=client)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+        repo.insert_order(
+            DbOrder(
+                order_id="other-symbol-open-order",
+                ts_created=datetime.now(timezone.utc),
+                symbol="KRW-ETH",
+                side="BUY",
+                order_type="limit",
+                price=100.0,
+                quantity=1.0,
+                time_in_force="post_only",
+                status="ACK",
+                client_order_id="existing",
+                meta={"live": True},
+                run_id=uuid.uuid4(),
+                rule_version_id=uuid.uuid4(),
+            )
+        )
+
+        result = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=MarketSnapshot(ts_ms=0, symbol="KRW-BTC", last_price=100.0, best_bid=100.0, best_ask=101.0),
+            rules=rules,
+            target_position_pct=20.0,
+            allow_min_order_round_up=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(client.place_calls, 0)
+        self.assertTrue(
+            any((e.payload or {}).get("reason") == "RG_EXPOSURE_LIMIT" for e in repo.events),
+            "other-symbol open order should lock new entries under max_open_positions=1",
+        )
+
+    def test_live_executor_blocks_buy_after_daily_trade_cap(self) -> None:
+        repo = _FakeRepo()
+        client = _FakeLiveClient()
+        ex = LiveExecutor(repo=repo, client=client)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+        today_kst = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
+        max_trades = int((((rules.raw.get("governance") or {}).get("micro_mode") or {}).get("max_trades_per_day") or 0))
+        repo.pnl_daily.append({"day": today_kst, "trades_count": max_trades})
+
+        result = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=MarketSnapshot(ts_ms=0, symbol="KRW-BTC", last_price=100.0, best_bid=100.0, best_ask=101.0),
+            rules=rules,
+            target_position_pct=20.0,
+            allow_min_order_round_up=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(client.place_calls, 0)
+        self.assertTrue(
+            any((e.payload or {}).get("reason") == "RG_EXPOSURE_LIMIT" for e in repo.events),
+            "daily trade-cap skip event should be observable",
+        )
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ def _parse_ts(value: Any) -> datetime:
 def normalize_orchestrator_status(status: Mapping[str, Any] | None) -> dict[str, Any]:
     src = status if isinstance(status, Mapping) else {}
     workers_raw = src.get("workers") if isinstance(src.get("workers"), Mapping) else {}
+    stop_request_raw = src.get("last_stop_request") if isinstance(src.get("last_stop_request"), Mapping) else None
     workers: dict[str, dict[str, Any]] = {}
     for name, raw in sorted(workers_raw.items(), key=lambda item: str(item[0])):
         state = raw if isinstance(raw, Mapping) else {}
@@ -45,6 +46,7 @@ def normalize_orchestrator_status(status: Mapping[str, Any] | None) -> dict[str,
     return {
         "ts_utc": str(src.get("ts_utc") or ""),
         "stopping": bool(src.get("stopping")),
+        "last_stop_request": dict(stop_request_raw) if isinstance(stop_request_raw, Mapping) else None,
         "workers": workers,
     }
 
@@ -53,6 +55,7 @@ def orchestrator_status_signature(status: Mapping[str, Any] | None) -> str:
     normalized = normalize_orchestrator_status(status)
     payload = {
         "stopping": normalized.get("stopping"),
+        "last_stop_request": normalized.get("last_stop_request"),
         "workers": normalized.get("workers"),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -83,6 +86,11 @@ def build_orchestrator_summary(
         "running": bool(alive_workers),
         "ts_utc": normalized.get("ts_utc"),
         "stopping": bool(normalized.get("stopping")),
+        "last_stop_request": (
+            dict(normalized.get("last_stop_request"))
+            if isinstance(normalized.get("last_stop_request"), Mapping)
+            else None
+        ),
         "alive_workers": alive_workers,
         "dead_workers": dead_workers,
         "worker_count": len(workers),

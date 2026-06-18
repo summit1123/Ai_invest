@@ -35,3 +35,24 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+
+# Codex Ralph loop
+.codex-loop/history/*
+!.codex-loop/history/.gitkeep
+.codex-loop/reviews/*
+!.codex-loop/reviews/.gitkeep
+.codex-loop/evals/*
+!.codex-loop/evals/.gitkeep
+.codex-loop/artifacts/*
+!.codex-loop/artifacts/.gitkeep
+.codex-loop/state.json
+.codex-loop/ralph-loop.json
+.codex-loop/logs/iteration-*.log
+.codex-loop/logs/ralph-hook.log
+.codex-loop/context/current-state.md
+.codex-loop/context/handoff.md
+.codex-loop/context/events.jsonl
+.codex-loop/preflight/status.json
+.codex-loop/preflight/REPORT.md
+output/html/*
+output/pdf/*
