@@ -4,6 +4,7 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from ai_invest.config.rules_loader import load_rules
@@ -107,6 +108,60 @@ class _FakeLiveClient:
         payload = dict(self.orders[order_id])
         payload["state"] = "cancel"
         return payload
+
+
+class _FakePendingCancelClient(_FakeLiveClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_calls = 0
+        self.get_calls = 0
+        self.canceled = False
+
+    def place_order(
+        self,
+        *,
+        market: str,
+        side: str,
+        ord_type: str,
+        volume: float | None = None,
+        price: float | None = None,
+        time_in_force: str | None = None,  # noqa: ARG002
+        identifier: str | None = None,  # noqa: ARG002
+    ) -> dict[str, Any]:
+        self.place_calls += 1
+        order_id = str(uuid.uuid4())
+        payload = {
+            "uuid": order_id,
+            "state": "wait",
+            "market": market,
+            "side": side,
+            "ord_type": ord_type,
+            "price": str(float(price or 100.0)),
+            "volume": str(float(volume or 0.0)),
+            "remaining_volume": str(float(volume or 0.0)),
+            "executed_volume": "0",
+            "paid_fee": "0",
+            "trades": [],
+        }
+        self.orders[order_id] = payload
+        return dict(payload)
+
+    def get_order(self, *, order_id: str | None = None, identifier: str | None = None) -> dict[str, Any]:  # noqa: ARG002
+        if not order_id:
+            raise RuntimeError("order_id required")
+        self.get_calls += 1
+        payload = dict(self.orders[order_id])
+        if self.canceled:
+            payload["state"] = "cancel"
+            self.orders[order_id] = dict(payload)
+        return payload
+
+    def cancel_order(self, *, order_id: str | None = None, identifier: str | None = None) -> dict[str, Any]:  # noqa: ARG002
+        if not order_id:
+            raise RuntimeError("order_id required")
+        self.cancel_calls += 1
+        self.canceled = True
+        return dict(self.orders[order_id])
 
 
 class _FakeRepo:
@@ -318,6 +373,35 @@ class LiveExecutorTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(order.price or 0.0) * float(order.quantity or 0.0), float(expected_notional), delta=1.0)
 
+    def test_live_executor_rechecks_order_after_timeout_cancel(self) -> None:
+        repo = _FakeRepo()
+        client = _FakePendingCancelClient()
+        with patch.dict("os.environ", {"UPBIT_LIVE_MAX_WAIT_SEC": "1", "UPBIT_LIVE_POLL_SEC": "0"}, clear=False):
+            ex = LiveExecutor(repo=repo, client=client)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+
+        result = ex.execute(
+            run_id=uuid.uuid4(),
+            rule_version_id=uuid.uuid4(),
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=MarketSnapshot(
+                ts_ms=0,
+                symbol="KRW-BTC",
+                last_price=100.0,
+                best_bid=100.0,
+                best_ask=101.0,
+            ),
+            rules=rules,
+            target_position_pct=10.0,
+            allow_min_order_round_up=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(client.cancel_calls, 1)
+        self.assertEqual(next(iter(repo.orders.values())).status, "CANCELED")
+        self.assertTrue(any(e.event_type == "ORDER_CANCELED" for e in repo.events))
+
     def test_live_executor_blocks_new_order_when_symbol_has_open_order(self) -> None:
         repo = _FakeRepo()
         client = _FakeLiveClient()
@@ -364,6 +448,67 @@ class LiveExecutorTests(unittest.TestCase):
         self.assertEqual(client.place_calls, 0)
         self.assertEqual(len(repo.orders), 1)
         self.assertTrue(any(e.event_type == "ORDER_SKIPPED" for e in repo.events))
+
+    def test_live_executor_reconciles_canceled_open_order_before_guarding(self) -> None:
+        repo = _FakeRepo()
+        client = _FakeLiveClient()
+        ex = LiveExecutor(repo=repo, client=client)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+        run_id = uuid.uuid4()
+        rule_version_id = uuid.uuid4()
+        stale_order_id = "stale-canceled-order"
+        client.orders[stale_order_id] = {
+            "uuid": stale_order_id,
+            "state": "cancel",
+            "market": "KRW-BTC",
+            "side": "bid",
+            "ord_type": "limit",
+            "price": "100",
+            "volume": "1",
+            "remaining_volume": "1",
+            "executed_volume": "0",
+            "paid_fee": "0",
+            "trades": [],
+        }
+        repo.insert_order(
+            DbOrder(
+                order_id=stale_order_id,
+                ts_created=datetime.now(timezone.utc),
+                symbol="KRW-BTC",
+                side="BUY",
+                order_type="limit",
+                price=100.0,
+                quantity=1.0,
+                time_in_force="post_only",
+                status="ACK",
+                client_order_id="stale",
+                meta={"live": True},
+                run_id=run_id,
+                rule_version_id=rule_version_id,
+            )
+        )
+
+        result = ex.execute(
+            run_id=run_id,
+            rule_version_id=rule_version_id,
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=MarketSnapshot(
+                ts_ms=0,
+                symbol="KRW-BTC",
+                last_price=100.0,
+                best_bid=100.0,
+                best_ask=101.0,
+            ),
+            rules=rules,
+            target_position_pct=20.0,
+            allow_min_order_round_up=True,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(client.place_calls, 1)
+        self.assertEqual(repo.orders[stale_order_id].status, "CANCELED")
+        self.assertTrue(any(e.event_type == "ORDER_CANCELED" and e.entity_id == stale_order_id for e in repo.events))
 
     def test_live_executor_blocks_buy_during_position_cooldown(self) -> None:
         repo = _FakeRepo()

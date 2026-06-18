@@ -366,6 +366,51 @@ class LiveExecutor:
                     active.add(sym)
         return active
 
+    def _reconcile_canceled_open_orders(
+        self,
+        *,
+        open_orders: list[Mapping[str, Any]],
+        run_id: uuid.UUID,
+        rule_version_id: uuid.UUID,
+        symbol: str,
+    ) -> list[Mapping[str, Any]]:
+        active: list[Mapping[str, Any]] = []
+        for row in open_orders:
+            if not isinstance(row, Mapping):
+                continue
+            order_id = str(row.get("order_id") or "").strip()
+            if not order_id:
+                active.append(row)
+                continue
+            try:
+                snapshot = self._client.get_order(order_id=order_id)
+            except Exception:
+                active.append(row)
+                continue
+
+            upbit_state = str(snapshot.get("state") or "").strip().lower()
+            executed = _as_float(snapshot.get("executed_volume"), default=0.0)
+            if upbit_state == "cancel" and executed <= 0:
+                self._repo.update_order_status(
+                    order_id,
+                    status=OrderState.CANCELED.value,
+                    meta_patch={
+                        "state_ts": _utcnow().isoformat(),
+                        "upbit_state": upbit_state,
+                        "reconciled_before_open_order_guard": True,
+                    },
+                )
+                self._emit_order_state_event(
+                    run_id=run_id,
+                    rule_version_id=rule_version_id,
+                    order_id=order_id,
+                    symbol=symbol,
+                    state=OrderState.CANCELED,
+                )
+                continue
+            active.append(row)
+        return active
+
     def execute(
         self,
         *,
@@ -399,6 +444,12 @@ class LiveExecutor:
                 )
             except Exception:
                 open_orders = []
+            open_orders = self._reconcile_canceled_open_orders(
+                open_orders=open_orders,
+                run_id=run_id,
+                rule_version_id=rule_version_id,
+                symbol=symbol,
+            )
             if open_orders:
                 self._skip_order(
                     run_id=run_id,
@@ -717,6 +768,10 @@ class LiveExecutor:
         if machine.state not in {OrderState.FILLED, OrderState.CANCELED, OrderState.REJECTED}:
             try:
                 latest_snapshot = self._client.cancel_order(order_id=order_id)
+                try:
+                    latest_snapshot = self._client.get_order(order_id=order_id)
+                except UpbitPrivateApiError:
+                    pass
             except UpbitPrivateApiError:
                 latest_snapshot = self._client.get_order(order_id=order_id)
             emitted_states = self._transition_state(
