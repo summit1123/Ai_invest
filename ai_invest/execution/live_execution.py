@@ -389,14 +389,15 @@ class LiveExecutor:
                 continue
 
             upbit_state = str(snapshot.get("state") or "").strip().lower()
-            executed = _as_float(snapshot.get("executed_volume"), default=0.0)
-            if upbit_state == "cancel" and executed <= 0:
+            if upbit_state == "cancel":
                 self._repo.update_order_status(
                     order_id,
                     status=OrderState.CANCELED.value,
                     meta_patch={
                         "state_ts": _utcnow().isoformat(),
                         "upbit_state": upbit_state,
+                        "upbit_executed_volume": snapshot.get("executed_volume"),
+                        "upbit_remaining_volume": snapshot.get("remaining_volume"),
                         "reconciled_before_open_order_guard": True,
                     },
                 )

@@ -510,6 +510,67 @@ class LiveExecutorTests(unittest.TestCase):
         self.assertEqual(repo.orders[stale_order_id].status, "CANCELED")
         self.assertTrue(any(e.event_type == "ORDER_CANCELED" and e.entity_id == stale_order_id for e in repo.events))
 
+    def test_live_executor_reconciles_partially_filled_canceled_order_before_guarding(self) -> None:
+        repo = _FakeRepo()
+        client = _FakeLiveClient()
+        ex = LiveExecutor(repo=repo, client=client)  # type: ignore[arg-type]
+        rules = load_rules("rules.yaml")
+        run_id = uuid.uuid4()
+        rule_version_id = uuid.uuid4()
+        stale_order_id = "stale-partial-canceled-order"
+        client.orders[stale_order_id] = {
+            "uuid": stale_order_id,
+            "state": "cancel",
+            "market": "KRW-BTC",
+            "side": "bid",
+            "ord_type": "limit",
+            "price": "100",
+            "volume": "1",
+            "remaining_volume": "0.75",
+            "executed_volume": "0.25",
+            "paid_fee": "0.0125",
+            "trades": [{"price": "100", "volume": "0.25", "fee": "0.0125"}],
+        }
+        repo.insert_order(
+            DbOrder(
+                order_id=stale_order_id,
+                ts_created=datetime.now(timezone.utc),
+                symbol="KRW-BTC",
+                side="BUY",
+                order_type="limit",
+                price=100.0,
+                quantity=1.0,
+                time_in_force="post_only",
+                status="PARTIAL",
+                client_order_id="stale-partial",
+                meta={"live": True},
+                run_id=run_id,
+                rule_version_id=rule_version_id,
+            )
+        )
+
+        result = ex.execute(
+            run_id=run_id,
+            rule_version_id=rule_version_id,
+            decision_id=uuid.uuid4(),
+            action="BUY",
+            snapshot=MarketSnapshot(
+                ts_ms=0,
+                symbol="KRW-BTC",
+                last_price=100.0,
+                best_bid=100.0,
+                best_ask=101.0,
+            ),
+            rules=rules,
+            target_position_pct=20.0,
+            allow_min_order_round_up=True,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(client.place_calls, 1)
+        self.assertEqual(repo.orders[stale_order_id].status, "CANCELED")
+        self.assertTrue(any(e.event_type == "ORDER_CANCELED" and e.entity_id == stale_order_id for e in repo.events))
+
     def test_live_executor_blocks_buy_during_position_cooldown(self) -> None:
         repo = _FakeRepo()
         client = _FakeLiveClient()
